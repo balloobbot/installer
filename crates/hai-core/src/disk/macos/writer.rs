@@ -219,26 +219,28 @@ fn verify_write(
         match pipe.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => {
-                // dd reads whole 64 MiB blocks, so the last block may
-                // extend past the image; only hash up to total_size
-                let remaining = total_size - bytes_read_total;
+                // dd reads whole 64 MiB blocks, so the last block may extend
+                // past the image; hash only up to total_size. Keep draining
+                // the pipe to EOF afterwards rather than breaking early: the
+                // privileged dd is still writing the rounded-off remainder,
+                // and closing our read end now would kill it with a broken
+                // pipe and race the diskutil eject that follows.
+                let remaining = total_size.saturating_sub(bytes_read_total);
                 let to_hash = (n as u64).min(remaining) as usize;
-                device_hasher.update(&buffer[..to_hash]);
-                bytes_read_total += to_hash as u64;
+                if to_hash > 0 {
+                    device_hasher.update(&buffer[..to_hash]);
+                    bytes_read_total += to_hash as u64;
 
-                if bytes_read_total >= total_size {
-                    break;
-                }
-
-                // Send progress update every PROGRESS_UPDATE_INTERVAL bytes
-                if bytes_read_total - last_progress_update >= PROGRESS_UPDATE_INTERVAL {
-                    let _ = progress_tx.send(FlashProgress::new(
-                        FlashStage::Verifying,
-                        bytes_read_total,
-                        total_size,
-                        "Verifying written data...",
-                    ));
-                    last_progress_update = bytes_read_total;
+                    // Send progress update every PROGRESS_UPDATE_INTERVAL bytes
+                    if bytes_read_total - last_progress_update >= PROGRESS_UPDATE_INTERVAL {
+                        let _ = progress_tx.send(FlashProgress::new(
+                            FlashStage::Verifying,
+                            bytes_read_total,
+                            total_size,
+                            "Verifying written data...",
+                        ));
+                        last_progress_update = bytes_read_total;
+                    }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
