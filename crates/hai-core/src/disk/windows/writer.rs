@@ -12,9 +12,11 @@ pub async fn write_image<P: ProgressCallback>(
     verify: bool,
     progress_callback: &P,
 ) -> Result<()> {
-    let disk_number = device_id
-        .strip_prefix("\\\\.\\PhysicalDrive")
-        .ok_or_else(|| Error::DeviceNotFound(device_id.to_string()))?;
+    let disk_number = parse_disk_number(device_id)?;
+
+    // Clear-Disk is destructive, so make sure the device can be opened for
+    // writing (e.g. we are running as Administrator) before wiping it.
+    open_device_for_write(device_id)?;
 
     clean_disk(disk_number)?;
 
@@ -90,15 +92,8 @@ fn write_and_verify(
     Ok(())
 }
 
-fn write_to_device(
-    image_path: &PathBuf,
-    device_path: &str,
-    total_size: u64,
-    progress_tx: &mpsc::Sender<FlashProgress>,
-) -> Result<()> {
-    let mut source = File::open(image_path)?;
-
-    let mut dest = std::fs::OpenOptions::new()
+fn open_device_for_write(device_path: &str) -> Result<File> {
+    std::fs::OpenOptions::new()
         .write(true)
         .open(device_path)
         .map_err(|e| {
@@ -111,7 +106,18 @@ fn write_to_device(
             } else {
                 Error::Io(e)
             }
-        })?;
+        })
+}
+
+fn write_to_device(
+    image_path: &PathBuf,
+    device_path: &str,
+    total_size: u64,
+    progress_tx: &mpsc::Sender<FlashProgress>,
+) -> Result<()> {
+    let mut source = File::open(image_path)?;
+
+    let mut dest = open_device_for_write(device_path)?;
 
     let mut buffer = vec![0u8; WRITE_BUFFER_SIZE];
     let mut bytes_written: u64 = 0;
@@ -230,7 +236,19 @@ fn verify_write(
     Ok(())
 }
 
-fn clean_disk(disk_number: &str) -> Result<()> {
+/// Extract the disk number from a `\\.\PhysicalDriveN` device id.
+///
+/// The number is interpolated into a PowerShell command, so it must be
+/// parsed as an integer rather than passed through as a string.
+fn parse_disk_number(device_id: &str) -> Result<u32> {
+    device_id
+        .strip_prefix("\\\\.\\PhysicalDrive")
+        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| Error::DeviceNotFound(device_id.to_string()))
+}
+
+fn clean_disk(disk_number: u32) -> Result<()> {
     let ps_script = format!(
         "Clear-Disk -Number {} -RemoveData -RemoveOEM -Confirm:$false",
         disk_number
@@ -255,6 +273,45 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    #[test]
+    fn test_parse_disk_number_valid() {
+        assert_eq!(parse_disk_number("\\\\.\\PhysicalDrive0").unwrap(), 0);
+        assert_eq!(parse_disk_number("\\\\.\\PhysicalDrive12").unwrap(), 12);
+    }
+
+    #[test]
+    fn test_parse_disk_number_rejects_non_numeric() {
+        for device_id in [
+            "\\\\.\\PhysicalDrive",
+            "\\\\.\\PhysicalDrive1; Remove-Item C:\\ -Recurse",
+            "\\\\.\\PhysicalDrive1 ",
+            "\\\\.\\PhysicalDrive+1",
+            "\\\\.\\PhysicalDrive-1",
+            "\\\\.\\PhysicalDrive99999999999",
+            "PhysicalDrive1",
+            "C:",
+        ] {
+            assert!(
+                matches!(parse_disk_number(device_id), Err(Error::DeviceNotFound(_))),
+                "{device_id:?} should be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_rejects_non_numeric_disk_number() {
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), b"test data").unwrap();
+        let image_path = temp_file.path().to_path_buf();
+
+        // Must fail before any PowerShell command runs.
+        let device_id = "\\\\.\\PhysicalDrive1; echo injected";
+
+        let result = write_image(&image_path, device_id, false, &crate::NoOpProgress).await;
+        assert!(matches!(result, Err(Error::DeviceNotFound(_))));
+    }
+
     #[tokio::test]
     #[serial]
     async fn test_write_image_invalid_device() {
@@ -262,7 +319,7 @@ mod tests {
         std::fs::write(temp_file.path(), b"test data").unwrap();
         let image_path = temp_file.path().to_path_buf();
 
-        // Fails at clean_disk: the device does not exist.
+        // Fails at the writability check: the device does not exist.
         let device_id = "\\\\.\\PhysicalDrive999";
 
         let result = write_image(&image_path, device_id, false, &crate::NoOpProgress).await;
