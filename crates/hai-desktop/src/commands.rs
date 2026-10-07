@@ -619,6 +619,24 @@ pub async fn proxmox_list_bridges(
         .map_err(CommandError::from_query)
 }
 
+/// Explicitly enable import content on an active directory storage.
+///
+/// Only called after the user agreed to the cluster-wide change. Returns
+/// whether this call changed the storage, so the frontend can remind the user.
+#[tauri::command]
+pub async fn proxmox_enable_storage_import(
+    session: ProxmoxSession,
+    node: String,
+    storage: String,
+) -> Result<bool, CommandError> {
+    Operation::new("proxmox_enable_import").finish(
+        Backend
+            .enable_storage_import(&session, &node, &storage)
+            .await
+            .map_err(CommandError::from),
+    )
+}
+
 /// Get the next available VM ID on Proxmox
 #[tauri::command]
 pub async fn proxmox_get_next_vm_id(session: ProxmoxSession) -> Result<u32, CommandError> {
@@ -1661,6 +1679,28 @@ mod mock_tests {
         // UTM reports "started", so this proves the Proxmox backend answered
         assert_eq!(status.status, "running");
         assert_eq!(status.ip_address.as_deref(), Some("192.168.1.100"));
+    }
+
+    #[tokio::test]
+    async fn enable_import_command_uses_mock_backend() {
+        let session = ProxmoxSession {
+            server_url: "https://example.invalid:8006".to_string(),
+            ticket: "mock-ticket".to_string(),
+            csrf_token: "mock-csrf".to_string(),
+            certificate_sha256: None,
+        };
+        assert!(!proxmox_enable_storage_import(
+            session.clone(),
+            "pve".to_string(),
+            "local".to_string()
+        )
+        .await
+        .unwrap());
+        let error =
+            proxmox_enable_storage_import(session, "pve".to_string(), "local-lvm".to_string())
+                .await
+                .unwrap_err();
+        assert_eq!(error.code, "proxmox_api");
     }
 
     /// A request for `device_id` whose `expected_device` matches what the mock

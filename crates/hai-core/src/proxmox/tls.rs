@@ -634,6 +634,9 @@ mod tests {
             certificate_sha256: credentials.certificate_sha256,
         };
         let errors = [
+            super::super::enable_storage_import(&session, "pve", "local")
+                .await
+                .unwrap_err(),
             super::super::list_nodes(&session).await.unwrap_err(),
             super::super::list_storage(&session, "pve")
                 .await

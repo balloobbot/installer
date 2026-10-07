@@ -44,3 +44,17 @@ async fn certificate_inspection_defaults_to_an_error_not_platform_trust() {
         .await;
     assert!(matches!(result, Err(Error::ProxmoxApi(message)) if message.contains("not supported")));
 }
+
+#[tokio::test]
+async fn storage_import_defaults_to_an_error_not_a_change() {
+    let session = ProxmoxSession {
+        server_url: "https://pve.example:8006".to_string(),
+        ticket: "ticket".to_string(),
+        csrf_token: "csrf".to_string(),
+        certificate_sha256: None,
+    };
+    let result = ExistingBackend
+        .enable_storage_import(&session, "pve", "local")
+        .await;
+    assert!(matches!(result, Err(Error::ProxmoxApi(message)) if message.contains("not support")));
+}
