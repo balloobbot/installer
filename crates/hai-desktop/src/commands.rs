@@ -724,10 +724,6 @@ mod tests {
             panic!("must not extract an image");
         }
 
-        async fn check_for_updates(&self) -> hai_core::Result<UpdateInfo> {
-            panic!("must not check for updates");
-        }
-
         fn cache_dir(&self) -> hai_core::Result<std::path::PathBuf> {
             panic!("must not create a cache directory");
         }
