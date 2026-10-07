@@ -5,7 +5,9 @@
 //! images to them.
 
 use crate::error::{Error, Result};
-use crate::types::{BlockDevice, DeviceType, FlashProgress, FlashStage};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use crate::types::DeviceType;
+use crate::types::{BlockDevice, FlashProgress, FlashStage};
 use crate::{Backend, DeviceBackend, ProgressCallback};
 use std::path::Path;
 
