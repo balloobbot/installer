@@ -270,6 +270,9 @@ pub struct ProxmoxCredentials {
     pub username: String,
     /// Password
     pub password: String,
+    /// Optional time-based one-time password from an authenticator app.
+    #[serde(default)]
+    pub totp: Option<String>,
 }
 
 /// Proxmox session (authentication result)
