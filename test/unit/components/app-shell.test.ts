@@ -41,7 +41,8 @@ function selectTargets({ withBoard = true } = {}) {
   if (withBoard) {
     wizardState.setSelection("deviceConfig", {
       board: "rpi5-64",
-      download_url: "https://example.test/haos_rpi5-64.img.xz",
+      download_url:
+        "https://github.com/home-assistant/operating-system/releases/download/{version}/haos_rpi5-64-{version}.img.xz",
     });
   }
   storeDriveSelection(CONNECTED);
