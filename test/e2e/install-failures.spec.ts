@@ -1,5 +1,5 @@
 import type { Page } from "@playwright/test";
-import { test, expect } from "./fixtures.js";
+import { approveProxmoxImport, test, expect } from "./fixtures.js";
 
 test.use({ platform: "macos" });
 
@@ -75,6 +75,7 @@ for (const scenario of [
       await expect(
         page.locator(`${scenario.flow}-configure-view`)
       ).toBeVisible();
+      if (scenario.flow === "proxmox") await approveProxmoxImport(page);
       await expect(next(page)).toHaveJSProperty("disabled", false);
       await next(page).click();
       await expect(page.locator(`${scenario.flow}-confirm-view`)).toBeVisible();

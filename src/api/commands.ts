@@ -530,6 +530,9 @@ export async function proxmoxListNodes(
   return invoke<ProxmoxNode[]>("proxmox_list_nodes", { session });
 }
 
+/** Servers whose "local" storage accepts Import in the browser-only mock */
+const mockImportServers = new Set<string>();
+
 /**
  * List available storage on a Proxmox node.
  * @param session The authentication session
@@ -546,7 +549,15 @@ export async function proxmoxListStorage(
       {
         name: "local",
         storage_type: "dir",
-        content: ["images", "rootdir", "vztmpl", "backup", "iso", "snippets"],
+        content: [
+          "images",
+          "rootdir",
+          "vztmpl",
+          "backup",
+          "iso",
+          "snippets",
+          ...(mockImportServers.has(session.server_url) ? ["import"] : []),
+        ],
         available: 200 * 1024 * 1024 * 1024,
         total: 500 * 1024 * 1024 * 1024,
         active: true,
@@ -562,6 +573,38 @@ export async function proxmoxListStorage(
     ];
   }
   return invoke<ProxmoxStorage[]>("proxmox_list_storage", { session, node });
+}
+
+/**
+ * Enable Import on an active directory storage, keeping its other content
+ * types. Only call this after the user agreed: the setting is cluster-wide
+ * and stays enabled after installation.
+ * @returns Whether this call changed the storage
+ */
+export async function proxmoxEnableStorageImport(
+  session: ProxmoxSession,
+  node: string,
+  storage: string
+): Promise<boolean> {
+  if (MOCK_ALLOWED && isBrowserOnly()) {
+    if (storage !== "local" || !["pve", "pve2"].includes(node)) {
+      // Shaped like the native CommandError rejections
+      throw {
+        code: "proxmox_action_required",
+        message: `Storage '${storage}' must be an active directory storage on node '${node}'.`,
+        retryable: false,
+        details: {},
+      };
+    }
+    const changed = !mockImportServers.has(session.server_url);
+    mockImportServers.add(session.server_url);
+    return changed;
+  }
+  return invoke<boolean>("proxmox_enable_storage_import", {
+    session,
+    node,
+    storage,
+  });
 }
 
 /** List bridges and eligible SDN VNets on the selected node. */

@@ -22,6 +22,7 @@ import {
   proxmoxListNodes,
   proxmoxListStorage,
   proxmoxListBridges,
+  proxmoxEnableStorageImport,
   proxmoxGetNextVmId,
   formatBytes,
 } from "../../api/commands.js";
@@ -31,6 +32,8 @@ import type {
   ProxmoxStorage,
 } from "../../api/types.js";
 import "@home-assistant/webawesome/dist/components/button/button.js";
+import "../../components/info-dialog.js";
+import { openExternalLink } from "../../utils/external-url.js";
 import {
   DEFAULT_CPU_CORES,
   DEFAULT_DISK_SIZE_GB,
@@ -47,6 +50,9 @@ const SESSION_EXPIRED = "proxmox_session_expired";
  * certificate to confirm, while retrying would keep hitting the old pin.
  */
 const CERTIFICATE_CHANGED = "proxmox_certificate_changed";
+
+const DIRECTORY_STORAGE_DOCS =
+  "https://pve.proxmox.com/pve-docs/pve-admin-guide.html#storage_directory";
 
 function isSessionExpired(error: unknown): boolean {
   return (
@@ -174,6 +180,22 @@ export class ProxmoxConfigureView extends LitElement {
       font-size: 0.875rem;
       color: var(--ha-error-color, #db4437);
     }
+
+    .import-setting {
+      gap: 0.75rem;
+      overflow-wrap: anywhere;
+    }
+
+    .import-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+
+    .import-setting a {
+      font-size: 0.875rem;
+      color: var(--ha-primary-color, #03a9f4);
+    }
   `;
 
   @state()
@@ -232,6 +254,15 @@ export class ProxmoxConfigureView extends LitElement {
   @state() private _selectedBridge = "";
   /** Node whose bridge lookup last completed, so an empty list is real. */
   @state() private _bridgesNode = "";
+  /** The node has active storage with room that already accepts Import. */
+  @state() private _importReady = false;
+  /** Active directory storage on the node that Import could be enabled on. */
+  @state() private _importCandidates: ProxmoxStorage[] = [];
+  @state() private _importStorage = "";
+  @state() private _importBusy = false;
+  @state() private _importDialog = false;
+  @state() private _importDeclined = false;
+  @state() private _importError: InstallerError | null = null;
 
   connectedCallback() {
     super.connectedCallback();
@@ -240,6 +271,7 @@ export class ProxmoxConfigureView extends LitElement {
     });
     this._restoreSelections();
     wizardState.setSelection("proxmoxBridgeReady", false);
+    wizardState.setSelection("proxmoxImportReady", false);
     void this._loadNodes();
   }
 
@@ -275,6 +307,7 @@ export class ProxmoxConfigureView extends LitElement {
     this._sessionExpired = false;
     // Preserve choices across reconnects, but block Next until revalidated.
     wizardState.setSelection("proxmoxConfigureReady", false);
+    this._resetImport();
     const session = this._wizardState.selections.proxmoxSession;
     const isCurrentSession = () =>
       this._wizardState.selections.proxmoxSession === session;
@@ -372,6 +405,7 @@ export class ProxmoxConfigureView extends LitElement {
     this._sessionExpired = false;
     wizardState.setSelection("proxmoxConfigureReady", false);
     wizardState.setSelection("proxmoxBridgeReady", false);
+    this._resetImport();
     try {
       const [storageResult, bridgeResult] = await Promise.allSettled([
         proxmoxListStorage(session, node),
@@ -401,6 +435,25 @@ export class ProxmoxConfigureView extends LitElement {
       // other way around. A failed list keeps its choice for retry/reconnect;
       // readiness keeps it from being used until a lookup verifies it again.
       if (storageResult.status === "fulfilled") {
+        // The image is uploaded to import storage before the VM disk is made.
+        // ESXi only advertises Import as a source, and a full storage cannot
+        // take the upload either.
+        this._importReady = storageResult.value.some(
+          (s) =>
+            s.active &&
+            s.storage_type !== "esxi" &&
+            s.available > 0 &&
+            s.content.includes("import")
+        );
+        this._importCandidates = storageResult.value.filter(
+          (s) =>
+            s.active &&
+            s.storage_type === "dir" &&
+            s.available > 0 &&
+            !s.content.includes("import")
+        );
+        this._importStorage = this._importCandidates[0]?.name ?? "";
+
         // Filter to only show storage that supports VM images
         this._storages = storageResult.value.filter(
           (s) => s.active && s.content.includes("images")
@@ -475,6 +528,82 @@ export class ProxmoxConfigureView extends LitElement {
       wizardState.setSelection("proxmoxConnected", false);
     }
     wizardState.setSelection("proxmoxConfigureReady", false);
+    wizardState.setSelection("proxmoxImportReady", false);
+  }
+
+  /** Forget the previous lookup's Import state until storage is read again. */
+  private _resetImport() {
+    this._importReady = false;
+    this._importCandidates = [];
+    this._importStorage = "";
+    this._importBusy = false;
+    this._importDialog = false;
+    this._importDeclined = false;
+    this._importError = null;
+    wizardState.setSelection("proxmoxImportReady", false);
+  }
+
+  /**
+   * Enable Import on the storage the user just agreed to. This changes the
+   * cluster-wide storage configuration, so it only ever runs from the
+   * consent dialog, never from loading or selecting storage.
+   */
+  private async _enableImport() {
+    if (!this._importDialog || this._importBusy || this._loadingStorage) return;
+    this._importDialog = false;
+
+    const session = this._wizardState.selections.proxmoxSession;
+    const node = this._selectedNode;
+    const storage = this._importStorage;
+    if (!session || !this._importCandidates.some((s) => s.name === storage))
+      return;
+
+    const lookup = this._storageLookup;
+    const isCurrent = () =>
+      this.isConnected &&
+      this._wizardState.selections.proxmoxSession === session &&
+      lookup === this._storageLookup &&
+      node === this._selectedNode;
+
+    this._importBusy = true;
+    this._importError = null;
+    try {
+      await proxmoxEnableStorageImport(session, node, storage);
+      if (!isCurrent()) return;
+      // Only a fresh read decides readiness, so the step never trusts its
+      // own assumption about what the server now has
+      await this._loadStorage();
+    } catch (error) {
+      if (!isCurrent()) return;
+      if (isSessionExpired(error)) {
+        this._setError(error);
+        return;
+      }
+      new InstallDiagnostics("proxmox").fail(error);
+      this._importError = installerError(
+        error,
+        localize("views.proxmox.proxmox_configure_view.failed_to_enable_import")
+      );
+    } finally {
+      if (isCurrent()) this._importBusy = false;
+    }
+  }
+
+  private _onImportStorageChange(e: Event) {
+    const select = e.target as WaSelect;
+    this._importStorage = select.value as string;
+    this._importDeclined = false;
+    this._importError = null;
+  }
+
+  private _askToEnableImport() {
+    this._importDeclined = false;
+    this._importDialog = true;
+  }
+
+  private _declineImport() {
+    this._importDialog = false;
+    this._importDeclined = true;
   }
 
   private _retry() {
@@ -500,6 +629,13 @@ export class ProxmoxConfigureView extends LitElement {
     wizardState.setSelection(
       "proxmoxConfigureReady",
       !this._loadingNodes && !this._loadingStorage && !this._error
+    );
+    wizardState.setSelection(
+      "proxmoxImportReady",
+      !this._loadingNodes &&
+        !this._loadingStorage &&
+        !this._error &&
+        this._importReady
     );
     // A failed initial lookup must not turn the fallback ID into a choice
     // that suppresses the next-free-ID suggestion after reconnecting.
@@ -728,6 +864,147 @@ export class ProxmoxConfigureView extends LitElement {
     </svg>`;
   }
 
+  private _renderImport() {
+    if (
+      !this._selectedNode ||
+      this._loadingNodes ||
+      this._loadingStorage ||
+      this._importReady ||
+      this._error
+    )
+      return "";
+
+    const candidates = this._importCandidates;
+    const selected = candidates.find((s) => s.name === this._importStorage);
+
+    return html`
+      <div class="setting-row">
+        <div class="setting-icon">${this._renderDatabaseIcon()}</div>
+        <div class="setting-content import-setting">
+          <span class="setting-label"
+            >${localize(
+              "views.proxmox.proxmox_configure_view.import_storage_required"
+            )}</span
+          >
+          <p class="setting-description">
+            ${localize(
+              "views.proxmox.proxmox_configure_view.no_import_storage_on_node",
+              { node: this._selectedNode }
+            )}
+          </p>
+          ${this._importDeclined
+            ? html`<p class="setting-description" role="status">
+                ${localize(
+                  "views.proxmox.proxmox_configure_view.import_not_enabled_paused"
+                )}
+              </p>`
+            : ""}
+          ${candidates.length > 1
+            ? html`<wa-select
+                label=${localize(
+                  "views.proxmox.proxmox_configure_view.import_storage"
+                )}
+                size="s"
+                .value=${this._importStorage}
+                ?disabled=${this._importBusy}
+                @change=${this._onImportStorageChange}
+              >
+                ${candidates.map(
+                  (storage) => html`
+                    <wa-option value=${storage.name}>
+                      ${localize(
+                        "views.proxmox.proxmox_configure_view.value_value_free",
+                        {
+                          value0: storage.name,
+                          value1: formatBytes(storage.available),
+                        }
+                      )}
+                    </wa-option>
+                  `
+                )}
+              </wa-select>`
+            : selected
+              ? html`<p class="setting-description">
+                  ${localize(
+                    "views.proxmox.proxmox_configure_view.import_can_be_enabled_on_storage",
+                    {
+                      storage: selected.name,
+                      free: formatBytes(selected.available),
+                    }
+                  )}
+                </p>`
+              : html`<p class="setting-description">
+                  ${localize(
+                    "views.proxmox.proxmox_configure_view.no_storage_to_enable_import_on"
+                  )}
+                </p>`}
+          ${this._importError
+            ? html`<p class="error-text" role="alert">
+                  ${this._importError.message}
+                </p>
+                <p class="setting-description">
+                  ${localize(
+                    "views.proxmox.proxmox_configure_view.check_storage_permissions_and_try_again"
+                  )}
+                </p>`
+            : ""}
+          <div class="import-actions">
+            ${selected
+              ? html`<wa-button
+                  variant="brand"
+                  size="s"
+                  ?disabled=${this._importBusy}
+                  @click=${this._askToEnableImport}
+                >
+                  ${this._importBusy
+                    ? localize(
+                        "views.proxmox.proxmox_configure_view.enabling_import"
+                      )
+                    : localize(
+                        "views.proxmox.proxmox_configure_view.enable_import_ellipsis"
+                      )}
+                </wa-button>`
+              : ""}
+            <wa-button
+              appearance="outlined"
+              size="s"
+              ?disabled=${this._importBusy}
+              @click=${this._loadStorage}
+            >
+              ${localize(
+                "views.proxmox.proxmox_configure_view.refresh_storage"
+              )}
+            </wa-button>
+          </div>
+          <a
+            href=${DIRECTORY_STORAGE_DOCS}
+            @click=${(event: Event) =>
+              openExternalLink(event, DIRECTORY_STORAGE_DOCS)}
+            >${localize("proxmox.directory_storage_documentation")}</a
+          >
+        </div>
+      </div>
+      <info-dialog
+        .open=${this._importDialog}
+        title=${localize(
+          "views.proxmox.proxmox_configure_view.enable_import_on_storage_title"
+        )}
+        .message=${localize(
+          "views.proxmox.proxmox_configure_view.enable_import_on_storage_message",
+          { storage: this._importStorage }
+        )}
+        primaryLabel=${localize(
+          "views.proxmox.proxmox_configure_view.enable_import"
+        )}
+        secondaryLabel=${localize(
+          "views.proxmox.proxmox_configure_view.not_now"
+        )}
+        @dialog-primary=${this._enableImport}
+        @dialog-secondary=${this._declineImport}
+      ></info-dialog>
+    `;
+  }
+
   render() {
     if (this._error) {
       return html`
@@ -827,6 +1104,7 @@ export class ProxmoxConfigureView extends LitElement {
                     size="s"
                     .value=${this._selectedNode}
                     @change=${this._onNodeChange}
+                    ?disabled=${this._importBusy}
                   >
                     ${this._nodes.map(
                       (node) => html`
@@ -960,6 +1238,8 @@ export class ProxmoxConfigureView extends LitElement {
                 `}
           </div>
         </div>
+
+        ${this._renderImport()}
 
         <!-- VM ID -->
         <div class="setting-row">

@@ -157,7 +157,12 @@ describe("app-shell", () => {
       if (cmd === "proxmox_get_next_vm_id") return 100;
       if (cmd === "proxmox_list_storage")
         return [
-          { name: "local", active: true, content: ["images"], available: 100 },
+          {
+            name: "local",
+            active: true,
+            content: ["images", "import"],
+            available: 100,
+          },
         ];
       if (cmd === "proxmox_list_bridges")
         return [{ name: "vmbr0", network_type: "bridge", comments: null }];

@@ -1,4 +1,5 @@
 import { test, expect, type Locator, type Page } from "@playwright/test";
+import { approveProxmoxImport } from "./fixtures.js";
 
 // Traverse the real tab order instead of focusing controls programmatically.
 async function tabTo(page: Page, control: Locator) {
@@ -142,6 +143,7 @@ for (const flow of ["proxmox", "utm"] as const) {
     await next(page);
     const view = page.locator(`${flow}-configure-view`);
     await expect(view).toBeVisible();
+    if (flow === "proxmox") await approveProxmoxImport(page);
     const name = view.getByRole("textbox", { name: "Display name" });
     await tabTo(page, name);
     await page.keyboard.press("ControlOrMeta+A");
