@@ -4,11 +4,12 @@
 //! It handles the bridge between Tauri's Channel<T> and hai-core's ProgressCallback trait.
 
 use crate::backend::Backend;
+use crate::flash_state::FlashState;
 use hai_core::{
     BlockDevice, DeviceBackend, DeviceManifest, ExpectedDevice, FlashProgress, FlashRequest,
     FlashStage, HaosRelease, HostBackend, ImageFormat, ProgressCallback, ProxmoxBackend,
     ProxmoxCredentials, ProxmoxNode, ProxmoxSession, ProxmoxStorage, ProxmoxVmConfig,
-    ProxmoxVmResult, ReleaseSource, SystemInfo, UpdateInfo, UtmBackend, VmStatusInfo,
+    ProxmoxVmResult, ReleaseSource, SystemInfo, UtmBackend, VmStatusInfo,
 };
 use tauri::ipc::Channel;
 
@@ -100,9 +101,14 @@ fn find_flash_target<'a>(
 pub async fn flash_image(
     request: FlashRequest,
     progress_channel: Channel<FlashProgress>,
+    state: tauri::State<'_, FlashState>,
 ) -> Result<FlashResult, String> {
-    let callback = TauriProgressCallback::new(&progress_channel);
-    run_flash(&Backend, &request, &callback).await
+    state
+        .run(async move {
+            let callback = TauriProgressCallback::new(&progress_channel);
+            run_flash(&Backend, &request, &callback).await
+        })
+        .await
 }
 
 /// The message for a failed write, as the frontend shows it.
@@ -256,12 +262,6 @@ pub async fn get_haos_release(version: Option<String>) -> Result<HaosRelease, St
         .get_haos_release(ver)
         .await
         .map_err(|e| e.to_string())
-}
-
-/// Check for application updates
-#[tauri::command]
-pub async fn check_for_updates() -> Result<UpdateInfo, String> {
-    Backend.check_for_updates().await.map_err(|e| e.to_string())
 }
 
 /// Get the device manifest
@@ -487,23 +487,6 @@ mod tests {
     fn write_error_message_prefixes_a_plain_io_error() {
         let msg = write_error_message(hai_core::Error::Io(std::io::Error::other("boom")));
         assert!(msg.starts_with("Write failed"), "{msg}");
-    }
-
-    // ===== Update Info Tests =====
-
-    #[tokio::test]
-    async fn test_check_for_updates_returns_ok() {
-        let result = check_for_updates().await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_check_for_updates_has_valid_structure() {
-        let result = check_for_updates().await;
-        assert!(result.is_ok());
-        let update_info = result.unwrap();
-        assert!(!update_info.current_version.is_empty());
-        assert!(!update_info.latest_version.is_empty());
     }
 
     // ===== Manifest Tests =====
