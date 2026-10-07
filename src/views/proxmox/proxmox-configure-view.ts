@@ -370,7 +370,7 @@ export class ProxmoxConfigureView extends LitElement {
     }
 
     try {
-      const [nodes, nextVmId] = await Promise.all([
+      const results = await Promise.allSettled([
         proxmoxListNodes(session),
         proxmoxGetNextVmId(session),
       ]);
@@ -378,6 +378,18 @@ export class ProxmoxConfigureView extends LitElement {
       // The user may have left this step while the lookups were in flight;
       // saving now would write over what the next step reads
       if (!this.isConnected) return;
+
+      // An expired session must take precedence over an ordinary failure
+      // from the other lookup, regardless of which one finishes first.
+      const failures = results.filter((result) => result.status === "rejected");
+      if (failures.length) {
+        const expired = failures.find(
+          (result) => result.reason?.session_expired === true
+        );
+        throw (expired ?? failures[0]).reason;
+      }
+      const nodes = (results[0] as PromiseFulfilledResult<ProxmoxNode[]>).value;
+      const nextVmId = (results[1] as PromiseFulfilledResult<number>).value;
 
       this._nodes = nodes.filter((n) => n.status === "online");
 

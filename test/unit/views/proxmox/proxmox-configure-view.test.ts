@@ -491,6 +491,75 @@ describe("proxmox-configure-view", () => {
     });
   }
 
+  for (const expiredCommand of [
+    "proxmox_list_nodes",
+    "proxmox_get_next_vm_id",
+  ]) {
+    for (const expiredFirst of [false, true]) {
+      for (const chosenVmId of [undefined, 250]) {
+        it(`prioritizes ${expiredCommand} session expiry arriving ${expiredFirst ? "first" : "last"} with VM ID ${chosenVmId}`, async () => {
+          wizardState.nextStep();
+          wizardState.setSelection("proxmoxConnected", true);
+          wizardState.setSelection("proxmoxVmId", chosenVmId);
+          wizardState.setSelection("proxmoxConfigureReady", true);
+          const expired = deferred<never>();
+          const temporary = deferred<never>();
+          const calls: string[] = [];
+          mockTauriIpc((cmd) => {
+            calls.push(cmd);
+            if (cmd === expiredCommand) return expired.promise;
+            if (
+              cmd === "proxmox_list_nodes" ||
+              cmd === "proxmox_get_next_vm_id"
+            ) {
+              return temporary.promise;
+            }
+            throw new Error(`Unexpected IPC command: ${cmd}`);
+          });
+          const el = await fixture<ProxmoxConfigureView>(html`
+            <proxmox-configure-view></proxmox-configure-view>
+          `);
+          const rejectExpired = () =>
+            expired.reject({
+              message: "Session expired",
+              session_expired: true,
+            });
+          const rejectTemporary = () =>
+            temporary.reject({
+              message: "Temporary failure",
+              session_expired: false,
+            });
+
+          (expiredFirst ? rejectExpired : rejectTemporary)();
+          await settle();
+          expect(wizardState.getState().selections.proxmoxConfigureReady).to.be
+            .false;
+          (expiredFirst ? rejectTemporary : rejectExpired)();
+          await settle();
+          await el.updateComplete;
+
+          const selections = wizardState.getState().selections;
+          expect(selections.proxmoxSession).to.be.undefined;
+          expect(selections.proxmoxConnected).to.be.false;
+          expect(selections.proxmoxConfigureReady).to.be.false;
+          expect(selections.proxmoxVmId).to.equal(chosenVmId);
+          expect(calls).to.deep.equal([
+            "proxmox_list_nodes",
+            "proxmox_get_next_vm_id",
+          ]);
+          expect(el.shadowRoot!.textContent).to.contain("Session expired");
+          expect(el.shadowRoot!.textContent).to.not.contain(
+            "Temporary failure"
+          );
+          const reconnect = el.shadowRoot!.querySelector("wa-button")!;
+          expect(reconnect.textContent).to.contain("Reconnect");
+          reconnect.click();
+          expect(wizardState.currentStep!.id).to.equal("connection");
+        });
+      }
+    }
+  }
+
   it("ignores an authentication failure after leaving the step", async () => {
     const nodes = deferred<never>();
     mockTauriIpc((cmd) => {
