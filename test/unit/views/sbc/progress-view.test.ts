@@ -1,4 +1,7 @@
-import { expect, fixtureSync, html } from "@open-wc/testing";
+import { expect, fixtureSync, html, waitUntil } from "@open-wc/testing";
+import { MOCK_BLOCK_DEVICES } from "../../../../src/api/mock-data.js";
+import { storeDriveSelection } from "../../../../src/utils/drive-selection.js";
+import type { FlashRequest } from "../../../../src/api/types.js";
 import { wizardState } from "../../../../src/state/wizard-state.js";
 import "../../../../src/views/sbc/progress-view.js";
 import type { ProgressView } from "../../../../src/views/sbc/progress-view.js";
@@ -16,6 +19,26 @@ describe("progress-view", () => {
   afterEach(() => {
     wizardState.reset();
     restoreTauriIpc();
+  });
+
+  it("sends the selected hardware serial to the backend recheck", async () => {
+    storeDriveSelection(MOCK_BLOCK_DEVICES[0]);
+    wizardState.setSelection("deviceConfig", {
+      board: "rpi5-64",
+      download_url: "https://example.test/haos.img.xz",
+    });
+    let request: FlashRequest | undefined;
+    mockTauriIpc((cmd, args) => {
+      if (cmd !== "flash_image")
+        throw new Error(`Unexpected IPC command: ${cmd}`);
+      request = (args as { request: FlashRequest }).request;
+      return { success: false, error: "Fixture: no disk write" };
+    });
+    fixtureSync<ProgressView>(html`<progress-view></progress-view>`);
+    await waitUntil(() => request !== undefined);
+    expect(request!.expected_device.serial).to.equal(
+      MOCK_BLOCK_DEVICES[0].serial
+    );
   });
 
   it("reports a missing drive or device config to the app shell", async () => {

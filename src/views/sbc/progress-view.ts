@@ -389,6 +389,7 @@ export class ProgressView extends LitElement {
             size: drive.size,
             model: drive.model,
             vendor: drive.vendor,
+            serial: drive.serial,
           },
         },
         (progress) => {

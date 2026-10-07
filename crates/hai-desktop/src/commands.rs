@@ -214,6 +214,7 @@ where
         .write_image(
             &extracted_path,
             &request.device_id,
+            &request.expected_device,
             request.verify,
             callback,
         )
@@ -623,6 +624,7 @@ mod tests {
             removable,
             model: None,
             vendor: None,
+            serial: None,
         }
     }
 
@@ -639,6 +641,21 @@ mod tests {
         let devices = [flash_target("/dev/sdb", true)];
         let device = find_flash_target(&devices, "/dev/sdb", &expected()).unwrap();
         assert_eq!(device.id, "/dev/sdb");
+    }
+
+    #[test]
+    fn test_find_flash_target_checks_serial_even_for_identical_models() {
+        let mut device = flash_target("/dev/sdb", true);
+        let expected = ExpectedDevice {
+            serial: Some("STICK-A".into()),
+            ..expected()
+        };
+        for serial in [None, Some("STICK-B".into())] {
+            device.serial = serial;
+            assert!(find_flash_target(&[device.clone()], "/dev/sdb", &expected).is_err());
+        }
+        device.serial = expected.serial.clone();
+        assert!(find_flash_target(&[device], "/dev/sdb", &expected).is_ok());
     }
 
     #[test]
@@ -702,6 +719,7 @@ mod mock_tests {
                 size: Some(device.size),
                 model: device.model,
                 vendor: device.vendor,
+                serial: device.serial,
             },
         }
     }

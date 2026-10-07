@@ -6,9 +6,8 @@ import { wizardState, type WizardSelections } from "../state/wizard-state.js";
  *
  * The device id doubles as the path handed to the backend (`/dev/sda`,
  * `disk2`, `\\.\PhysicalDrive1`), and the OS is free to hand that same path to
- * a different device once the original is unplugged. `BlockDevice` carries no
- * serial number, so identity is the id plus every other field that
- * distinguishes two devices that could end up sharing it.
+ * a different device once the original is unplugged. Compare the hardware
+ * serial when available, along with the size, model and vendor.
  *
  * `undefined` means the value is unknown.
  */
@@ -18,6 +17,7 @@ export interface DriveIdentity {
   size?: number;
   model?: string;
   vendor?: string;
+  serial?: string;
 }
 
 export function driveIdentity(drive: BlockDevice): DriveIdentity {
@@ -28,6 +28,7 @@ export function driveIdentity(drive: BlockDevice): DriveIdentity {
     // The backend sends null for a value the device does not report.
     model: drive.model ?? undefined,
     vendor: drive.vendor ?? undefined,
+    serial: drive.serial ?? undefined,
   };
 }
 
@@ -44,7 +45,8 @@ export function isSameDrive(a: DriveIdentity, b: DriveIdentity): boolean {
     a.size !== undefined &&
     a.size === b.size &&
     a.model === b.model &&
-    a.vendor === b.vendor
+    a.vendor === b.vendor &&
+    a.serial === b.serial
   );
 }
 
@@ -89,6 +91,7 @@ export function readDriveSelection(
     size: selections.driveSize,
     model: selections.driveModel,
     vendor: selections.driveVendor,
+    serial: selections.driveSerial,
   };
 }
 
@@ -100,6 +103,7 @@ export function storeDriveSelection(drive: BlockDevice) {
   wizardState.setSelection("driveSize", identity.size);
   wizardState.setSelection("driveModel", identity.model);
   wizardState.setSelection("driveVendor", identity.vendor);
+  wizardState.setSelection("driveSerial", identity.serial);
 }
 
 export function clearDriveSelection() {
@@ -108,4 +112,5 @@ export function clearDriveSelection() {
   wizardState.setSelection("driveSize", undefined);
   wizardState.setSelection("driveModel", undefined);
   wizardState.setSelection("driveVendor", undefined);
+  wizardState.setSelection("driveSerial", undefined);
 }

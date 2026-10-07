@@ -23,6 +23,8 @@ pub struct BlockDevice {
     pub model: Option<String>,
     /// Vendor name if available
     pub vendor: Option<String>,
+    /// Hardware serial, when reported by the device (not a filesystem UUID).
+    pub serial: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -168,13 +170,17 @@ pub struct ExpectedDevice {
     pub size: Option<u64>,
     pub model: Option<String>,
     pub vendor: Option<String>,
+    pub serial: Option<String>,
 }
 
 impl ExpectedDevice {
     /// Whether `device` still looks like the selected drive. Every device
     /// reports a size, so an unknown expected size never matches.
     pub fn matches(&self, device: &BlockDevice) -> bool {
-        self.size == Some(device.size) && self.model == device.model && self.vendor == device.vendor
+        self.size == Some(device.size)
+            && self.model == device.model
+            && self.vendor == device.vendor
+            && self.serial == device.serial
     }
 }
 
@@ -535,6 +541,7 @@ mod tests {
             removable: true,
             model: Some("Ultra 32GB".to_string()),
             vendor: Some("SanDisk".to_string()),
+            serial: Some("STICK-A".into()),
         };
 
         let json = serde_json::to_string(&device).unwrap();
@@ -547,6 +554,19 @@ mod tests {
         assert_eq!(device.removable, deserialized.removable);
         assert_eq!(device.model, deserialized.model);
         assert_eq!(device.vendor, deserialized.vendor);
+        assert_eq!(device.serial, deserialized.serial);
+        let expected = ExpectedDevice {
+            size: Some(device.size),
+            model: device.model.clone(),
+            vendor: device.vendor.clone(),
+            serial: device.serial.clone(),
+        };
+        assert!(expected.matches(&deserialized));
+        let mut replacement = deserialized;
+        replacement.serial = Some("STICK-B".into());
+        assert!(!expected.matches(&replacement));
+        replacement.serial = None;
+        assert!(!expected.matches(&replacement));
     }
 
     #[test]
@@ -559,6 +579,7 @@ mod tests {
             removable: false,
             model: None,
             vendor: None,
+            serial: None,
         };
 
         let json = serde_json::to_string(&device).unwrap();
@@ -882,6 +903,7 @@ mod tests {
             removable: true,
             model: None,
             vendor: None,
+            serial: None,
         };
         let json = serde_json::to_string(&device).unwrap();
         assert!(json.contains("\"model\":null"));

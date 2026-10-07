@@ -11,9 +11,11 @@ export interface BlockDevice {
   /** Whether this is a removable device */
   removable: boolean;
   /** Model name if available */
-  model?: string;
+  model?: string | null;
   /** Vendor name if available */
-  vendor?: string;
+  vendor?: string | null;
+  /** Hardware serial if available; never a filesystem UUID */
+  serial?: string | null;
 }
 
 export type DeviceType =
@@ -105,6 +107,7 @@ export interface FlashRequest {
     model?: string;
     /** Omitted when unknown */
     vendor?: string;
+    serial?: string;
   };
 }
 

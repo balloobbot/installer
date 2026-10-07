@@ -9,15 +9,18 @@ use std::sync::mpsc;
 pub async fn write_image<P: ProgressCallback>(
     image_path: &Path,
     device_id: &str,
+    expected: &ExpectedDevice,
     verify: bool,
     progress_callback: &P,
 ) -> Result<()> {
     let disk_number = parse_disk_number(device_id)?;
+    check_identity(&super::device::list_devices_sync()?, device_id, expected)?;
 
     // Clear-Disk is destructive, so make sure the device can be opened for
     // writing (e.g. we are running as Administrator) and its media accepts
     // writes before wiping it.
     let probe = open_device_for_write(device_id)?;
+    check_handle_serial(&probe, expected)?;
     ensure_media_writable(&probe)?;
     drop(probe);
 
@@ -37,11 +40,13 @@ pub async fn write_image<P: ProgressCallback>(
 
     let image_path_clone = image_path.to_path_buf();
     let device_id_clone = device_id.to_string();
+    let expected = expected.clone();
 
     let write_handle = tokio::task::spawn_blocking(move || {
         write_and_verify(
             &image_path_clone,
             &device_id_clone,
+            &expected,
             image_size,
             verify,
             progress_tx,
@@ -70,11 +75,12 @@ pub async fn write_image<P: ProgressCallback>(
 fn write_and_verify(
     image_path: &Path,
     device_path: &str,
+    expected: &ExpectedDevice,
     total_size: u64,
     verify: bool,
     progress_tx: mpsc::Sender<FlashProgress>,
 ) -> Result<()> {
-    write_to_device(image_path, device_path, total_size, &progress_tx)?;
+    write_to_device(image_path, device_path, expected, total_size, &progress_tx)?;
 
     if verify {
         let _ = progress_tx.send(FlashProgress::new(
@@ -112,6 +118,21 @@ fn open_device_for_write(device_path: &str) -> Result<File> {
                 device_io_error(e)
             }
         })
+}
+
+fn check_handle_serial(device: &File, expected: &ExpectedDevice) -> Result<()> {
+    // A known serial must match exactly (apart from surrounding whitespace):
+    // do not silently fall back when a driver omits or changes it.
+    let Some(expected_serial) = &expected.serial else {
+        return Ok(());
+    };
+    let serial = crate::disk::windows_serial::read_serial(device)?;
+    if serial.as_ref() != Some(expected_serial) {
+        return Err(Error::DeviceNotFound(
+            "The selected drive's serial changed or is unavailable. Select it again.".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Ask the disk driver whether the media accepts writes. A write handle opens
@@ -156,12 +177,14 @@ fn ensure_media_writable(device: &File) -> Result<()> {
 fn write_to_device(
     image_path: &Path,
     device_path: &str,
+    expected: &ExpectedDevice,
     total_size: u64,
     progress_tx: &mpsc::Sender<FlashProgress>,
 ) -> Result<()> {
     let mut source = File::open(image_path)?;
 
     let mut dest = open_device_for_write(device_path)?;
+    check_handle_serial(&dest, expected)?;
 
     let mut buffer = vec![0u8; WRITE_BUFFER_SIZE];
     let mut bytes_written: u64 = 0;
@@ -337,7 +360,14 @@ mod tests {
         // Must fail before any PowerShell command runs.
         let device_id = "\\\\.\\PhysicalDrive1; echo injected";
 
-        let result = write_image(&image_path, device_id, false, &crate::NoOpProgress).await;
+        let result = write_image(
+            &image_path,
+            device_id,
+            &ExpectedDevice::default(),
+            false,
+            &crate::NoOpProgress,
+        )
+        .await;
         assert!(matches!(result, Err(Error::DeviceNotFound(_))));
     }
 
@@ -351,7 +381,14 @@ mod tests {
         // Fails at the writability check: the device does not exist.
         let device_id = "\\\\.\\PhysicalDrive999";
 
-        let result = write_image(&image_path, device_id, false, &crate::NoOpProgress).await;
+        let result = write_image(
+            &image_path,
+            device_id,
+            &ExpectedDevice::default(),
+            false,
+            &crate::NoOpProgress,
+        )
+        .await;
         assert!(result.is_err());
     }
 }

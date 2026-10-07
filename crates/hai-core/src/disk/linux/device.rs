@@ -28,6 +28,8 @@ pub(super) struct LsblkDevice {
     #[serde(default)]
     pub(super) vendor: Option<String>,
     #[serde(default)]
+    pub(super) serial: Option<String>,
+    #[serde(default)]
     pub(super) hotplug: Option<bool>,
 }
 
@@ -39,7 +41,7 @@ pub async fn list_devices() -> Result<Vec<BlockDevice>> {
             "-b", // Size in bytes
             "-d", // Don't show partitions
             "-o", // Output columns
-            "NAME,SIZE,TYPE,RM,RO,TRAN,MODEL,VENDOR,HOTPLUG",
+            "NAME,SIZE,TYPE,RM,RO,TRAN,MODEL,VENDOR,SERIAL,HOTPLUG",
         ])
         .output()
         .map_err(Error::Io)?;
@@ -93,6 +95,7 @@ pub async fn list_devices() -> Result<Vec<BlockDevice>> {
             removable: is_removable,
             model,
             vendor,
+            serial: normalize_serial(dev.serial.as_deref()),
         });
     }
 
@@ -146,6 +149,24 @@ mod tests {
     use crate::types::DeviceType;
 
     #[test]
+    fn reads_optional_lsblk_serial() {
+        for (serial, expected) in [
+            ("null", None),
+            ("\"  \"", None),
+            ("\" ABC123 \"", Some("ABC123")),
+        ] {
+            let dev: LsblkDevice =
+                serde_json::from_str(&format!(r#"{{"name":"sdb","serial":{serial}}}"#)).unwrap();
+            assert_eq!(
+                crate::disk::normalize_serial(dev.serial.as_deref()).as_deref(),
+                expected
+            );
+        }
+        let dev: LsblkDevice = serde_json::from_str(r#"{"name":"sdb"}"#).unwrap();
+        assert_eq!(dev.serial, None);
+    }
+
+    #[test]
     fn test_determine_device_type_mmcblk_sd_card() {
         let dev = LsblkDevice {
             name: "mmcblk0".to_string(),
@@ -156,6 +177,7 @@ mod tests {
             tran: None,
             model: None,
             vendor: None,
+            serial: None,
             hotplug: Some(false),
         };
         assert_eq!(determine_device_type(&dev), DeviceType::SdCard);
@@ -172,6 +194,7 @@ mod tests {
             tran: Some("usb".to_string()),
             model: Some("USB Drive".to_string()),
             vendor: Some("Generic".to_string()),
+            serial: None,
             hotplug: Some(true),
         };
         assert_eq!(determine_device_type(&dev), DeviceType::UsbDrive);
@@ -188,6 +211,7 @@ mod tests {
             tran: Some("nvme".to_string()),
             model: Some("Samsung 970 EVO".to_string()),
             vendor: Some("Samsung".to_string()),
+            serial: None,
             hotplug: Some(false),
         };
         assert_eq!(determine_device_type(&dev), DeviceType::Nvme);
@@ -204,6 +228,7 @@ mod tests {
             tran: Some("sata".to_string()),
             model: Some("Samsung SSD 860".to_string()),
             vendor: Some("Samsung".to_string()),
+            serial: None,
             hotplug: Some(false),
         };
         assert_eq!(determine_device_type(&dev), DeviceType::Ssd);
@@ -220,6 +245,7 @@ mod tests {
             tran: Some("sata".to_string()),
             model: Some("WD Blue".to_string()),
             vendor: Some("WD".to_string()),
+            serial: None,
             hotplug: Some(false),
         };
         assert_eq!(determine_device_type(&dev), DeviceType::Hdd);
@@ -236,6 +262,7 @@ mod tests {
             tran: Some("ata".to_string()),
             model: Some("Crucial SSD".to_string()),
             vendor: Some("Crucial".to_string()),
+            serial: None,
             hotplug: Some(false),
         };
         assert_eq!(determine_device_type(&dev), DeviceType::Ssd);
@@ -252,6 +279,7 @@ mod tests {
             tran: Some("unknown".to_string()),
             model: None,
             vendor: None,
+            serial: None,
             hotplug: Some(true),
         };
         assert_eq!(determine_device_type(&dev), DeviceType::Unknown);
@@ -268,6 +296,7 @@ mod tests {
             tran: Some("usb".to_string()),
             model: Some("SD Card Reader".to_string()),
             vendor: None,
+            serial: None,
             hotplug: Some(true),
         };
         assert_eq!(determine_device_type(&dev), DeviceType::SdCard);
@@ -285,6 +314,7 @@ mod tests {
             tran: Some("usb".to_string()),
             model: Some("Portable SSD T7".to_string()),
             vendor: Some("Samsung".to_string()),
+            serial: None,
             hotplug: Some(true),
         };
         assert_eq!(determine_device_type(&dev), DeviceType::UsbDrive);
@@ -301,6 +331,7 @@ mod tests {
             tran: Some("usb".to_string()),
             model: Some("microSD".to_string()),
             vendor: None,
+            serial: None,
             hotplug: Some(true),
         };
         assert_eq!(determine_device_type(&dev), DeviceType::SdCard);
@@ -317,6 +348,7 @@ mod tests {
             tran: Some("usb".to_string()),
             model: Some("SD CARD".to_string()),
             vendor: None,
+            serial: None,
             hotplug: Some(true),
         };
         assert_eq!(determine_device_type(&dev), DeviceType::SdCard);
@@ -333,6 +365,7 @@ mod tests {
             tran: None,
             model: None,
             vendor: None,
+            serial: None,
             hotplug: Some(true),
         };
         assert_eq!(determine_device_type(&dev), DeviceType::Unknown);
