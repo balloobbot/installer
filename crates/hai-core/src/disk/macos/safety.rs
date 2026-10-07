@@ -120,14 +120,17 @@ pub(super) fn system_disks(
                         .into_iter()
                         .map(|store| (store.device_identifier, false)),
                 );
+            } else if disk.is_physical_whole_disk() {
+                // Before the container reference: APFS straight on a whole
+                // disk makes the disk its own store, pointing back at the
+                // container we came from.
+                disks.insert(disk.device_identifier);
             } else if let Some(container) = disk
                 .apfs_container_reference
                 .as_ref()
                 .filter(|container| *container != &disk.device_identifier)
             {
                 pending.push((container.clone(), false));
-            } else if disk.is_physical_whole_disk() {
-                disks.insert(disk.device_identifier);
             } else {
                 return Err(unresolved_system_disk(mount));
             }
@@ -157,6 +160,49 @@ mod tests {
             _ => return Err(Error::DeviceNotFound(device.into())),
         };
         plist::from_bytes(xml.as_bytes()).map_err(|err| Error::InvalidConfig(err.to_string()))
+    }
+
+    /// APFS on a whole disk without a partition map: the disk is its own
+    /// physical store, and like any store it points back at its container.
+    #[test]
+    fn resolves_a_container_on_a_whole_disk_store() {
+        let info = |device: &str| -> Result<DiskInfo> {
+            let xml = match device {
+                "/" => {
+                    r#"<plist version="1.0"><dict>
+                    <key>DeviceIdentifier</key><string>disk3s1s1</string>
+                    <key>ParentWholeDisk</key><string>disk3</string>
+                    </dict></plist>"#
+                }
+                "disk3" => {
+                    r#"<plist version="1.0"><dict>
+                    <key>DeviceIdentifier</key><string>disk3</string>
+                    <key>WholeDisk</key><true/>
+                    <key>VirtualOrPhysical</key><string>Virtual</string>
+                    <key>APFSContainerReference</key><string>disk3</string>
+                    <key>APFSPhysicalStores</key><array>
+                    <dict><key>APFSPhysicalStore</key><string>disk2</string></dict>
+                    </array>
+                    </dict></plist>"#
+                }
+                "disk2" => {
+                    r#"<plist version="1.0"><dict>
+                    <key>DeviceIdentifier</key><string>disk2</string>
+                    <key>ParentWholeDisk</key><string>disk2</string>
+                    <key>WholeDisk</key><true/>
+                    <key>VirtualOrPhysical</key><string>Physical</string>
+                    <key>BusProtocol</key><string>USB</string>
+                    <key>Ejectable</key><true/>
+                    <key>APFSContainerReference</key><string>disk3</string>
+                    </dict></plist>"#
+                }
+                _ => return Err(Error::DeviceNotFound(device.into())),
+            };
+            plist::from_bytes(xml.as_bytes()).map_err(|err| Error::InvalidConfig(err.to_string()))
+        };
+
+        let protected = system_disks(&["/"], info).unwrap();
+        assert_eq!(protected, HashSet::from(["disk2".into()]));
     }
 
     #[test]
