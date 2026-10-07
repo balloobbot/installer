@@ -145,19 +145,6 @@ export const MOCK_MANIFEST: DeviceManifest = {
           "https://github.com/home-assistant/operating-system/releases/download/{version}/haos_odroid-m1s-{version}.img.xz",
       },
     },
-    {
-      id: "odroid-xu4",
-      name: "ODROID-XU4",
-      category: "odroid",
-      image_url: "/assets/devices/hardkernel_odroid-xu4.png",
-      haos: {
-        minimum_storage_bytes: 16_000_000_000,
-        recommended_storage_bytes: 32_000_000_000,
-        board: "odroid-xu",
-        download_url:
-          "https://github.com/home-assistant/operating-system/releases/download/{version}/haos_odroid-xu-{version}.img.xz",
-      },
-    },
     // Khadas devices
     {
       id: "khadas-vim3",
@@ -170,20 +157,6 @@ export const MOCK_MANIFEST: DeviceManifest = {
         board: "khadas-vim3",
         download_url:
           "https://github.com/home-assistant/operating-system/releases/download/{version}/haos_khadas-vim3-{version}.img.xz",
-      },
-    },
-    // ASUS devices
-    {
-      id: "asus-tinker",
-      name: "ASUS Tinker Board",
-      category: "asus",
-      image_url: "/assets/devices/asus_tinker.png",
-      haos: {
-        minimum_storage_bytes: 16_000_000_000,
-        recommended_storage_bytes: 32_000_000_000,
-        board: "tinker",
-        download_url:
-          "https://github.com/home-assistant/operating-system/releases/download/{version}/haos_tinker-{version}.img.xz",
       },
     },
     // Home Assistant Hardware
