@@ -502,7 +502,11 @@ export class ProxmoxConfigureView extends LitElement {
       "proxmoxConfigureReady",
       !this._loadingNodes && !this._loadingStorage && !this._error
     );
-    wizardState.setSelection("proxmoxVmId", this._vmId);
+    // A failed initial lookup must not turn the fallback ID into a choice
+    // that suppresses the next-free-ID suggestion after reconnecting.
+    if (this._vmIdChosen) {
+      wizardState.setSelection("proxmoxVmId", this._vmId);
+    }
     wizardState.setSelection("vmName", this._vmName);
     wizardState.setSelection("cpuCores", this._cpuCores);
     wizardState.setSelection("memoryMb", this._memoryMb);

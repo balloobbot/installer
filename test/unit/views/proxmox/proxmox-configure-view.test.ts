@@ -435,6 +435,9 @@ describe("proxmox-configure-view", () => {
       await waitUntil(() => !!el.shadowRoot!.querySelector("[role=alert]"));
       expect(wizardState.getState().selections.proxmoxSession).to.be.undefined;
       expect(wizardState.getState().selections.proxmoxConnected).to.be.false;
+      if (failingCommand !== "proxmox_list_storage") {
+        expect(wizardState.getState().selections.proxmoxVmId).to.be.undefined;
+      }
       expect(wizardState.getState().selections.proxmoxConfigureReady).to.be
         .false;
       const reconnect = el.shadowRoot!.querySelector("wa-button")!;
