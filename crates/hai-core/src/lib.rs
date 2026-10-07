@@ -36,6 +36,9 @@ pub use types::*;
 
 use std::path::{Path, PathBuf};
 
+/// Stable application identity, shared with the desktop bundle and its app directories.
+pub const APP_IDENTIFIER: &str = "io.home-assistant.installer";
+
 // ===========================================================================
 // Backend traits
 // ===========================================================================

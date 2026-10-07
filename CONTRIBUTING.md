@@ -44,6 +44,29 @@ npm run test:e2e
 cargo test --workspace
 ```
 
+### Application Identity
+
+The product name is **Home Assistant Installer** and the bundle identifier is
+`io.home-assistant.installer`. Keep this identity stable across releases. The core
+`APP_IDENTIFIER` constant and desktop configuration are checked together by a
+desktop unit test. The pinned WiX upgrade code preserves Tauri's original
+product-name-derived UUID, so future display-name changes do not create a new
+MSI upgrade family.
+
+Image downloads use the platform cache root followed by the bundle identifier,
+matching Tauri's `app_cache_dir`:
+
+- Linux: `$XDG_CACHE_HOME/io.home-assistant.installer` (normally
+  `~/.cache/io.home-assistant.installer`).
+- macOS: `~/Library/Caches/io.home-assistant.installer` (unchanged).
+- Windows: `%LOCALAPPDATA%\io.home-assistant.installer`.
+
+Earlier preview builds used different cache directories on Linux and Windows
+(`$XDG_CACHE_HOME/installer`, normally `~/.cache/installer`, or
+`%LOCALAPPDATA%\home-assistant\installer\cache`). These are not automatically
+migrated or deleted: a running preview build may still own their files. Close
+that build before manually removing its leftover cache.
+
 ## Development Guidelines
 
 ### Code Style

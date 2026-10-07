@@ -70,3 +70,26 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn application_identity_is_consistent() {
+        let config: tauri::Config =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(config.identifier, hai_core::APP_IDENTIFIER);
+        assert_eq!(config.identifier, "io.home-assistant.installer");
+        assert_eq!(
+            config.product_name.as_deref(),
+            Some("Home Assistant Installer")
+        );
+        assert!(config.app.app_directories_override.is_none());
+
+        // Preserve the UUID previously derived by Tauri from this product name.
+        let upgrade_code = config.bundle.windows.wix.unwrap().upgrade_code.unwrap();
+        assert_eq!(
+            upgrade_code.to_string(),
+            "09813f85-b90f-5b69-bdbd-616da8341ff0"
+        );
+    }
+}

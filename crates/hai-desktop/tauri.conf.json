@@ -43,6 +43,11 @@
     "macOS": {
       "entitlements": "macos/Entitlements.plist",
       "infoPlist": "macos/Info.plist"
+    },
+    "windows": {
+      "wix": {
+        "upgradeCode": "09813f85-b90f-5b69-bdbd-616da8341ff0"
+      }
     }
   }
 }
