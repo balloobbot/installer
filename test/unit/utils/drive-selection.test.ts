@@ -50,6 +50,21 @@ describe("drive-selection", () => {
         )
       ).to.be.true;
     });
+
+    it("accepts a newly discovered serial but still checks the other metadata", () => {
+      const selected = driveIdentity(makeDrive({ serial: null }));
+      expect(isSameDrive(selected, driveIdentity(makeDrive()))).to.be.true;
+      for (const change of [
+        { id: "/dev/sdb" },
+        { size: 1 },
+        { model: null },
+        { vendor: null },
+      ]) {
+        expect(isSameDrive(selected, driveIdentity(makeDrive(change)))).to.be
+          .false;
+      }
+    });
+
     it("rejects another device that took over the same path", () => {
       expect(
         isSameDrive(
@@ -84,6 +99,15 @@ describe("drive-selection", () => {
       expect(findDrive([hidden], driveIdentity(hidden))).to.be.null;
     }
     expect(findDrive([makeDrive()], driveIdentity(makeDrive()))).to.exist;
+  });
+
+  it("uses the selected serial when finding a drive", () => {
+    const known = makeDrive();
+    const unknown = makeDrive({ serial: null });
+    expect(findDrive([known], driveIdentity(unknown))).to.equal(known);
+    expect(findDrive([unknown], driveIdentity(known))).to.be.null;
+    expect(findDrive([makeDrive({ serial: "STICK-B" })], driveIdentity(known)))
+      .to.be.null;
   });
 
   it("stores the full identity, not just the path", () => {

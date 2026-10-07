@@ -644,6 +644,15 @@ mod tests {
     }
 
     #[test]
+    fn test_find_flash_target_accepts_newly_discovered_serial() {
+        let mut device = flash_target("/dev/sdb", true);
+        device.serial = Some("STICK-A".into());
+        assert!(find_flash_target(&[device.clone()], "/dev/sdb", &expected()).is_ok());
+        device.model = Some("Different model".into());
+        assert!(find_flash_target(&[device], "/dev/sdb", &expected()).is_err());
+    }
+
+    #[test]
     fn test_find_flash_target_checks_serial_even_for_identical_models() {
         let mut device = flash_target("/dev/sdb", true);
         let expected = ExpectedDevice {

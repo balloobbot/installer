@@ -176,11 +176,12 @@ pub struct ExpectedDevice {
 impl ExpectedDevice {
     /// Whether `device` still looks like the selected drive. Every device
     /// reports a size, so an unknown expected size never matches.
+    /// A serial is required only when it was known at selection time.
     pub fn matches(&self, device: &BlockDevice) -> bool {
         self.size == Some(device.size)
             && self.model == device.model
             && self.vendor == device.vendor
-            && self.serial == device.serial
+            && (self.serial.is_none() || self.serial == device.serial)
     }
 }
 
@@ -567,6 +568,58 @@ mod tests {
         assert!(!expected.matches(&replacement));
         replacement.serial = None;
         assert!(!expected.matches(&replacement));
+    }
+
+    #[test]
+    fn test_expected_device_serial_fallback() {
+        let device = BlockDevice {
+            id: "/dev/sdb".into(),
+            name: "USB Drive".into(),
+            size: 32_000_000_000,
+            device_type: DeviceType::UsbDrive,
+            removable: true,
+            model: Some("Ultra Fit".into()),
+            vendor: Some("SanDisk".into()),
+            serial: Some("STICK-A".into()),
+        };
+        let expected = ExpectedDevice {
+            size: Some(device.size),
+            model: device.model.clone(),
+            vendor: device.vendor.clone(),
+            serial: None,
+        };
+        assert!(expected.matches(&device));
+        assert!(expected.matches(&BlockDevice {
+            serial: None,
+            ..device.clone()
+        }));
+        for changed in [
+            BlockDevice {
+                size: 1,
+                ..device.clone()
+            },
+            BlockDevice {
+                model: None,
+                ..device.clone()
+            },
+            BlockDevice {
+                vendor: None,
+                ..device.clone()
+            },
+        ] {
+            assert!(!expected.matches(&changed));
+        }
+        let known = ExpectedDevice {
+            serial: device.serial.clone(),
+            ..expected
+        };
+        assert!(known.matches(&device));
+        for serial in [None, Some("STICK-B".into())] {
+            assert!(!known.matches(&BlockDevice {
+                serial,
+                ..device.clone()
+            }));
+        }
     }
 
     #[test]

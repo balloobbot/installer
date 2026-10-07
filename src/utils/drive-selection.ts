@@ -33,20 +33,24 @@ export function driveIdentity(drive: BlockDevice): DriveIdentity {
 }
 
 /**
- * Whether two snapshots describe the same physical device.
+ * Whether the current snapshot still matches the selected device.
  *
  * `name` is deliberately excluded: it is a display label some enumerators
  * build from the mount state, so it can change while the device does not.
  * An unknown size never matches, since every enumerated device has one.
+ * Only require a serial when it was known at selection time.
  */
-export function isSameDrive(a: DriveIdentity, b: DriveIdentity): boolean {
+export function isSameDrive(
+  selected: DriveIdentity,
+  current: DriveIdentity
+): boolean {
   return (
-    a.id === b.id &&
-    a.size !== undefined &&
-    a.size === b.size &&
-    a.model === b.model &&
-    a.vendor === b.vendor &&
-    a.serial === b.serial
+    selected.id === current.id &&
+    selected.size !== undefined &&
+    selected.size === current.size &&
+    selected.model === current.model &&
+    selected.vendor === current.vendor &&
+    (selected.serial === undefined || selected.serial === current.serial)
   );
 }
 
@@ -74,7 +78,7 @@ export function findDrive(
   return (
     drives
       .filter(isEligibleFlashTarget)
-      .find((drive) => isSameDrive(driveIdentity(drive), identity)) ?? null
+      .find((drive) => isSameDrive(identity, driveIdentity(drive))) ?? null
   );
 }
 
