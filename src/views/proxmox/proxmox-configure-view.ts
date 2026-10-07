@@ -324,7 +324,7 @@ export class ProxmoxConfigureView extends LitElement {
       this._wizardState = state;
     });
     this._restoreSelections();
-    this._loadNodes();
+    void this._loadNodes();
   }
 
   /**
@@ -766,7 +766,7 @@ export class ProxmoxConfigureView extends LitElement {
                           ?selected=${node.name === this._selectedNode}
                         >
                           ${node.name}
-                          ${node.cpu_usage !== undefined
+                          ${node.cpu_usage != null
                             ? `(CPU: ${node.cpu_usage.toFixed(1)}%)`
                             : ""}
                         </option>
