@@ -359,6 +359,8 @@ export class ProxmoxConfigureView extends LitElement {
     // Preserve choices across reconnects, but block Next until revalidated.
     wizardState.setSelection("proxmoxConfigureReady", false);
     const session = this._wizardState.selections.proxmoxSession;
+    const isCurrentSession = () =>
+      this._wizardState.selections.proxmoxSession === session;
 
     if (!session) {
       this._setError({
@@ -377,7 +379,7 @@ export class ProxmoxConfigureView extends LitElement {
 
       // The user may have left this step while the lookups were in flight;
       // saving now would write over what the next step reads
-      if (!this.isConnected) return;
+      if (!this.isConnected || !isCurrentSession()) return;
 
       // An expired session must take precedence over an ordinary failure
       // from the other lookup, regardless of which one finishes first.
@@ -411,16 +413,16 @@ export class ProxmoxConfigureView extends LitElement {
       if (this._selectedNode) {
         await this._loadStorage();
         // The storage lookup is another chance to have left this step
-        if (!this.isConnected) return;
+        if (!this.isConnected || !isCurrentSession()) return;
       }
 
       this._saveSelections();
     } catch (error) {
-      if (!this.isConnected) return;
+      if (!this.isConnected || !isCurrentSession()) return;
       this._setError(error);
     } finally {
       this._loadingNodes = false;
-      if (this.isConnected) this._saveSelections();
+      if (this.isConnected && isCurrentSession()) this._saveSelections();
     }
   }
 
@@ -436,7 +438,10 @@ export class ProxmoxConfigureView extends LitElement {
     // for the same node; only the latest one may update the storage
     const lookup = ++this._storageLookup;
     const isLatest = () => lookup === this._storageLookup;
-    const isStale = () => !this.isConnected || !isLatest();
+    const isCurrentSession = () =>
+      this._wizardState.selections.proxmoxSession === session;
+    const isStale = () =>
+      !this.isConnected || !isLatest() || !isCurrentSession();
 
     this._loadingStorage = true;
     wizardState.setSelection("proxmoxConfigureReady", false);
@@ -461,7 +466,20 @@ export class ProxmoxConfigureView extends LitElement {
 
       this._saveSelections();
     } catch (error) {
-      if (isStale()) return;
+      if (!this.isConnected || !isCurrentSession()) return;
+      if (!isLatest()) {
+        // Session expiry applies to every node, even if this lookup was
+        // superseded. Ordinary failures still belong to the old selection.
+        if (
+          typeof error === "object" &&
+          error !== null &&
+          "session_expired" in error &&
+          error.session_expired === true
+        ) {
+          this._setError(error);
+        }
+        return;
+      }
       // Keep the choice for retry/reconnect; readiness prevents using it
       // until a successful lookup verifies that it is still available.
       this._storages = [];
@@ -471,7 +489,7 @@ export class ProxmoxConfigureView extends LitElement {
       // A newer lookup is still running and owns the loading state
       if (isLatest()) {
         this._loadingStorage = false;
-        if (this.isConnected) this._saveSelections();
+        if (this.isConnected && isCurrentSession()) this._saveSelections();
       }
     }
   }

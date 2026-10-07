@@ -319,6 +319,111 @@ describe("proxmox-configure-view", () => {
     expect(el.shadowRoot!.textContent).to.not.contain("storage unavailable");
   });
 
+  for (const outcome of [
+    "newer success first",
+    "newer success last",
+    "newer failure last",
+    "retry failure last",
+    "replaced session",
+    "detached view",
+  ]) {
+    it(`handles expiry from a superseded storage lookup with ${outcome}`, async () => {
+      wizardState.setSelection("proxmoxConnected", true);
+      wizardState.setSelection("proxmoxVmId", 250);
+      const older = deferred<ProxmoxStorage[]>();
+      const newer = deferred<ProxmoxStorage[]>();
+      const retryNodes = deferred<never>();
+      const storages: ProxmoxStorage[] = [
+        {
+          name: "local",
+          storage_type: "dir",
+          content: ["images"],
+          available: 100,
+          total: 100,
+          active: true,
+        },
+      ];
+      let storageCalls = 0;
+      let nodesCalls = 0;
+      mockTauriIpc((cmd) => {
+        if (cmd === "proxmox_list_nodes") {
+          if (++nodesCalls > 1) return retryNodes.promise;
+          return [
+            { name: "pve", status: "online" },
+            { name: "pve2", status: "online" },
+          ];
+        }
+        if (cmd === "proxmox_get_next_vm_id") return 100;
+        if (cmd === "proxmox_list_storage") {
+          storageCalls++;
+          return storageCalls === 1
+            ? storages
+            : storageCalls === 2
+              ? older.promise
+              : newer.promise;
+        }
+        throw new Error(`Unexpected IPC command: ${cmd}`);
+      });
+      const el = await mount();
+      const nodeSelect = el.shadowRoot!.querySelector("select")!;
+      nodeSelect.value = "pve2";
+      nodeSelect.dispatchEvent(new Event("change"));
+      nodeSelect.value = "pve";
+      nodeSelect.dispatchEvent(new Event("change"));
+      expect(storageCalls).to.equal(3);
+      let session = wizardState.getState().selections.proxmoxSession;
+
+      if (outcome === "newer success first") {
+        newer.resolve(storages);
+        await settle();
+        expect(wizardState.getState().selections.proxmoxConfigureReady).to.be
+          .true;
+      } else if (outcome === "retry failure last") {
+        newer.reject({ message: "Temporary failure", session_expired: false });
+        await settle();
+        el.shadowRoot!.querySelector("wa-button")!.click();
+        await settle();
+        expect(nodesCalls).to.equal(2);
+      } else if (outcome === "replaced session") {
+        session = { ...session!, ticket: "replacement-ticket" };
+        wizardState.setSelection("proxmoxSession", session);
+      } else if (outcome === "detached view") {
+        el.remove();
+      }
+      older.reject({ message: "Session expired", session_expired: true });
+      await settle();
+      if (outcome === "retry failure last") {
+        retryNodes.reject({
+          message: "Temporary failure",
+          session_expired: false,
+        });
+      } else if (outcome === "newer failure last") {
+        newer.reject({ message: "Temporary failure", session_expired: false });
+      } else if (outcome !== "newer success first") {
+        newer.resolve(storages);
+      }
+      await settle();
+      await el.updateComplete;
+
+      const selections = wizardState.getState().selections;
+      expect(selections.proxmoxVmId).to.equal(250);
+      expect(selections.proxmoxConfigureReady).to.be.false;
+      if (outcome === "replaced session" || outcome === "detached view") {
+        expect(selections.proxmoxSession).to.equal(session);
+        expect(selections.proxmoxConnected).to.be.true;
+        expect(el.shadowRoot!.querySelector("[role=alert]")).to.be.null;
+      } else {
+        expect(selections.proxmoxSession).to.be.undefined;
+        expect(selections.proxmoxConnected).to.be.false;
+        expect(el.shadowRoot!.textContent).to.contain("Session expired");
+        expect(el.shadowRoot!.textContent).to.not.contain("Temporary failure");
+        expect(
+          el.shadowRoot!.querySelector("wa-button")!.textContent
+        ).to.contain("Reconnect");
+      }
+    });
+  }
+
   it("blocks Next when the restored node is gone and the new node's lookup fails", async () => {
     wizardState.setSelection("proxmoxNode", "retired-node");
     wizardState.setSelection("proxmoxStorage", "retired-storage");
