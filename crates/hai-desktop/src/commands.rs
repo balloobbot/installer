@@ -1681,6 +1681,7 @@ mod mock_tests {
         assert_eq!(bridges[0].name, "vmbr0");
         assert_eq!(bridges[0].network_type, "bridge");
         assert_eq!(bridges[0].comments, None);
+        assert!(bridges[0].vlan_aware);
     }
 
     #[tokio::test]
