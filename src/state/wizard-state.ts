@@ -67,6 +67,7 @@ export interface WizardSelections {
   proxmoxBridge?: string;
   /** The selected bridge was verified for the current node and session. */
   proxmoxBridgeReady?: boolean;
+  proxmoxVlanTag?: number;
   proxmoxVmId?: number;
   /** Node and storage selections were verified by the current configure view. */
   proxmoxConfigureReady?: boolean;
