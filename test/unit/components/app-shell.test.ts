@@ -403,7 +403,7 @@ describe("app-shell", () => {
       // the progress view reports the flash error itself.
       selectTargets({ withBoard: false });
       await goToStep(el, "flash");
-      await waitUntil(() => shellOf(el).nextLabel === "Try again");
+      await waitUntil(() => shellOf(el).nextLabel === "Choose another drive");
 
       fire(shellOf(el), "wizard-cancel");
       await el.updateComplete;

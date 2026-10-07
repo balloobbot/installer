@@ -1,3 +1,8 @@
+import {
+  installerError,
+  renderErrorHelp,
+  type InstallerError,
+} from "../../utils/installer-error.js";
 import { LitElement, html, css } from "lit";
 import { ViewAccessibility } from "../../utils/view-accessibility.js";
 import { customElement, state } from "lit/decorators.js";
@@ -120,7 +125,7 @@ export class ProxmoxConnectView extends LitElement {
   private _connected = false;
 
   @state()
-  private _error: string | null = null;
+  private _error: InstallerError | null = null;
 
   connectedCallback() {
     super.connectedCallback();
@@ -180,16 +185,7 @@ export class ProxmoxConnectView extends LitElement {
       wizardState.setSelection("proxmoxConnected", true);
       return true;
     } catch (error) {
-      // Tauri invoke errors can be strings, Error objects, or other types
-      if (typeof error === "string") {
-        this._error = error;
-      } else if (error instanceof Error) {
-        this._error = error.message;
-      } else if (error && typeof error === "object" && "message" in error) {
-        this._error = String((error as { message: unknown }).message);
-      } else {
-        this._error = String(error) || "Failed to connect to Proxmox";
-      }
+      this._error = installerError(error, "Failed to connect to Proxmox");
       wizardState.setSelection("proxmoxConnected", false);
       return false;
     } finally {
@@ -225,7 +221,7 @@ export class ProxmoxConnectView extends LitElement {
   }
 
   private async _validationError(message: string): Promise<false> {
-    this._error = message;
+    this._error = installerError(message);
     await this.updateComplete;
     // An identical validation message does not trigger another Lit update.
     if (this.isConnected) {
@@ -359,7 +355,10 @@ export class ProxmoxConnectView extends LitElement {
         </div>
         <div class="status-text">
           <p class="status-title">Connection failed</p>
-          <p class="status-description">${this._error}</p>
+          <p class="status-description" style="overflow-wrap: anywhere;">
+            ${this._error?.message}
+          </p>
+          ${renderErrorHelp()}
         </div>
       </div>
     `;

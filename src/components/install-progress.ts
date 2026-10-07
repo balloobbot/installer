@@ -7,6 +7,7 @@ import {
   renderCasitaSad,
 } from "./install-mascot.js";
 import "./progress-bar.js";
+import { renderErrorHelp } from "../utils/installer-error.js";
 import {
   LiveStatus,
   ReducedSvgMotion,
@@ -350,7 +351,10 @@ export class InstallProgress extends LitElement {
           ${renderCasitaSad()}
         </div>
         <h2>Installation failed</h2>
-        <p class="error-message" role="alert">${this.error}</p>
+        <p class="error-message" role="alert" style="overflow-wrap: anywhere;">
+          ${this.error}
+        </p>
+        ${renderErrorHelp()}
       `;
     }
     const hasBubble = this.stage !== "complete" && this.stage !== "error";
