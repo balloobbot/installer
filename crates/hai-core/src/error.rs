@@ -32,6 +32,9 @@ pub enum Error {
     #[error("Proxmox API error: {0}")]
     ProxmoxApi(String),
 
+    #[error("Proxmox session expired or invalid. Please reconnect to Proxmox.")]
+    ProxmoxSessionExpired,
+
     #[error("UTM error: {0}")]
     Utm(String),
 

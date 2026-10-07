@@ -405,6 +405,22 @@ pub async fn check_ha_updated(ip_address: String) -> bool {
 // Proxmox Commands
 // =============================================================================
 
+/// Preserve authentication failures so the configure view can offer reconnect.
+#[derive(Debug, serde::Serialize)]
+pub struct ProxmoxLookupError {
+    message: String,
+    session_expired: bool,
+}
+
+impl From<hai_core::Error> for ProxmoxLookupError {
+    fn from(error: hai_core::Error) -> Self {
+        Self {
+            message: error.to_string(),
+            session_expired: matches!(error, hai_core::Error::ProxmoxSessionExpired),
+        }
+    }
+}
+
 /// Connect to a Proxmox VE server
 #[tauri::command]
 pub async fn proxmox_connect(credentials: ProxmoxCredentials) -> Result<ProxmoxSession, String> {
@@ -416,11 +432,10 @@ pub async fn proxmox_connect(credentials: ProxmoxCredentials) -> Result<ProxmoxS
 
 /// List available nodes on Proxmox
 #[tauri::command]
-pub async fn proxmox_list_nodes(session: ProxmoxSession) -> Result<Vec<ProxmoxNode>, String> {
-    Backend
-        .list_nodes(&session)
-        .await
-        .map_err(|e| e.to_string())
+pub async fn proxmox_list_nodes(
+    session: ProxmoxSession,
+) -> Result<Vec<ProxmoxNode>, ProxmoxLookupError> {
+    Backend.list_nodes(&session).await.map_err(Into::into)
 }
 
 /// List available storage on a Proxmox node
@@ -428,20 +443,17 @@ pub async fn proxmox_list_nodes(session: ProxmoxSession) -> Result<Vec<ProxmoxNo
 pub async fn proxmox_list_storage(
     session: ProxmoxSession,
     node: String,
-) -> Result<Vec<ProxmoxStorage>, String> {
+) -> Result<Vec<ProxmoxStorage>, ProxmoxLookupError> {
     Backend
         .list_storage(&session, &node)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(Into::into)
 }
 
 /// Get the next available VM ID on Proxmox
 #[tauri::command]
-pub async fn proxmox_get_next_vm_id(session: ProxmoxSession) -> Result<u32, String> {
-    Backend
-        .get_next_vm_id(&session)
-        .await
-        .map_err(|e| e.to_string())
+pub async fn proxmox_get_next_vm_id(session: ProxmoxSession) -> Result<u32, ProxmoxLookupError> {
+    Backend.get_next_vm_id(&session).await.map_err(Into::into)
 }
 
 /// Create a Home Assistant VM on Proxmox
@@ -465,6 +477,20 @@ pub async fn proxmox_create_vm(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_proxmox_lookup_error_preserves_authentication_failure() {
+        let expired = ProxmoxLookupError::from(hai_core::Error::ProxmoxSessionExpired);
+        let value = tauri::ipc::InvokeError::from(expired).0;
+        assert_eq!(value["session_expired"], true);
+        assert!(value["message"].as_str().unwrap().contains("reconnect"));
+
+        let denied =
+            ProxmoxLookupError::from(hai_core::Error::ProxmoxApi("Access denied".to_string()));
+        let value = tauri::ipc::InvokeError::from(denied).0;
+        assert_eq!(value["session_expired"], false);
+        assert_eq!(value["message"], "Proxmox API error: Access denied");
+    }
 
     // ===== Update Info Tests =====
 

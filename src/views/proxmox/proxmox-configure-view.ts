@@ -8,6 +8,7 @@ import {
   formatBytes,
 } from "../../api/commands.js";
 import type { ProxmoxNode, ProxmoxStorage } from "../../api/types.js";
+import "@home-assistant/webawesome/dist/components/button/button.js";
 import {
   DEFAULT_CPU_CORES,
   DEFAULT_DISK_SIZE_GB,
@@ -283,6 +284,9 @@ export class ProxmoxConfigureView extends LitElement {
   private _error: string | null = null;
 
   @state()
+  private _sessionExpired = false;
+
+  @state()
   private _selectedNode = "";
 
   @state()
@@ -349,10 +353,18 @@ export class ProxmoxConfigureView extends LitElement {
   }
 
   private async _loadNodes() {
+    this._loadingNodes = true;
+    this._error = null;
+    this._sessionExpired = false;
+    // Preserve choices across reconnects, but block Next until revalidated.
+    wizardState.setSelection("proxmoxConfigureReady", false);
     const session = this._wizardState.selections.proxmoxSession;
 
     if (!session) {
-      this._error = "No Proxmox session available";
+      this._setError({
+        message: "Connect to Proxmox to continue.",
+        session_expired: true,
+      });
       this._loadingNodes = false;
       return;
     }
@@ -373,6 +385,7 @@ export class ProxmoxConfigureView extends LitElement {
       // user has already been shown and may have changed
       if (!this._vmIdChosen) {
         this._vmId = nextVmId;
+        this._vmIdChosen = true;
       }
 
       // Keep a restored node as long as it is still online
@@ -391,15 +404,11 @@ export class ProxmoxConfigureView extends LitElement {
 
       this._saveSelections();
     } catch (error) {
-      // Tauri invoke errors are strings, not Error objects
-      this._error =
-        typeof error === "string"
-          ? error
-          : error instanceof Error
-            ? error.message
-            : "Failed to load Proxmox nodes";
+      if (!this.isConnected) return;
+      this._setError(error);
     } finally {
       this._loadingNodes = false;
+      if (this.isConnected) this._saveSelections();
     }
   }
 
@@ -418,6 +427,7 @@ export class ProxmoxConfigureView extends LitElement {
     const isStale = () => !this.isConnected || !isLatest();
 
     this._loadingStorage = true;
+    wizardState.setSelection("proxmoxConfigureReady", false);
     try {
       const storages = await proxmoxListStorage(session, node);
 
@@ -440,28 +450,58 @@ export class ProxmoxConfigureView extends LitElement {
       this._saveSelections();
     } catch (error) {
       if (isStale()) return;
-      // Nothing this node offers could be checked, so neither a restored
-      // storage nor one from a previous node may stay selected: an empty one
-      // keeps the step from continuing
+      // Keep the choice for retry/reconnect; readiness prevents using it
+      // until a successful lookup verifies that it is still available.
       this._storages = [];
-      this._selectedStorage = "";
       this._saveSelections();
-      // Show storage error to user
-      this._error =
-        typeof error === "string"
-          ? error
-          : error instanceof Error
-            ? error.message
-            : "Failed to load storage";
+      this._setError(error);
     } finally {
       // A newer lookup is still running and owns the loading state
-      if (isLatest()) this._loadingStorage = false;
+      if (isLatest()) {
+        this._loadingStorage = false;
+        if (this.isConnected) this._saveSelections();
+      }
     }
+  }
+
+  private _setError(error: unknown) {
+    this._sessionExpired =
+      typeof error === "object" &&
+      error !== null &&
+      "session_expired" in error &&
+      error.session_expired === true;
+    this._error =
+      typeof error === "string"
+        ? error
+        : typeof error === "object" &&
+            error !== null &&
+            "message" in error &&
+            typeof error.message === "string"
+          ? error.message
+          : "Failed to load Proxmox configuration";
+    if (this._sessionExpired) {
+      wizardState.setSelection("proxmoxSession", undefined);
+      wizardState.setSelection("proxmoxConnected", false);
+    }
+    wizardState.setSelection("proxmoxConfigureReady", false);
+  }
+
+  private _retry() {
+    if (this._loadingNodes || this._loadingStorage) return;
+    this._loadNodes();
+  }
+
+  private _reconnect() {
+    wizardState.goToStep(0);
   }
 
   private _saveSelections() {
     wizardState.setSelection("proxmoxNode", this._selectedNode);
     wizardState.setSelection("proxmoxStorage", this._selectedStorage);
+    wizardState.setSelection(
+      "proxmoxConfigureReady",
+      !this._loadingNodes && !this._loadingStorage && !this._error
+    );
     wizardState.setSelection("proxmoxVmId", this._vmId);
     wizardState.setSelection("vmName", this._vmName);
     wizardState.setSelection("cpuCores", this._cpuCores);
@@ -657,7 +697,14 @@ export class ProxmoxConfigureView extends LitElement {
         <h2>Configure virtual machine</h2>
         <p class="subtitle">Configure your Home Assistant VM on Proxmox</p>
         <div class="config-card">
-          <p class="error-text">${this._error}</p>
+          <p class="error-text" role="alert">${this._error}</p>
+          <wa-button
+            variant="brand"
+            @click=${this._sessionExpired ? this._reconnect : this._retry}
+            ?disabled=${this._loadingNodes || this._loadingStorage}
+          >
+            ${this._sessionExpired ? "Reconnect" : "Try again"}
+          </wa-button>
         </div>
       `;
     }
