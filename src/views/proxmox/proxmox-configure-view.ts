@@ -488,7 +488,7 @@ export class ProxmoxConfigureView extends LitElement {
 
   private _retry() {
     if (this._loadingNodes || this._loadingStorage) return;
-    this._loadNodes();
+    void this._loadNodes();
   }
 
   private _reconnect() {
