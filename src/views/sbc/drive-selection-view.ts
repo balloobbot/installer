@@ -248,9 +248,11 @@ export class DriveSelectionView extends LitElement {
 
     let drives: BlockDevice[];
     let error: InstallerError | null = null;
+    let scanError: unknown;
     try {
       drives = (await listBlockDevices()).filter((drive) => drive.removable);
     } catch (err) {
+      scanError = err;
       error = installerError(err, "Failed to load drives");
       // The scan failed, so the selection cannot be confirmed. Drop it rather
       // than let a stale path through to the write.
@@ -265,7 +267,7 @@ export class DriveSelectionView extends LitElement {
 
     this._drives = drives;
     this._error = error;
-    if (error) new InstallDiagnostics("flash").fail(error);
+    if (error) new InstallDiagnostics("flash").fail(scanError);
     this._loading = false;
     this._reconcileSelection();
   }
