@@ -66,7 +66,7 @@ export function installerError(
       !Array.isArray(error.details)
         ? (error.details as Record<string, unknown>)
         : {};
-    let message = Object.hasOwn(messages, error.code)
+    let message = Object.prototype.hasOwnProperty.call(messages, error.code)
       ? messages[error.code]
       : error.message || fallback;
     if (
