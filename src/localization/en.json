@@ -349,5 +349,8 @@
   "views.proxmox.proxmox_configure_view.enable_import_on_storage_title": "Enable Import on storage?",
   "views.proxmox.proxmox_configure_view.enable_import_on_storage_message": "Enable Import on \"{storage}\"? Existing content types are preserved. This changes the storage configuration cluster-wide and remains enabled after installation. The installer will not automatically restore the previous setting.",
   "views.proxmox.proxmox_configure_view.enable_import": "Enable Import",
-  "views.proxmox.proxmox_configure_view.not_now": "Not now"
+  "views.proxmox.proxmox_configure_view.not_now": "Not now",
+  "views.proxmox.proxmox_success_view.import_storage_reminder": "Import storage reminder",
+  "views.proxmox.proxmox_success_view.installer_enabled_import_on_storages": "This installer enabled Import on {storages}. This is a cluster-wide setting; the installer does not restore it automatically.",
+  "views.proxmox.proxmox_success_view.review_import_in_proxmox": "Review the storage in Proxmox and remove Import only if no other workflows need it. Keep the other content types unchanged."
 }

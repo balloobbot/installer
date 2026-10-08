@@ -559,6 +559,7 @@ export class ProxmoxConfigureView extends LitElement {
       return;
 
     const lookup = this._storageLookup;
+    const flowGeneration = wizardState.flowGeneration;
     const isCurrent = () =>
       this.isConnected &&
       this._wizardState.selections.proxmoxSession === session &&
@@ -568,7 +569,16 @@ export class ProxmoxConfigureView extends LitElement {
     this._importBusy = true;
     this._importError = null;
     try {
-      await proxmoxEnableStorageImport(session, node, storage);
+      const changed = await proxmoxEnableStorageImport(session, node, storage);
+      // The change is cluster-wide, so leaving the step or picking another
+      // node does not undo it. Only a newer flow must not inherit it.
+      if (
+        changed &&
+        wizardState.flowGeneration === flowGeneration &&
+        wizardState.getState().currentFlow === "proxmox"
+      ) {
+        this._rememberImportChange(session.server_url, storage);
+      }
       if (!isCurrent()) return;
       // Only a fresh read decides readiness, so the step never trusts its
       // own assumption about what the server now has
@@ -587,6 +597,26 @@ export class ProxmoxConfigureView extends LitElement {
     } finally {
       if (isCurrent()) this._importBusy = false;
     }
+  }
+
+  /** Remember a change once per server, for the post-install reminder. */
+  private _rememberImportChange(serverUrl: string, storage: string) {
+    // A renewed login may spell the same server differently
+    const serverOrigin = new URL(serverUrl).origin;
+    const changes =
+      wizardState.getState().selections.proxmoxImportChanges ?? [];
+    if (
+      changes.some(
+        (change) =>
+          change.serverOrigin === serverOrigin && change.storage === storage
+      )
+    )
+      return;
+
+    wizardState.setSelection("proxmoxImportChanges", [
+      ...changes,
+      { serverOrigin, storage },
+    ]);
   }
 
   private _onImportStorageChange(e: Event) {
