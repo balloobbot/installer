@@ -8,6 +8,7 @@ import {
   ViewAccessibility,
   reducedMotionStyles,
 } from "../../utils/view-accessibility.js";
+import { InstallDiagnostics } from "../../utils/diagnostics.js";
 import { customElement, state } from "lit/decorators.js";
 import {
   formatBytes,
@@ -264,6 +265,7 @@ export class DriveSelectionView extends LitElement {
 
     this._drives = drives;
     this._error = error;
+    if (error) new InstallDiagnostics("flash").fail(error);
     this._loading = false;
     this._reconcileSelection();
   }
