@@ -2,10 +2,14 @@ import { expect, fixture, html, waitUntil } from "@open-wc/testing";
 import "../../../src/components/app-shell.js";
 import type { AppShell } from "../../../src/components/app-shell.js";
 import type { ConfirmDialog } from "../../../src/components/confirm-dialog.js";
-import { MOCK_BLOCK_DEVICES } from "../../../src/api/mock-data.js";
+import {
+  MOCK_BLOCK_DEVICES,
+  MOCK_MANIFEST,
+} from "../../../src/api/mock-data.js";
 import { wizardState } from "../../../src/state/wizard-state.js";
 import { storeDriveSelection } from "../../../src/utils/drive-selection.js";
 import { flush, holdDeviceScan } from "../helpers/hold-device-scan.js";
+import { deferred, mockTauriIpc, restoreTauriIpc } from "../tauri-ipc.js";
 
 // Browser-only mode (no Tauri) serves MOCK_BLOCK_DEVICES, so this is the drive
 // that is "connected" for the duration of these tests.
@@ -15,6 +19,7 @@ interface WizardShell extends HTMLElement {
   nextLabel: string;
   nextDisabled: boolean;
   hideFooter: boolean;
+  nextDisabled: boolean;
 }
 
 interface ErrorFlags {
@@ -40,11 +45,7 @@ function selectTargets({ withBoard = true } = {}) {
   wizardState.setSelection("device", "rpi5");
   wizardState.setSelection("deviceName", "Raspberry Pi 5");
   if (withBoard) {
-    wizardState.setSelection("deviceConfig", {
-      board: "rpi5-64",
-      download_url:
-        "https://github.com/home-assistant/operating-system/releases/download/{version}/haos_rpi5-64-{version}.img.xz",
-    });
+    wizardState.setSelection("deviceConfig", MOCK_MANIFEST.devices[0].haos);
   }
   storeDriveSelection(CONNECTED);
 }
@@ -82,6 +83,61 @@ describe("app-shell", () => {
     // "complete" would advance the shared wizard state under a later test.
     el.shadowRoot?.querySelector("wizard-shell")?.remove();
     wizardState.reset();
+    restoreTauriIpc();
+  });
+
+  it("keeps Next disabled until restored Proxmox choices have been verified", async () => {
+    fire(el.shadowRoot!.querySelector("welcome-view")!, "navigate", {
+      view: "path-selection",
+    });
+    await el.updateComplete;
+    fire(el.shadowRoot!.querySelector("path-selection-view")!, "select-path", {
+      path: "proxmox",
+    });
+    await el.updateComplete;
+    wizardState.setSelection("proxmoxSession", {
+      server_url: "https://pve:8006",
+      ticket: "test",
+      csrf_token: "test",
+    });
+    wizardState.setSelection("proxmoxNode", "pve");
+    wizardState.setSelection("proxmoxStorage", "local");
+    wizardState.setSelection("proxmoxConfigureReady", true);
+    const storage = deferred<unknown>();
+    mockTauriIpc((cmd) => {
+      if (cmd === "proxmox_list_nodes")
+        return [{ name: "pve", status: "online" }];
+      if (cmd === "proxmox_get_next_vm_id") return 100;
+      if (cmd === "proxmox_list_storage") return storage.promise;
+      throw new Error(cmd);
+    });
+    await goToStep(el, "configure");
+    await waitUntil(() => shellOf(el).nextDisabled);
+    expect(wizardState.getState().selections.proxmoxStorage).to.equal("local");
+    storage.reject({ message: "Temporary failure", session_expired: false });
+    await waitUntil(
+      () =>
+        !!el
+          .shadowRoot!.querySelector("proxmox-configure-view")!
+          .shadowRoot!.querySelector("[role=alert]")
+    );
+    expect(shellOf(el).nextDisabled).to.be.true;
+    mockTauriIpc((cmd) => {
+      if (cmd === "proxmox_list_nodes")
+        return [{ name: "pve", status: "online" }];
+      if (cmd === "proxmox_get_next_vm_id") return 100;
+      if (cmd === "proxmox_list_storage")
+        return [
+          { name: "local", active: true, content: ["images"], available: 100 },
+        ];
+      throw new Error(cmd);
+    });
+    (
+      el
+        .shadowRoot!.querySelector("proxmox-configure-view")!
+        .shadowRoot!.querySelector("wa-button") as HTMLElement
+    ).click();
+    await waitUntil(() => !shellOf(el).nextDisabled);
   });
 
   for (const [flow, step] of [
@@ -170,6 +226,23 @@ describe("app-shell", () => {
         () => wizardState.currentStep?.id === "drive",
         "the write was not held back"
       );
+    });
+
+    it("rechecks the board minimum before erasing", async () => {
+      fire(shellOf(el), "wizard-next");
+      await waitUntil(() => dialogOf(el).hasAttribute("open"));
+
+      wizardState.setSelection("deviceConfig", {
+        ...MOCK_MANIFEST.devices[0].haos,
+        minimum_storage_bytes: CONNECTED.size * 2,
+        recommended_storage_bytes: CONNECTED.size * 2,
+      });
+      fire(dialogOf(el), "dialog-confirm");
+      await waitUntil(() => wizardState.currentStep?.id === "drive");
+      await waitUntil(
+        () => wizardState.getState().selections.drive === undefined
+      );
+      expect(dialogOf(el).hasAttribute("open")).to.be.false;
     });
   });
 
