@@ -1,4 +1,4 @@
-import { expect, fixture, html } from "@open-wc/testing";
+import { expect, fixture, html, waitUntil } from "@open-wc/testing";
 import type WaInput from "@home-assistant/webawesome/dist/components/input/input.js";
 import "../../../../src/views/proxmox/proxmox-connect-view.js";
 import type { ProxmoxConnectView } from "../../../../src/views/proxmox/proxmox-connect-view.js";
@@ -81,7 +81,7 @@ describe("proxmox-connect-view", () => {
     expect(names).to.include.members(["Server URL", "Username", "Password"]);
   });
 
-  it("does not show certificate approval until an untrusted issuer is detected", async () => {
+  it("does not show certificate approval until an untrusted certificate is detected", async () => {
     const { el } = await renderView();
 
     expect(el.shadowRoot!.querySelector("wa-dialog")!.open).to.be.false;
@@ -265,7 +265,7 @@ describe("proxmox-connect-view", () => {
     );
   });
 
-  it("waits for fingerprint comparison before sending credentials and preserves the pin", async () => {
+  it("waits for the user to trust the certificate before sending credentials and preserves the pin", async () => {
     const calls: string[] = [];
     const fingerprint = Array(32).fill("AB").join(":");
     mockTauriIpc((cmd, args) => {
@@ -296,13 +296,7 @@ describe("proxmox-connect-view", () => {
     expect(dialog.open).to.be.true;
     expect(dialog.textContent).to.include(fingerprint);
     expect(dialog.textContent).to.include("https://pve.example:8006");
-    const trust = dialog.querySelectorAll("wa-button")[1];
-    expect(trust.disabled).to.be.true;
-    const checkbox = dialog.querySelector("wa-checkbox")!;
-    checkbox.checked = true;
-    checkbox.dispatchEvent(new Event("change", { bubbles: true }));
-    await el.updateComplete;
-    trust.click();
+    dialog.querySelectorAll("wa-button")[1].click();
     expect(await connecting).to.be.true;
     expect(
       wizardState.getState().selections.proxmoxSession?.certificate_sha256
@@ -312,6 +306,61 @@ describe("proxmox-connect-view", () => {
       "proxmox_certificate_fingerprint",
       "proxmox_connect",
     ]);
+  });
+
+  it("asks once per server and certificate, even when a second attempt is needed", async () => {
+    const calls: string[] = [];
+    let fingerprint = Array(32).fill("AB").join(":");
+    let attempts = 0;
+    mockTauriIpc((cmd) => {
+      calls.push(cmd);
+      if (cmd === "proxmox_certificate_fingerprint") return fingerprint;
+      attempts++;
+      // The first login asks for an authenticator code
+      throw {
+        code: "proxmox_two_factor",
+        message: "This account requires an authenticator app code.",
+        retryable: false,
+        details: {},
+      };
+    });
+    const { el, inputs } = await renderView();
+    await typeInto(el, inputs[0], "https://pve.example:8006");
+    await typeInto(el, inputs[2], "secret");
+    const dialog = el.shadowRoot!.querySelector("wa-dialog")!;
+    // The fingerprint waiting for an answer; wa-dialog's own open state
+    // trails behind its hide animation
+    const asking = () =>
+      dialog.querySelector(".fingerprint")!.textContent!.trim();
+    const trustCertificate = async () => {
+      await waitUntil(() => asking() === fingerprint, "certificate not shown");
+      dialog.querySelectorAll("wa-button")[1].click();
+      await el.updateComplete;
+      expect(asking()).to.equal("");
+    };
+
+    let connecting = el.connect();
+    await trustCertificate();
+    expect(await connecting).to.be.false;
+
+    // Same server, same certificate: straight to the login
+    expect(await el.connect()).to.be.false;
+    expect(attempts).to.equal(2);
+    expect(asking()).to.equal("");
+
+    // A different certificate is a new question
+    fingerprint = Array(32).fill("CD").join(":");
+    connecting = el.connect();
+    await trustCertificate();
+    expect(await connecting).to.be.false;
+    expect(attempts).to.equal(3);
+
+    // So is a different server address
+    await typeInto(el, inputs[0], "https://pve.example:8007");
+    connecting = el.connect();
+    await trustCertificate();
+    expect(await connecting).to.be.false;
+    expect(attempts).to.equal(4);
   });
 
   for (const action of ["cancel", "dismiss", "disconnect"] as const) {

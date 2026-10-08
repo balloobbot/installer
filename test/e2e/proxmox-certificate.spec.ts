@@ -21,6 +21,7 @@ for (const width of [1100, 390]) {
       win.certificateCalls = [];
       win.__TAURI_INTERNALS__ = {
         invoke: async (cmd, args) => {
+          if (cmd === "log_frontend_event") return;
           win.certificateCalls.push(cmd);
           if (cmd === "proxmox_certificate_fingerprint")
             return Array(32).fill("AB").join(":");
@@ -65,12 +66,13 @@ for (const width of [1100, 390]) {
       .locator("proxmox-connect-view input[type=password]")
       .press("Enter");
     const dialog = page.getByRole("dialog", {
-      name: "Verify Proxmox certificate",
+      name: "Trust this Proxmox server?",
     });
     await expect(dialog).toBeVisible();
-    await expect(
-      page.getByRole("button", { name: "Trust for this session" })
-    ).toBeDisabled();
+    // The explanation and fingerprint are slotted into wa-dialog
+    await expect(page.locator("proxmox-connect-view wa-dialog")).toContainText(
+      Array(32).fill("AB").join(":")
+    );
     expect(
       await page.evaluate(
         () =>
@@ -88,15 +90,7 @@ for (const width of [1100, 390]) {
     ).toEqual(["proxmox_certificate_fingerprint"]);
     await page.getByRole("button", { name: "Next", exact: true }).click();
     await expect(dialog).toBeVisible();
-    await page
-      .getByText("I compared the fingerprints and they match", { exact: true })
-      .click();
-    await expect(
-      page.getByRole("checkbox", {
-        name: "I compared the fingerprints and they match",
-      })
-    ).toBeChecked();
-    await page.getByRole("button", { name: "Trust for this session" }).click();
+    await page.getByRole("button", { name: "Trust and connect" }).click();
     await expect(page.locator("proxmox-configure-view")).toBeVisible();
     await page.getByRole("button", { name: /Back/ }).click();
     await expect(page.locator("proxmox-connect-view")).toBeVisible();

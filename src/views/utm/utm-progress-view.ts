@@ -1,4 +1,12 @@
+import {
+  installerError,
+  type InstallerError,
+} from "../../utils/installer-error.js";
 import { LitElement, html, css } from "lit";
+import {
+  InstallDiagnostics,
+  logFrontendError,
+} from "../../utils/diagnostics.js";
 import { customElement, state } from "lit/decorators.js";
 import { wizardState, type WizardState } from "../../state/wizard-state.js";
 import {
@@ -20,6 +28,7 @@ import {
   DEFAULT_UTM_VM_NAME,
 } from "../../state/vm-defaults.js";
 import {
+  PollTimeoutError,
   isCancelled,
   pollUntil,
   throwIfCancelled,
@@ -93,12 +102,13 @@ export class UtmProgressView extends LitElement {
   private _totalBytes = 0;
 
   @state()
-  private _error: string | null = null;
+  private _error: InstallerError | null = null;
 
   @state()
   private _isInstalling = false;
 
   private _stageStartTime: number | null = null;
+  private _diagnostics?: InstallDiagnostics;
   private _stageStartBytes: number = 0;
   private _unsubscribe?: () => void;
   private _abortController?: AbortController;
@@ -131,6 +141,7 @@ export class UtmProgressView extends LitElement {
    * of being run again - see `_startInstall`.
    */
   retry(): void {
+    if (!this._error?.retryable) return;
     this._error = null;
     this._stage = "downloading";
     this._progress = 0;
@@ -174,6 +185,7 @@ export class UtmProgressView extends LitElement {
     const { signal } = controller;
 
     this._isInstalling = true;
+    this._diagnostics = new InstallDiagnostics("utm");
     this._error = null;
 
     const selections = this._wizardState.selections;
@@ -246,6 +258,7 @@ export class UtmProgressView extends LitElement {
       throwIfCancelled(signal);
 
       // Complete
+      this._diagnostics?.advance("complete");
       this._stage = "complete";
       this._progress = 100;
 
@@ -267,15 +280,22 @@ export class UtmProgressView extends LitElement {
         return;
       }
 
+      this._diagnostics?.fail(error);
       this._stage = "error";
-      this._error =
-        error instanceof Error
-          ? error.message
-          : typeof error === "string" && error.trim()
-            ? error
-            : "Failed to create virtual machine";
+      this._error = installerError(
+        error instanceof PollTimeoutError
+          ? {
+              code: "timeout",
+              message: error.message,
+              retryable: true,
+              details: {},
+            }
+          : error,
+        "Failed to create virtual machine"
+      );
       this.dispatchEvent(
         new CustomEvent("install-error", {
+          detail: { retryable: this._error.retryable },
           bubbles: true,
           composed: true,
         })
@@ -290,7 +310,7 @@ export class UtmProgressView extends LitElement {
         try {
           await discardUtmImage(imagePath);
         } catch (error) {
-          console.warn("Could not release temporary UTM image", error);
+          logFrontendError(error);
         }
       }
     }
@@ -346,6 +366,7 @@ export class UtmProgressView extends LitElement {
 
   /** Move to an indeterminate stage, clearing the previous stage's progress */
   private _startStage(stage: InstallStage) {
+    this._diagnostics?.advance(stage);
     this._stage = stage;
     this._progress = 0;
     this._stageStartTime = null;
@@ -355,6 +376,7 @@ export class UtmProgressView extends LitElement {
 
   /** Download the HAOS qcow2 image, reporting download and extract progress */
   private async _downloadImage(signal: AbortSignal): Promise<string> {
+    this._diagnostics?.advance("downloading");
     this._stage = "downloading";
     this._progress = 0;
     this._stageStartTime = Date.now();
@@ -367,6 +389,7 @@ export class UtmProgressView extends LitElement {
 
       // Track stage changes
       if (progress.stage === "extracting" && this._stage === "downloading") {
+        this._diagnostics?.advance("extracting");
         this._stage = "extracting";
         this._stageStartTime = Date.now();
         this._stageStartBytes = progress.bytes_processed;
@@ -434,7 +457,7 @@ export class UtmProgressView extends LitElement {
         .indeterminate=${this._isIndeterminate(stage)}
         .measurable=${this._hasMeasurableProgress(stage)}
         .hideEmptyDetails=${true}
-        .error=${this._error}
+        .error=${this._error?.message ?? null}
       ></install-progress>
     `;
   }

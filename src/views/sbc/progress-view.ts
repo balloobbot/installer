@@ -1,9 +1,15 @@
+import {
+  installerError,
+  type InstallerError,
+} from "../../utils/installer-error.js";
 import { LitElement, html, css } from "lit";
 import { customElement, state } from "lit/decorators.js";
 import { wizardState, type WizardState } from "../../state/wizard-state.js";
 import { flashImage, type FlashProgress } from "../../api/index.js";
 import { readDriveSelection } from "../../utils/drive-selection.js";
 import "../../components/install-progress.js";
+import "../../components/progress-bar.js";
+import { InstallDiagnostics } from "../../utils/diagnostics.js";
 
 @customElement("progress-view")
 export class ProgressView extends LitElement {
@@ -24,12 +30,13 @@ export class ProgressView extends LitElement {
   private _progress: FlashProgress | null = null;
 
   @state()
-  private _error: string | null = null;
+  private _error: InstallerError | null = null;
 
   @state()
   private _isFlashing = false;
 
   private _stageStartTime: number | null = null;
+  private _diagnostics?: InstallDiagnostics;
   private _stageStartBytes: number = 0;
 
   /** Whether the flash operation has failed */
@@ -39,6 +46,7 @@ export class ProgressView extends LitElement {
 
   /** Retry the flash operation */
   retry(): void {
+    if (!this._error?.retryable) return;
     this._error = null;
     this._progress = null;
     this._stageStartTime = null;
@@ -67,6 +75,7 @@ export class ProgressView extends LitElement {
     if (this._isFlashing) return;
 
     this._isFlashing = true;
+    this._diagnostics = new InstallDiagnostics("flash");
     this._error = null;
 
     const selections = this._wizardState.selections;
@@ -80,7 +89,7 @@ export class ProgressView extends LitElement {
     }
 
     try {
-      const result = await flashImage(
+      await flashImage(
         {
           device_id: drive.id,
           board: deviceConfig.board,
@@ -94,6 +103,7 @@ export class ProgressView extends LitElement {
           },
         },
         (progress) => {
+          this._diagnostics?.advance(progress.stage);
           // Track stage changes for ETA calculation
           const prevStage = this._progress?.stage;
           if (prevStage !== progress.stage) {
@@ -109,34 +119,19 @@ export class ProgressView extends LitElement {
           }
         }
       );
-
-      if (!result.success) {
-        this._setError(result.error || "Flash failed");
-      }
     } catch (err) {
-      // Tauri invoke errors come as strings, not Error objects
-      const errorMessage =
-        typeof err === "string"
-          ? err
-          : err instanceof Error
-            ? err.message
-            : "An unexpected error occurred";
-      this._setError(errorMessage);
+      this._setError(err);
     } finally {
       this._isFlashing = false;
     }
   }
 
-  private _setError(message: string) {
-    // Provide user-friendly messages for specific error types
-    if (message.toLowerCase().includes("disconnected")) {
-      this._error =
-        "The storage device was disconnected during the installation. Please reconnect it and try again.";
-    } else {
-      this._error = message;
-    }
+  private _setError(error: unknown) {
+    this._diagnostics?.fail(error);
+    this._error = installerError(error);
     this.dispatchEvent(
       new CustomEvent("flash-error", {
+        detail: { retryable: this._error.retryable },
         bubbles: true,
         composed: true,
       })
@@ -175,7 +170,7 @@ export class ProgressView extends LitElement {
         .indeterminate=${!this._progress?.total_bytes && stage !== "complete"}
         .measurable=${!!this._progress?.total_bytes || stage === "complete"}
         .showUnknownBytes=${true}
-        .error=${this._error}
+        .error=${this._error?.message ?? null}
       ></install-progress>
     `;
   }

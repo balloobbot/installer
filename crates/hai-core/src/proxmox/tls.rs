@@ -1,9 +1,9 @@
-//! Normal TLS validation, with explicit session-only leaf certificate pinning.
+//! Normal TLS validation, or a session-only pin on a certificate the user trusted.
 
 use crate::error::{Error, Result};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{CertificateError, DigitallySignedStruct, SignatureScheme};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 
@@ -15,7 +15,7 @@ pub(super) fn certificate_error(error: &reqwest::Error) -> Option<Error> {
     loop {
         let tls = source.downcast_ref::<rustls::Error>();
         if matches!(tls, Some(rustls::Error::General(message)) if message == CERTIFICATE_CHANGED) {
-            return Some(Error::ProxmoxApi(CERTIFICATE_CHANGED.into()));
+            return Some(Error::ProxmoxCertificateChanged);
         }
         // io::Error::source skips its wrapped error, so inspect it explicitly.
         source = if let Some(inner) = source
@@ -32,7 +32,7 @@ pub(super) fn certificate_error(error: &reqwest::Error) -> Option<Error> {
 /// Only bare HTTPS origins are accepted, including normalized scheme casing.
 pub fn server_url(value: &str) -> Result<reqwest::Url> {
     let url = reqwest::Url::parse(value)
-        .map_err(|_| Error::ProxmoxApi("Enter a valid HTTPS server URL".into()))?;
+        .map_err(|_| Error::ProxmoxActionRequired("Enter a valid HTTPS server URL".into()))?;
     if url.scheme() != "https"
         || url.host_str().is_none()
         || !url.username().is_empty()
@@ -41,7 +41,7 @@ pub fn server_url(value: &str) -> Result<reqwest::Url> {
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        return Err(Error::ProxmoxApi(
+        return Err(Error::ProxmoxActionRequired(
             "Use an HTTPS server URL without credentials, a path, query, or fragment".into(),
         ));
     }
@@ -179,135 +179,9 @@ impl ServerCertVerifier for PinnedVerifier {
 #[derive(Debug)]
 struct ProbeVerifier {
     normal: Arc<dyn ServerCertVerifier>,
-    result: Mutex<Option<std::result::Result<Option<String>, String>>>,
-}
-
-// Apple exposes some issuer failures as an untyped Other error in platform-verifier.
-// Re-evaluate with the native SSL policy to inspect status codes, never error text.
-#[cfg(target_os = "macos")]
-fn apple_unknown_issuer(
-    cert: &CertificateDer<'_>,
-    intermediates: &[CertificateDer<'_>],
-    server_name: &ServerName<'_>,
-    ocsp: &[u8],
-    now: UnixTime,
-) -> Option<bool> {
-    use core_foundation::date::CFDate;
-    use security_framework::{
-        certificate::SecCertificate,
-        policy::SecPolicy,
-        secure_transport::SslProtocolSide,
-        trust::{SecTrust, TrustResult},
-    };
-    use security_framework_sys::base;
-
-    let certificates = std::iter::once(cert)
-        .chain(intermediates)
-        .map(|cert| SecCertificate::from_der(cert.as_ref()))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .ok()?;
-    let policy = SecPolicy::create_ssl(SslProtocolSide::SERVER, Some(&server_name.to_str()));
-    let mut trust = SecTrust::create_with_certificates(&certificates, &[policy]).ok()?;
-    // CFAbsoluteTime starts on 2001-01-01, unlike UnixTime's 1970 epoch.
-    let seconds = now.as_secs().checked_sub(978_307_200)?;
-    trust
-        .set_trust_verify_date(&CFDate::new(seconds as f64))
-        .ok()?;
-    if !ocsp.is_empty() {
-        trust.set_trust_ocsp_response(std::iter::once(ocsp)).ok()?;
-    }
-    let error = trust.evaluate_with_error().err()?;
-    // The safe wrapper exposes the trust result only through this older API.
-    // Explicit user distrust (DENY), fatal failures, and other errors stay fatal.
-    #[allow(deprecated)]
-    let result = trust.evaluate().ok()?;
-    Some(
-        result == TrustResult::RECOVERABLE_TRUST_FAILURE
-            && matches!(
-                i32::try_from(error.code()).ok(),
-                Some(base::errSecNotTrusted | base::errSecCreateChainFailed)
-            ),
-    )
-}
-
-fn verify_untrusted_chain(
-    cert: &CertificateDer<'_>,
-    intermediates: &[CertificateDer<'_>],
-    server_name: &ServerName<'_>,
-    ocsp: &[u8],
-    now: UnixTime,
-) -> std::result::Result<ServerCertVerified, rustls::Error> {
-    // An unknown issuer may mask another problem. Temporarily anchor the supplied
-    // chain for this probe only, retaining name, validity, EKU and signature checks.
-    let parsed = rustls::server::ParsedCertificate::try_from(cert)?;
-    rustls::client::verify_server_name(&parsed, server_name)?;
-    if let Some(anchor) = intermediates.last() {
-        // Only promote ordinary, unconstrained CAs. Anchor conversion drops
-        // restrictions such as EKU/path length; do not implement a second PKIX
-        // validator here or silently discard unfamiliar extensions.
-        use x509_parser::extensions::ParsedExtension;
-
-        let (_, parsed) = x509_parser::parse_x509_certificate(anchor.as_ref())
-            .map_err(|_| CertificateError::BadEncoding)?;
-        let extensions = parsed
-            .extensions_map()
-            .map_err(|_| CertificateError::BadEncoding)?;
-        for extension in extensions.values() {
-            let supported = match extension.parsed_extension() {
-                ParsedExtension::BasicConstraints(constraints) => {
-                    constraints.path_len_constraint.is_none()
-                }
-                ParsedExtension::KeyUsage(_) => true,
-                ParsedExtension::SubjectKeyIdentifier(_)
-                | ParsedExtension::AuthorityKeyIdentifier(_) => !extension.critical,
-                _ => false,
-            };
-            if !supported {
-                return Err(rustls::Error::General(
-                    "Supplied CA constraints are unsupported for fingerprint approval. Install the appropriate CA in the operating system trust store."
-                        .into(),
-                ));
-            }
-        }
-        let is_ca = parsed
-            .basic_constraints()
-            .map_err(|_| CertificateError::BadEncoding)?
-            .is_some_and(|constraints| constraints.value.ca);
-        let forbids_signing = parsed
-            .key_usage()
-            .map_err(|_| CertificateError::BadEncoding)?
-            .is_some_and(|usage| !usage.value.key_cert_sign());
-        if !is_ca || forbids_signing {
-            return Err(CertificateError::InvalidPurpose.into());
-        }
-        let validity = parsed.validity();
-        let now = i128::from(now.as_secs());
-        if now < i128::from(validity.not_before.timestamp()) {
-            return Err(CertificateError::NotValidYet.into());
-        }
-        if now > i128::from(validity.not_after.timestamp()) {
-            return Err(CertificateError::Expired.into());
-        }
-    }
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(intermediates.last().unwrap_or(cert).clone().into_owned())?;
-    let verifier =
-        rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider())
-            .build()
-            .map_err(|error| rustls::Error::General(error.to_string()))?;
-    match verifier.verify_server_cert(cert, intermediates, server_name, ocsp, now) {
-        // Proxmox can omit its private CA. WebPKI checks the leaf's validity,
-        // basic constraints and EKU before searching for its issuer. Trust in the
-        // missing issuer comes from fingerprint approval, not this probe. The
-        // pinned login still verifies the TLS handshake's proof of key possession.
-        // A supplied chain, however, must actually reach the temporary anchor.
-        Err(rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer))
-            if intermediates.is_empty() =>
-        {
-            Ok(ServerCertVerified::assertion())
-        }
-        result => result,
-    }
+    /// `Some(None)` when the platform trusts the certificate, `Some(fingerprint)`
+    /// when it does not, and `None` when no certificate was seen at all.
+    result: Mutex<Option<Option<String>>>,
 }
 
 impl ServerCertVerifier for ProbeVerifier {
@@ -324,32 +198,11 @@ impl ServerCertVerifier for ProbeVerifier {
                 .normal
                 .verify_server_cert(cert, intermediates, server_name, ocsp, now)
             {
-                Ok(_) => Ok(None),
-                Err(error) => {
-                    #[cfg(not(target_os = "macos"))]
-                    let unknown_issuer = matches!(
-                        error,
-                        rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer)
-                    );
-                    #[cfg(target_os = "macos")]
-                    let unknown_issuer =
-                        matches!(
-                            error,
-                            rustls::Error::InvalidCertificate(
-                                CertificateError::UnknownIssuer | CertificateError::Other(_)
-                            )
-                        ) && apple_unknown_issuer(cert, intermediates, server_name, ocsp, now)
-                            == Some(true);
-                    if unknown_issuer {
-                        verify_untrusted_chain(cert, intermediates, server_name, ocsp, now)
-                            .map(|_| Some(fingerprint(cert)))
-                            .map_err(|error| {
-                                format!("Server certificate validation failed: {error}")
-                            })
-                    } else {
-                        Err(format!("Server certificate validation failed: {error}"))
-                    }
-                }
+                Ok(_) => None,
+                // Any reason is the user's call: Proxmox ships its own certificate,
+                // and home servers are reached by IP, alias, or VPN address. What
+                // they confirm is pinned exactly, so no other certificate passes.
+                Err(_) => Some(fingerprint(cert)),
             };
         *self.result.lock().expect("probe result lock") = Some(result);
         // Always abort here: even a trusted certificate probe must send no HTTP.
@@ -397,58 +250,28 @@ async fn probe(url: reqwest::Url, normal: Arc<dyn ServerCertVerifier>) -> Result
         .use_preconfigured_tls(config(verifier.clone()))
         .build()
         .map_err(|e| Error::ProxmoxApi(e.to_string()))?;
-    let _ = client.get(url).send().await;
-    let result = verifier.result.lock().expect("probe result lock").take();
-    result
-        .unwrap_or_else(|| {
-            Err("Could not inspect the server certificate. Check the URL and connection.".into())
-        })
-        .map_err(Error::ProxmoxApi)
-}
+    // The verifier aborts every handshake, so this never returns a response
+    let error = client.get(url).send().await.err();
+    if let Some(result) = verifier.result.lock().expect("probe result lock").take() {
+        return Ok(result);
+    }
 
+    // No certificate was seen: the same guidance as a failed login
+    Err(Error::ProxmoxActionRequired(
+        match error {
+            Some(error) if error.is_timeout() => {
+                "Connection timed out. Please check the server URL and network connectivity."
+            }
+            _ => "Failed to connect to Proxmox server. Please verify the URL is correct.",
+        }
+        .into(),
+    ))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{ProxmoxCredentials, ProxmoxSession};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    #[derive(Debug)]
-    struct UnknownIssuer;
-
-    impl ServerCertVerifier for UnknownIssuer {
-        fn verify_server_cert(
-            &self,
-            _cert: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp: &[u8],
-            _now: UnixTime,
-        ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-            Err(CertificateError::UnknownIssuer.into())
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-            unreachable!("certificate-only fixture")
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-            unreachable!("certificate-only fixture")
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            unreachable!("certificate-only fixture")
-        }
-    }
 
     struct TlsServer {
         url: String,
@@ -643,35 +466,6 @@ mod tests {
         assert!(server.requests.lock().unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn trusted_issuer_does_not_bypass_hostname_or_expiry_errors() {
-        let server = TlsServer::start(None, false).await;
-        let expired = expired_certificate();
-        let verifier = ProbeVerifier {
-            normal: Arc::new(
-                rustls_platform_verifier::Verifier::new_with_extra_roots(
-                    [server.cert.clone(), expired.clone()],
-                    provider(),
-                )
-                .unwrap(),
-            ),
-            result: Mutex::new(None),
-        };
-        for (cert, name, now) in [
-            (&server.cert, "different.example", UnixTime::now()),
-            (
-                &expired,
-                "localhost",
-                UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_640_995_200)),
-            ),
-        ] {
-            assert!(verifier
-                .verify_server_cert(cert, &[], &ServerName::try_from(name).unwrap(), &[], now)
-                .is_err());
-            assert!(verifier.result.lock().unwrap().take().unwrap().is_err());
-        }
-    }
-
     fn expired_certificate() -> CertificateDer<'static> {
         let key = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
@@ -680,397 +474,66 @@ mod tests {
         params.self_signed(&key).unwrap().der().clone()
     }
 
-    #[tokio::test]
-    async fn untrusted_issuer_does_not_hide_other_certificate_errors() {
-        let server = TlsServer::start(None, false).await;
+    // `openssl req -x509` marks its self-signed certificate as a CA by default
+    fn self_signed_ca_certificate() -> CertificateDer<'static> {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.self_signed(&key).unwrap().der().clone()
+    }
+
+    #[test]
+    fn every_untrusted_certificate_is_offered_for_confirmation() {
+        let trusted = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+            .unwrap()
+            .cert
+            .der()
+            .clone();
         let expired = expired_certificate();
+        let self_signed_ca = self_signed_ca_certificate();
         let verifier = ProbeVerifier {
-            normal: Arc::new(rustls_platform_verifier::Verifier::new(provider()).unwrap()),
-            result: Mutex::new(None),
-        };
-        let key = rcgen::KeyPair::generate().unwrap();
-        let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
-        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-        let wrong_usage = params.self_signed(&key).unwrap();
-        let mut invalid_signature = server.cert.to_vec();
-        *invalid_signature.last_mut().unwrap() ^= 1;
-        let invalid_signature = CertificateDer::from(invalid_signature);
-        for (cert, name, now) in [
-            (&server.cert, "different.example", UnixTime::now()),
-            (
-                &expired,
-                "localhost",
-                UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_640_995_200)),
-            ),
-            (wrong_usage.der(), "localhost", UnixTime::now()),
-            (&invalid_signature, "localhost", UnixTime::now()),
-        ] {
-            assert!(verify_untrusted_chain(
-                cert,
-                &[],
-                &ServerName::try_from(name).unwrap(),
-                &[],
-                now
-            )
-            .is_err());
-            assert!(verifier
-                .verify_server_cert(cert, &[], &ServerName::try_from(name).unwrap(), &[], now)
-                .is_err());
-            assert!(verifier.result.lock().unwrap().take().unwrap().is_err());
-        }
-    }
-
-    #[test]
-    fn untrusted_final_intermediate_retains_validity_checks() {
-        let mut ca = rcgen::CertificateParams::new(Vec::new()).unwrap();
-        ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca.not_before = rcgen::date_time_ymd(2020, 1, 1);
-        ca.not_after = rcgen::date_time_ymd(2030, 1, 1);
-        ca.distinguished_name
-            .push(rcgen::DnType::CommonName, "Fixture root CA");
-        let root = rcgen::Issuer::new(ca.clone(), rcgen::KeyPair::generate().unwrap());
-        let name = ServerName::try_from("localhost").unwrap();
-        let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_640_995_200));
-        for (not_before, not_after, expected) in [
-            (2020, 2030, None),
-            (2020, 2021, Some(CertificateError::Expired)),
-            (2023, 2030, Some(CertificateError::NotValidYet)),
-        ] {
-            let mut params = ca.clone();
-            params.distinguished_name = rcgen::DistinguishedName::new();
-            params
-                .distinguished_name
-                .push(rcgen::DnType::CommonName, "Fixture intermediate CA");
-            params.not_before = rcgen::date_time_ymd(not_before, 1, 1);
-            params.not_after = rcgen::date_time_ymd(not_after, 1, 1);
-            let key = rcgen::KeyPair::generate().unwrap();
-            let intermediate = params.signed_by(&key, &root).unwrap();
-            let issuer = rcgen::Issuer::new(params, key);
-            let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
-            params.not_before = rcgen::date_time_ymd(2021, 7, 1);
-            params.not_after = rcgen::date_time_ymd(2022, 7, 1);
-            params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
-            let leaf = params
-                .signed_by(&rcgen::KeyPair::generate().unwrap(), &issuer)
-                .unwrap();
-            let intermediates = [intermediate.der().clone()];
-            let result = verify_untrusted_chain(leaf.der(), &intermediates, &name, &[], now);
-            match &expected {
-                Some(error) => assert_eq!(
-                    result.unwrap_err(),
-                    rustls::Error::InvalidCertificate(error.clone()),
-                    "intermediate validity {not_before}-{not_after}"
-                ),
-                None => assert!(result.is_ok(), "{result:?}"),
-            }
-            let normal: [Arc<dyn ServerCertVerifier>; 2] = [
-                Arc::new(UnknownIssuer),
-                Arc::new(rustls_platform_verifier::Verifier::new(provider()).unwrap()),
-            ];
-            for normal in normal {
-                let verifier = ProbeVerifier {
-                    normal,
-                    result: Mutex::new(None),
-                };
-                assert!(verifier
-                    .verify_server_cert(leaf.der(), &intermediates, &name, &[], now)
-                    .is_err());
-                let result = verifier.result.lock().unwrap().take().unwrap();
-                if expected.is_none() {
-                    assert_eq!(result.unwrap(), Some(fingerprint(leaf.der())));
-                } else {
-                    assert!(result.is_err(), "{result:?}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn untrusted_final_intermediate_must_be_ca() {
-        for is_ca in [rcgen::IsCa::ExplicitNoCa, rcgen::IsCa::NoCa] {
-            assert_intermediate_signing_usage(is_ca, Vec::new(), false);
-        }
-    }
-
-    #[test]
-    fn untrusted_final_intermediate_must_allow_certificate_signing() {
-        assert_intermediate_signing_usage(
-            rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained),
-            vec![rcgen::KeyUsagePurpose::DigitalSignature],
-            false,
-        );
-    }
-
-    #[test]
-    fn untrusted_final_intermediate_accepts_ca_signing_usage() {
-        for usages in [Vec::new(), vec![rcgen::KeyUsagePurpose::KeyCertSign]] {
-            assert_intermediate_signing_usage(
-                rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained),
-                usages,
-                true,
-            );
-        }
-        let mut ca = unconstrained_ca();
-        ca.use_authority_key_identifier_extension = true;
-        assert_intermediate_parameters(ca, true);
-    }
-
-    fn assert_intermediate_signing_usage(
-        is_ca: rcgen::IsCa,
-        key_usages: Vec<rcgen::KeyUsagePurpose>,
-        allowed: bool,
-    ) {
-        let mut ca = rcgen::CertificateParams::new(Vec::new()).unwrap();
-        ca.is_ca = is_ca;
-        ca.key_usages = key_usages;
-        assert_intermediate_parameters(ca, allowed);
-    }
-
-    #[test]
-    fn untrusted_final_intermediate_rejects_extended_key_usage() {
-        for usage in [
-            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
-            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
-        ] {
-            let mut ca = unconstrained_ca();
-            ca.extended_key_usages = vec![usage];
-            assert_intermediate_parameters(ca, false);
-        }
-    }
-
-    #[test]
-    fn untrusted_final_intermediate_rejects_path_length_and_name_constraints() {
-        let mut ca = unconstrained_ca();
-        ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
-        assert_intermediate_parameters(ca, false);
-        let mut ca = unconstrained_ca();
-        ca.name_constraints = Some(rcgen::NameConstraints {
-            permitted_subtrees: vec![rcgen::GeneralSubtree::DnsName("localhost".into())],
-            excluded_subtrees: Vec::new(),
-        });
-        assert_intermediate_parameters(ca, false);
-    }
-
-    #[test]
-    fn untrusted_final_intermediate_rejects_policy_unknown_and_malformed_extensions() {
-        for (oid, value, critical) in [
-            (&[2, 5, 29, 36][..], vec![0x30, 3, 0x80, 1, 0], true),
-            (&[2, 5, 29, 54][..], vec![2, 1, 0], true),
-            (&[1, 2, 3, 4][..], vec![5, 0], true),
-            (&[1, 2, 3, 4][..], vec![5, 0], false),
-            (&[2, 5, 29, 37][..], vec![5, 0], true),
-            // rcgen already emits a subject key identifier for CA certificates.
-            (&[2, 5, 29, 14][..], vec![4, 1, 0], false),
-            (&[2, 5, 29, 35][..], vec![0x30, 3, 0x80, 1, 0], true),
-        ] {
-            let mut ca = unconstrained_ca();
-            let mut extension = rcgen::CustomExtension::from_oid_content(oid, value);
-            extension.set_criticality(critical);
-            ca.custom_extensions.push(extension);
-            assert_intermediate_parameters(ca, false);
-        }
-    }
-
-    fn unconstrained_ca() -> rcgen::CertificateParams {
-        let mut ca = rcgen::CertificateParams::new(Vec::new()).unwrap();
-        ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca
-    }
-
-    fn assert_intermediate_parameters(mut ca: rcgen::CertificateParams, allowed: bool) {
-        let mut root = unconstrained_ca();
-        root.distinguished_name
-            .push(rcgen::DnType::CommonName, "Fixture root CA");
-        let root = rcgen::Issuer::new(root, rcgen::KeyPair::generate().unwrap());
-        ca.distinguished_name = rcgen::DistinguishedName::new();
-        ca.distinguished_name
-            .push(rcgen::DnType::CommonName, "Fixture intermediate");
-        let key = rcgen::KeyPair::generate().unwrap();
-        let intermediate = ca.signed_by(&key, &root).unwrap();
-        let issuer = rcgen::Issuer::new(ca, key);
-        let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
-        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
-        let leaf = params
-            .signed_by(&rcgen::KeyPair::generate().unwrap(), &issuer)
-            .unwrap();
-        let intermediates = [intermediate.der().clone()];
-        let name = ServerName::try_from("localhost").unwrap();
-        let now = UnixTime::now();
-        let result = verify_untrusted_chain(leaf.der(), &intermediates, &name, &[], now);
-        assert_eq!(result.is_ok(), allowed, "chain verification: {result:?}");
-        if let Err(rustls::Error::General(message)) = &result {
-            assert_eq!(message, "Supplied CA constraints are unsupported for fingerprint approval. Install the appropriate CA in the operating system trust store.");
-        }
-
-        // Force the platform's unknown-issuer result to exercise the fallback,
-        // regardless of which error a particular native trust store prioritizes.
-        let verifier = ProbeVerifier {
-            normal: Arc::new(UnknownIssuer),
-            result: Mutex::new(None),
-        };
-        assert!(verifier
-            .verify_server_cert(leaf.der(), &intermediates, &name, &[], now)
-            .is_err());
-        let result = verifier.result.lock().unwrap().take().unwrap();
-        if allowed {
-            assert_eq!(result.unwrap(), Some(fingerprint(leaf.der())));
-        } else {
-            assert!(result.is_err(), "must not offer approval: {result:?}");
-        }
-    }
-
-    #[test]
-    fn complete_private_chain_preserves_middle_intermediate_constraints() {
-        for (usage, permitted_name, extra_ca, allowed) in [
-            (
-                rcgen::ExtendedKeyUsagePurpose::ServerAuth,
-                "localhost",
-                false,
-                true,
-            ),
-            (
-                rcgen::ExtendedKeyUsagePurpose::ClientAuth,
-                "localhost",
-                false,
-                false,
-            ),
-            (
-                rcgen::ExtendedKeyUsagePurpose::ServerAuth,
-                "other.example",
-                false,
-                false,
-            ),
-            (
-                rcgen::ExtendedKeyUsagePurpose::ServerAuth,
-                "localhost",
-                true,
-                false,
-            ),
-        ] {
-            let mut params = unconstrained_ca();
-            params
-                .distinguished_name
-                .push(rcgen::DnType::CommonName, "Complete chain root");
-            let key = rcgen::KeyPair::generate().unwrap();
-            let root = params.self_signed(&key).unwrap();
-            let root_issuer = rcgen::Issuer::new(params, key);
-
-            let mut params = unconstrained_ca();
-            params
-                .distinguished_name
-                .push(rcgen::DnType::CommonName, "Constrained middle CA");
-            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
-            params.extended_key_usages = vec![usage];
-            params.name_constraints = Some(rcgen::NameConstraints {
-                permitted_subtrees: vec![rcgen::GeneralSubtree::DnsName(permitted_name.into())],
-                excluded_subtrees: Vec::new(),
-            });
-            let key = rcgen::KeyPair::generate().unwrap();
-            let middle = params.signed_by(&key, &root_issuer).unwrap();
-            let middle_issuer = rcgen::Issuer::new(params, key);
-            let lower = extra_ca.then(|| {
-                let mut params = unconstrained_ca();
-                params
-                    .distinguished_name
-                    .push(rcgen::DnType::CommonName, "Extra lower CA");
-                let key = rcgen::KeyPair::generate().unwrap();
-                let cert = params.signed_by(&key, &middle_issuer).unwrap();
-                (cert, rcgen::Issuer::new(params, key))
-            });
-            let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
-            params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
-            let leaf = params
-                .signed_by(
-                    &rcgen::KeyPair::generate().unwrap(),
-                    lower
-                        .as_ref()
-                        .map(|(_, issuer)| issuer)
-                        .unwrap_or(&middle_issuer),
+            normal: Arc::new(
+                rustls_platform_verifier::Verifier::new_with_extra_roots(
+                    [trusted.clone()],
+                    provider(),
                 )
-                .unwrap();
-            let mut intermediates = Vec::new();
-            if let Some((cert, _)) = &lower {
-                intermediates.push(cert.der().clone());
-            }
-            intermediates.extend([middle.der().clone(), root.der().clone()]);
-            let name = ServerName::try_from("localhost").unwrap();
-            let now = UnixTime::now();
-            let result = verify_untrusted_chain(leaf.der(), &intermediates, &name, &[], now);
-            assert_eq!(result.is_ok(), allowed, "complete chain: {result:?}");
-            let verifier = ProbeVerifier {
-                normal: Arc::new(UnknownIssuer),
-                result: Mutex::new(None),
-            };
-            assert!(verifier
-                .verify_server_cert(leaf.der(), &intermediates, &name, &[], now)
-                .is_err());
-            let result = verifier.result.lock().unwrap().take().unwrap();
-            if allowed {
-                assert_eq!(result.unwrap(), Some(fingerprint(leaf.der())));
-            } else {
-                assert!(result.is_err(), "must not offer approval: {result:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn untrusted_supplied_chain_must_reach_the_temporary_anchor() {
-        let mut ca = unconstrained_ca();
-        ca.distinguished_name
-            .push(rcgen::DnType::CommonName, "Unrelated anchor");
-        let unrelated = ca
-            .self_signed(&rcgen::KeyPair::generate().unwrap())
-            .unwrap();
-        let leaf = rcgen::CertificateParams::new(vec!["localhost".into()])
-            .unwrap()
-            .self_signed(&rcgen::KeyPair::generate().unwrap())
-            .unwrap();
-        let intermediates = [unrelated.der().clone()];
-        let name = ServerName::try_from("localhost").unwrap();
-        let now = UnixTime::now();
-        assert!(verify_untrusted_chain(leaf.der(), &intermediates, &name, &[], now).is_err());
-        let verifier = ProbeVerifier {
-            normal: Arc::new(UnknownIssuer),
+                .unwrap(),
+            ),
             result: Mutex::new(None),
         };
-        assert!(verifier
-            .verify_server_cert(leaf.der(), &intermediates, &name, &[], now)
-            .is_err());
-        assert!(verifier.result.lock().unwrap().take().unwrap().is_err());
-    }
-
-    #[test]
-    fn private_ca_leaf_without_issuer_can_be_approved_but_still_checks_name() {
-        let mut ca = rcgen::CertificateParams::new(Vec::new()).unwrap();
-        ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca.distinguished_name
-            .push(rcgen::DnType::CommonName, "Fixture private CA");
-        let issuer = rcgen::Issuer::new(ca, rcgen::KeyPair::generate().unwrap());
-        let leaf = rcgen::CertificateParams::new(vec!["localhost".into()])
-            .unwrap()
-            .signed_by(&rcgen::KeyPair::generate().unwrap(), &issuer)
-            .unwrap();
-        let verifier = ProbeVerifier {
-            normal: Arc::new(rustls_platform_verifier::Verifier::new(provider()).unwrap()),
-            result: Mutex::new(None),
-        };
-        for (name, approved) in [("localhost", true), ("different.example", false)] {
+        for (cert, name) in [
+            // Reached by an address the certificate doesn't name
+            (&trusted, "192.0.2.10"),
+            (&expired, "localhost"),
+            (&self_signed_ca, "localhost"),
+        ] {
+            // The probe always aborts the handshake, trusted or not
             assert!(verifier
                 .verify_server_cert(
-                    leaf.der(),
+                    cert,
                     &[],
                     &ServerName::try_from(name).unwrap(),
                     &[],
                     UnixTime::now()
                 )
                 .is_err());
-            let result = verifier.result.lock().unwrap().take().unwrap();
-            if approved {
-                assert_eq!(result.unwrap(), Some(fingerprint(leaf.der())));
-            } else {
-                assert!(result.is_err());
-            }
+            assert_eq!(
+                verifier.result.lock().unwrap().take(),
+                Some(Some(fingerprint(cert))),
+                "{name}"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn unreachable_server_gets_connection_guidance() {
+        let error = certificate_fingerprint("https://127.0.0.1:1")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::ProxmoxActionRequired(message) if message.contains("verify the URL")),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -1116,7 +579,7 @@ mod tests {
         let error = super::super::authenticate(&original.credentials(true))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains(CERTIFICATE_CHANGED), "{error}");
+        assert!(matches!(error, Error::ProxmoxCertificateChanged), "{error}");
         let requests = original.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert!(requests[0].starts_with("POST /api2/json/access/ticket "));
@@ -1138,7 +601,7 @@ mod tests {
             original.handshakes.lock().unwrap()
         );
         let error = result.unwrap_err();
-        assert!(error.to_string().contains(CERTIFICATE_CHANGED), "{error}");
+        assert!(matches!(error, Error::ProxmoxCertificateChanged), "{error}");
         let requests = original.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert!(requests[0].starts_with("POST /api2/json/access/ticket "));
@@ -1160,11 +623,10 @@ mod tests {
         let changed = TlsServer::start(None, false).await;
         let mut credentials = changed.credentials(true);
         credentials.certificate_sha256 = Some(fingerprint(&original.cert));
-        assert!(super::super::authenticate(&credentials)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains(CERTIFICATE_CHANGED));
+        assert!(matches!(
+            super::super::authenticate(&credentials).await.unwrap_err(),
+            Error::ProxmoxCertificateChanged
+        ));
         let session = ProxmoxSession {
             server_url: changed.url.clone(),
             ticket: "fixture-ticket".into(),
@@ -1191,7 +653,7 @@ mod tests {
                 .unwrap_err(),
         ];
         for error in errors {
-            assert!(error.to_string().contains(CERTIFICATE_CHANGED), "{error}");
+            assert!(matches!(error, Error::ProxmoxCertificateChanged), "{error}");
         }
         assert!(super::super::wait_for_vm_ip(&session, "pve", 100)
             .await
@@ -1217,7 +679,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains(CERTIFICATE_CHANGED), "{error}");
+        assert!(matches!(error, Error::ProxmoxCertificateChanged), "{error}");
         // The bridge check fails before the create request is sent.
         assert!(source_unused);
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -1231,7 +693,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains(CERTIFICATE_CHANGED), "{error}");
+        assert!(matches!(error, Error::ProxmoxCertificateChanged), "{error}");
         assert!(changed.requests.lock().unwrap().is_empty());
     }
 

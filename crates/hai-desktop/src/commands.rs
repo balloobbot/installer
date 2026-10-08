@@ -4,6 +4,8 @@
 //! It handles the bridge between Tauri's Channel<T> and hai-core's ProgressCallback trait.
 
 use crate::backend::Backend;
+use crate::command_error::CommandError;
+use crate::diagnostics::Operation;
 use crate::flash_state::FlashState;
 use hai_core::download::TemporaryImage;
 use hai_core::{
@@ -30,16 +32,36 @@ impl PendingUtmImages {
 /// Adapter that bridges Tauri's Channel with hai-core's ProgressCallback trait
 struct TauriProgressCallback<'a> {
     channel: &'a Channel<FlashProgress>,
+    operation: Operation,
 }
 
 impl<'a> TauriProgressCallback<'a> {
-    fn new(channel: &'a Channel<FlashProgress>) -> Self {
-        Self { channel }
+    fn new(channel: &'a Channel<FlashProgress>, name: &'static str) -> Self {
+        Self {
+            channel,
+            operation: Operation::new(name),
+        }
     }
 }
 
 impl<'a> ProgressCallback for TauriProgressCallback<'a> {
     fn on_progress(&self, progress: FlashProgress) {
+        let stage = match progress.stage {
+            FlashStage::Downloading => "downloading",
+            FlashStage::Extracting => "extracting",
+            FlashStage::Writing => "writing",
+            FlashStage::Verifying => "verifying",
+            FlashStage::Finalizing => "finalizing",
+            FlashStage::Ready => "ready",
+            FlashStage::Updating => "updating",
+            FlashStage::Complete => "complete",
+            // Keep the failing stage, never the backend's free-form message.
+            FlashStage::Error => {
+                let _ = self.channel.send(progress);
+                return;
+            }
+        };
+        self.operation.stage(stage);
         let _ = self.channel.send(progress);
     }
 }
@@ -66,8 +88,11 @@ fn connection_error_message(error: hai_core::Error) -> String {
 
 /// List all block devices
 #[tauri::command]
-pub async fn list_block_devices() -> Result<Vec<BlockDevice>, String> {
-    Backend.list_devices().await.map_err(|e| e.to_string())
+pub async fn list_block_devices() -> Result<Vec<BlockDevice>, CommandError> {
+    Backend
+        .list_devices()
+        .await
+        .map_err(CommandError::from_query)
 }
 
 // =============================================================================
@@ -85,26 +110,32 @@ fn find_flash_target<'a>(
     device_id: &str,
     expected: &ExpectedDevice,
     board: &str,
-) -> Result<&'a BlockDevice, String> {
-    let device = devices.iter().find(|d| d.id == device_id).ok_or_else(|| {
-        format!(
-            "Device {} not found. It may have been disconnected.",
-            device_id
-        )
-    })?;
+) -> Result<&'a BlockDevice, CommandError> {
+    let device = devices
+        .iter()
+        .find(|d| d.id == device_id)
+        .ok_or_else(|| CommandError::from(hai_core::Error::DeviceNotFound(device_id.into())))?;
 
     if !device.removable {
-        return Err(format!(
-            "{} is not a removable drive and cannot be overwritten",
-            device_id
+        return Err(CommandError::new(
+            "invalid_config",
+            format!(
+                "{} is not a removable drive and cannot be overwritten",
+                device_id
+            ),
+            false,
         ));
     }
 
     if !expected.matches(device) {
-        return Err(format!(
-            "The drive at {} is no longer the one you selected. It may have been \
+        return Err(CommandError::new(
+            "device_not_found",
+            format!(
+                "The drive at {} is no longer the one you selected. It may have been \
              swapped for another device; please select your drive again.",
-            device_id
+                device_id
+            ),
+            false,
         ));
     }
 
@@ -112,12 +143,22 @@ fn find_flash_target<'a>(
         .devices
         .into_iter()
         .find(|device| device.haos.board == board)
-        .ok_or_else(|| format!("No storage requirements found for board: {}", board))?
+        .ok_or_else(|| {
+            CommandError::from(hai_core::Error::InvalidConfig(format!(
+                "No storage requirements found for board: {}",
+                board
+            )))
+        })?
         .haos;
     if device.size < config.minimum_reported_storage_bytes() {
-        return Err(format!(
-            "The selected drive is too small. At least a {:.0} GB drive is required.",
-            config.minimum_storage_bytes as f64 / 1_000_000_000.0
+        // A board minimum, not the image size: a bigger drive is the only fix
+        return Err(CommandError::new(
+            "drive_too_small",
+            format!(
+                "The selected drive is too small. At least a {:.0} GB drive is required.",
+                config.minimum_storage_bytes as f64 / 1_000_000_000.0
+            ),
+            false,
         ));
     }
 
@@ -130,31 +171,15 @@ pub async fn flash_image(
     request: FlashRequest,
     progress_channel: Channel<FlashProgress>,
     state: tauri::State<'_, FlashState>,
-) -> Result<FlashResult, String> {
+) -> Result<FlashResult, CommandError> {
     state
         .run(async move {
-            let callback = TauriProgressCallback::new(&progress_channel);
-            run_flash(&Backend, &request, &callback).await
+            let callback = TauriProgressCallback::new(&progress_channel, "flash");
+            callback
+                .operation
+                .finish(run_flash(&Backend, &request, &callback).await)
         })
         .await
-}
-
-/// The message for a failed write, as the frontend shows it.
-fn write_error_message(err: hai_core::Error) -> String {
-    match err {
-        // Verify-phase failures are tagged VerificationFailed; the rest are writes.
-        hai_core::Error::VerificationFailed(msg) => format!("Verification failed: {}", msg),
-        // Already carries its own "Disk service unavailable:" prefix.
-        err @ hai_core::Error::DiskServiceUnavailable(_) => err.to_string(),
-        // A disconnect doesn't require a prefix
-        err @ hai_core::Error::DriveDisconnected => err.to_string(),
-        // Self-explanatory messages; a "Write failed:" prefix would bury them.
-        err @ hai_core::Error::WriteProtected => err.to_string(),
-        err @ hai_core::Error::ImageTooLarge { .. } => err.to_string(),
-        err @ hai_core::Error::Cancelled => err.to_string(),
-        hai_core::Error::PermissionDenied(msg) => msg,
-        other => format!("Write failed: {}", other),
-    }
 }
 
 /// Download, extract, and write the image for `request`.
@@ -165,7 +190,7 @@ async fn run_flash<B, P>(
     backend: &B,
     request: &FlashRequest,
     callback: &P,
-) -> Result<FlashResult, String>
+) -> Result<FlashResult, CommandError>
 where
     B: ReleaseSource + DeviceBackend,
     P: ProgressCallback,
@@ -174,7 +199,7 @@ where
 
     backend
         .check_write_privileges()
-        .map_err(|e| e.to_string())?;
+        .map_err(CommandError::from)?;
 
     // Send initial progress
     callback.on_progress(FlashProgress {
@@ -189,13 +214,15 @@ where
     let release = backend
         .get_latest_haos_release_for_board(&request.board)
         .await
-        .map_err(|e| format!("Failed to fetch release info: {}", e))?;
+        .map_err(CommandError::from)?;
 
     // Find the raw disk image for the requested board. Some boards also ship a
     // qcow2 under the same board name, which must never be written to a drive.
     let image = release
         .image_for(&request.board, ImageFormat::Raw)
-        .ok_or_else(|| format!("No image found for board: {}", request.board))?;
+        .ok_or_else(|| {
+            hai_core::Error::InvalidConfig("No compatible image was found for this device.".into())
+        })?;
 
     callback.on_progress(FlashProgress {
         stage: FlashStage::Downloading,
@@ -206,17 +233,15 @@ where
     });
 
     // Get cache directory and download
-    let cache_dir = backend
-        .cache_dir()
-        .map_err(|e| format!("Cache error: {}", e))?;
+    let cache_dir = backend.cache_dir().map_err(CommandError::from)?;
     let temporary_image =
-        TemporaryImage::new(&cache_dir, ImageFormat::Raw).map_err(|e| e.to_string())?;
+        TemporaryImage::new(&cache_dir, ImageFormat::Raw).map_err(CommandError::from)?;
     let compressed_path = temporary_image.archive_path();
 
     backend
         .download_image(image, &compressed_path, callback)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(CommandError::from)?;
 
     // Extract the image
     let extracted_path = temporary_image.path();
@@ -224,18 +249,15 @@ where
     backend
         .extract_temporary_image(&temporary_image, callback)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(CommandError::from)?;
 
     // Check image size vs device size
     let image_size = tokio::fs::metadata(&extracted_path)
         .await
-        .map_err(|e| format!("Failed to get image size: {}", e))?
+        .map_err(CommandError::from)?
         .len();
 
-    let device_list = backend
-        .list_devices()
-        .await
-        .map_err(|e| format!("Failed to list devices: {}", e))?;
+    let device_list = backend.list_devices().await.map_err(CommandError::from)?;
 
     let device = find_flash_target(
         &device_list,
@@ -244,13 +266,7 @@ where
         &request.board,
     )?;
 
-    if image_size > device.size {
-        return Err(format!(
-            "Image is too large for the selected device. Image size: {:.1} GB, Device size: {:.1} GB.",
-            image_size as f64 / 1_000_000_000.0,
-            device.size as f64 / 1_000_000_000.0
-        ));
-    }
+    hai_core::disk::ensure_image_fits(image_size, device.size)?;
 
     // Write to device
     backend
@@ -261,7 +277,7 @@ where
             callback,
         )
         .await
-        .map_err(write_error_message)?;
+        .map_err(CommandError::from)?;
 
     drop(temporary_image);
 
@@ -276,8 +292,6 @@ where
     });
 
     Ok(FlashResult {
-        success: true,
-        error: None,
         duration_secs: duration.as_secs(),
     })
 }
@@ -291,7 +305,7 @@ where
 pub async fn get_haos_release(
     version: Option<String>,
     board: Option<String>,
-) -> Result<HaosRelease, String> {
+) -> Result<HaosRelease, CommandError> {
     release_for_selection(&Backend, version.as_deref(), board.as_deref()).await
 }
 
@@ -299,23 +313,23 @@ async fn release_for_selection<B: ReleaseSource>(
     backend: &B,
     version: Option<&str>,
     board: Option<&str>,
-) -> Result<HaosRelease, String> {
+) -> Result<HaosRelease, CommandError> {
     let release = match (version, board) {
         (None | Some("latest"), Some(board)) => {
             backend.get_latest_haos_release_for_board(board).await
         }
         (version, _) => backend.get_haos_release(version.unwrap_or("latest")).await,
     };
-    release.map_err(|e| e.to_string())
+    release.map_err(CommandError::from_query)
 }
 
 /// Get the device manifest
 #[tauri::command]
-pub async fn get_manifest() -> Result<DeviceManifest, String> {
+pub async fn get_manifest() -> Result<DeviceManifest, CommandError> {
     Backend
         .get_device_manifest()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(CommandError::from_query)
 }
 
 // =============================================================================
@@ -324,8 +338,8 @@ pub async fn get_manifest() -> Result<DeviceManifest, String> {
 
 /// Get system information (CPU cores and memory) for VM configuration limits
 #[tauri::command]
-pub fn get_system_info() -> Result<SystemInfo, String> {
-    Backend.system_info().map_err(|e| e.to_string())
+pub fn get_system_info() -> Result<SystemInfo, CommandError> {
+    Backend.system_info().map_err(CommandError::from)
 }
 
 // =============================================================================
@@ -334,18 +348,18 @@ pub fn get_system_info() -> Result<SystemInfo, String> {
 
 /// HAOS board for UTM, from the Mac's native architecture (also under
 /// Rosetta). The confirmation screen and the download must agree on it.
-fn utm_board() -> Result<&'static str, String> {
+fn utm_board() -> Result<&'static str, CommandError> {
     #[cfg(all(feature = "mock", not(target_os = "macos")))]
     let arch = hai_core::utm::UtmArchitecture::X86_64;
     #[cfg(any(not(feature = "mock"), target_os = "macos"))]
-    let arch = hai_core::utm::UtmArchitecture::host().map_err(|e| e.to_string())?;
+    let arch = hai_core::utm::UtmArchitecture::host().map_err(CommandError::from)?;
 
     Ok(arch.haos_board())
 }
 
 /// Get the release for the same board used by UTM downloads.
 #[tauri::command]
-pub async fn get_utm_haos_release() -> Result<HaosRelease, String> {
+pub async fn get_utm_haos_release() -> Result<HaosRelease, CommandError> {
     release_for_selection(&Backend, None, Some(utm_board()?)).await
 }
 
@@ -354,15 +368,21 @@ pub async fn get_utm_haos_release() -> Result<HaosRelease, String> {
 pub async fn download_utm_image(
     progress_channel: Channel<FlashProgress>,
     pending: tauri::State<'_, PendingUtmImages>,
-) -> Result<String, String> {
-    let callback = TauriProgressCallback::new(&progress_channel);
+) -> Result<String, CommandError> {
+    let callback = TauriProgressCallback::new(&progress_channel, "utm_download");
 
     // Verify UTM is available before doing any work.
-    Backend
-        .check_utm_status()
-        .await
-        .map_err(|e| e.to_string())?;
-    let image = run_utm_download(&Backend, utm_board()?, &callback).await?;
+    if let Err(error) = Backend.check_utm_status().await {
+        return callback.operation.finish(Err(CommandError::from(error)));
+    }
+    // Only a failure finishes the operation here; success waits for the image
+    let board = match utm_board() {
+        Ok(board) => board,
+        Err(error) => return callback.operation.finish(Err(error)),
+    };
+    let image = callback
+        .operation
+        .finish(run_utm_download(&Backend, board, &callback).await)?;
     let path = image.path().to_string_lossy().into_owned();
     pending.0.lock().unwrap().insert(path.clone(), image);
     Ok(path)
@@ -375,7 +395,7 @@ async fn run_utm_download<B, P>(
     backend: &B,
     arch: &str,
     callback: &P,
-) -> Result<TemporaryImage, String>
+) -> Result<TemporaryImage, CommandError>
 where
     B: ReleaseSource,
     P: ProgressCallback,
@@ -391,26 +411,26 @@ where
     let release = backend
         .get_latest_haos_release_for_board(arch)
         .await
-        .map_err(|e| format!("Failed to fetch release: {}", e))?;
+        .map_err(CommandError::from)?;
 
-    let image = release
-        .image_for(arch, ImageFormat::Qcow2)
-        .ok_or_else(|| format!("No qcow2 image found for: {}", arch))?;
+    let image = release.image_for(arch, ImageFormat::Qcow2).ok_or_else(|| {
+        hai_core::Error::InvalidConfig("No compatible virtual-machine image was found.".into())
+    })?;
 
-    let cache_dir = backend.cache_dir().map_err(|e| e.to_string())?;
+    let cache_dir = backend.cache_dir().map_err(CommandError::from)?;
     let temporary_image =
-        TemporaryImage::new(&cache_dir, ImageFormat::Qcow2).map_err(|e| e.to_string())?;
+        TemporaryImage::new(&cache_dir, ImageFormat::Qcow2).map_err(CommandError::from)?;
     let compressed_path = temporary_image.archive_path();
 
     backend
         .download_image(image, &compressed_path, callback)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(CommandError::from)?;
 
     backend
         .extract_temporary_image(&temporary_image, callback)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(CommandError::from)?;
 
     callback.on_progress(FlashProgress {
         stage: FlashStage::Complete,
@@ -432,8 +452,11 @@ pub fn discard_utm_image(image_path: String, pending: tauri::State<'_, PendingUt
 
 /// Check if UTM is installed and get its status
 #[tauri::command]
-pub async fn check_utm_status() -> Result<hai_core::UtmStatus, String> {
-    Backend.check_utm_status().await.map_err(|e| e.to_string())
+pub async fn check_utm_status() -> Result<hai_core::UtmStatus, CommandError> {
+    Backend
+        .check_utm_status()
+        .await
+        .map_err(CommandError::from_query)
 }
 
 /// Create a Home Assistant VM in UTM
@@ -441,63 +464,74 @@ pub async fn check_utm_status() -> Result<hai_core::UtmStatus, String> {
 pub async fn create_utm_vm(
     config: hai_core::UtmVmConfig,
     pending: tauri::State<'_, PendingUtmImages>,
-) -> Result<String, String> {
-    run_utm_creation(&Backend, &config, &pending).await
+) -> Result<String, CommandError> {
+    Operation::new("utm_create").finish(run_utm_creation(&Backend, &config, &pending).await)
 }
 
 async fn run_utm_creation<B: UtmBackend>(
     backend: &B,
     config: &hai_core::UtmVmConfig,
     pending: &PendingUtmImages,
-) -> Result<String, String> {
-    let image = pending
-        .take(&config.image_path)
-        .ok_or_else(|| "Temporary image is no longer available; download it again".to_string())?;
+) -> Result<String, CommandError> {
+    let image = pending.take(&config.image_path).ok_or_else(|| {
+        CommandError::new(
+            "temporary_image_unavailable",
+            "Temporary image is no longer available; download it again",
+            true,
+        )
+    })?;
     image.begin_utm_import().map_err(|error| {
-        format!(
-            "Could not prepare the UTM import: {error}. UTM was not contacted. \
+        CommandError::new(
+            "utm",
+            format!(
+                "Could not prepare the UTM import: {error}. UTM was not contacted. \
          Any retained source directory at {} can be removed manually.",
-            image.path().parent().unwrap().display()
+                image.path().parent().unwrap().display()
+            ),
+            false,
         )
     })?;
     // Fully qualified: `create_vm` is defined on both UtmBackend and ProxmoxBackend.
     let result = UtmBackend::create_vm(backend, config, &hai_core::NoOpProgress).await;
     if let Err(hai_core::Error::UtmOperationUncertain(error)) = &result {
-        return Err(format!(
-            "UTM may still be importing the image: {error}. Source retained at {}. \
+        return Err(CommandError::new(
+            "utm_operation_uncertain",
+            format!(
+                "UTM may still be importing the image: {error}. Source retained at {}. \
              Check UTM before retrying. Remove the source directory manually only after \
              confirming UTM has finished or stopped importing.",
-            image.path().parent().unwrap().display()
+                image.path().parent().unwrap().display()
+            ),
+            false,
         ));
     }
     // A completed creation or confirmed rejection no longer needs the source.
-    if let Err(error) = image.finish_utm_import() {
-        eprintln!(
-            "Could not release UTM source {}: {error}",
-            image.path().display()
-        );
+    if image.finish_utm_import().is_err() {
+        crate::diagnostics::warning("utm_source_cleanup_failed");
     }
-    result.map(|result| result.id).map_err(|e| e.to_string())
+    result.map(|result| result.id).map_err(CommandError::from)
 }
 
 /// Start a UTM VM
 #[tauri::command(async)]
-pub fn start_utm_vm(vm_id: String) -> Result<(), String> {
-    Backend.start_vm(&vm_id).map_err(|e| e.to_string())
+pub fn start_utm_vm(vm_id: String) -> Result<(), CommandError> {
+    Operation::new("utm_start").finish(Backend.start_vm(&vm_id).map_err(CommandError::from))
 }
 
 /// Resize a UTM VM's disk
 #[tauri::command]
-pub fn resize_utm_vm_disk(vm_id: String, size_gb: u32) -> Result<(), String> {
-    Backend
-        .resize_vm_disk(&vm_id, size_gb)
-        .map_err(|e| e.to_string())
+pub fn resize_utm_vm_disk(vm_id: String, size_gb: u32) -> Result<(), CommandError> {
+    Operation::new("utm_resize").finish(
+        Backend
+            .resize_vm_disk(&vm_id, size_gb)
+            .map_err(CommandError::from),
+    )
 }
 
 /// Get the status of a UTM VM
 #[tauri::command(async)]
-pub fn get_utm_vm_status(vm_id: String) -> Result<VmStatusInfo, String> {
-    Backend.vm_status(&vm_id).map_err(|e| e.to_string())
+pub fn get_utm_vm_status(vm_id: String) -> Result<VmStatusInfo, CommandError> {
+    Backend.vm_status(&vm_id).map_err(CommandError::from)
 }
 
 // =============================================================================
@@ -521,45 +555,41 @@ pub async fn check_ha_updated(ip_address: String) -> bool {
 // =============================================================================
 
 /// Inspect server trust without sending credentials or an HTTP request.
+///
+/// `None` means the platform trusts the certificate. A fingerprint means it
+/// does not, and the user has to confirm it before any credentials are sent.
 #[tauri::command]
-pub async fn proxmox_certificate_fingerprint(server_url: String) -> Result<Option<String>, String> {
-    Backend
-        .certificate_fingerprint(&server_url)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Preserve authentication failures so the configure view can offer reconnect.
-#[derive(Debug, serde::Serialize)]
-pub struct ProxmoxLookupError {
-    message: String,
-    session_expired: bool,
-}
-
-impl From<hai_core::Error> for ProxmoxLookupError {
-    fn from(error: hai_core::Error) -> Self {
-        Self {
-            message: error.to_string(),
-            session_expired: matches!(error, hai_core::Error::ProxmoxSessionExpired),
-        }
-    }
+pub async fn proxmox_certificate_fingerprint(
+    server_url: String,
+) -> Result<Option<String>, CommandError> {
+    Operation::new("proxmox_certificate").finish(
+        Backend
+            .certificate_fingerprint(&server_url)
+            .await
+            .map_err(CommandError::from),
+    )
 }
 
 /// Connect to a Proxmox VE server
 #[tauri::command]
-pub async fn proxmox_connect(credentials: ProxmoxCredentials) -> Result<ProxmoxSession, String> {
-    Backend
-        .authenticate(&credentials)
-        .await
-        .map_err(|e| e.to_string())
+pub async fn proxmox_connect(
+    credentials: ProxmoxCredentials,
+) -> Result<ProxmoxSession, CommandError> {
+    Operation::new("proxmox_connect").finish(
+        Backend
+            .authenticate(&credentials)
+            .await
+            .map_err(CommandError::from),
+    )
 }
 
 /// List available nodes on Proxmox
 #[tauri::command]
-pub async fn proxmox_list_nodes(
-    session: ProxmoxSession,
-) -> Result<Vec<ProxmoxNode>, ProxmoxLookupError> {
-    Backend.list_nodes(&session).await.map_err(Into::into)
+pub async fn proxmox_list_nodes(session: ProxmoxSession) -> Result<Vec<ProxmoxNode>, CommandError> {
+    Backend
+        .list_nodes(&session)
+        .await
+        .map_err(CommandError::from_query)
 }
 
 /// List available storage on a Proxmox node
@@ -567,11 +597,11 @@ pub async fn proxmox_list_nodes(
 pub async fn proxmox_list_storage(
     session: ProxmoxSession,
     node: String,
-) -> Result<Vec<ProxmoxStorage>, ProxmoxLookupError> {
+) -> Result<Vec<ProxmoxStorage>, CommandError> {
     Backend
         .list_storage(&session, &node)
         .await
-        .map_err(Into::into)
+        .map_err(CommandError::from_query)
 }
 
 /// List bridges and SDN VNets available on a Proxmox node.
@@ -579,17 +609,20 @@ pub async fn proxmox_list_storage(
 pub async fn proxmox_list_bridges(
     session: ProxmoxSession,
     node: String,
-) -> Result<Vec<ProxmoxBridge>, ProxmoxLookupError> {
+) -> Result<Vec<ProxmoxBridge>, CommandError> {
     Backend
         .list_bridges(&session, &node)
         .await
-        .map_err(Into::into)
+        .map_err(CommandError::from_query)
 }
 
 /// Get the next available VM ID on Proxmox
 #[tauri::command]
-pub async fn proxmox_get_next_vm_id(session: ProxmoxSession) -> Result<u32, ProxmoxLookupError> {
-    Backend.get_next_vm_id(&session).await.map_err(Into::into)
+pub async fn proxmox_get_next_vm_id(session: ProxmoxSession) -> Result<u32, CommandError> {
+    Backend
+        .get_next_vm_id(&session)
+        .await
+        .map_err(CommandError::from_query)
 }
 
 /// Create a Home Assistant VM on Proxmox
@@ -598,12 +631,20 @@ pub async fn proxmox_create_vm(
     session: ProxmoxSession,
     config: ProxmoxVmConfig,
     progress_channel: Channel<FlashProgress>,
-) -> Result<ProxmoxVmResult, String> {
-    let callback = TauriProgressCallback::new(&progress_channel);
+) -> Result<ProxmoxVmResult, CommandError> {
+    let callback = TauriProgressCallback::new(&progress_channel, "proxmox_install");
     // Fully qualified: `create_vm` is defined on both ProxmoxBackend and UtmBackend.
-    ProxmoxBackend::create_vm(&Backend, &session, &config, &callback)
-        .await
-        .map_err(|e| e.to_string())
+    callback.operation.finish(
+        ProxmoxBackend::create_vm(&Backend, &session, &config, &callback)
+            .await
+            .map_err(|error| {
+                let mut error = CommandError::from(error);
+                // A lost response may leave a VM behind. This command cannot yet
+                // resume it safely, even when the underlying network error is transient.
+                error.retryable = false;
+                error
+            }),
+    )
 }
 
 // =============================================================================
@@ -617,7 +658,7 @@ mod tests {
     #[tokio::test]
     async fn test_proxmox_certificate_rejects_http() {
         let result = proxmox_certificate_fingerprint("http://127.0.0.1:1".into()).await;
-        assert!(result.unwrap_err().contains("HTTPS"));
+        assert!(result.unwrap_err().message.contains("HTTPS"));
     }
 
     #[cfg(not(feature = "mock"))]
@@ -633,6 +674,7 @@ mod tests {
         assert!(proxmox_connect(credentials)
             .await
             .unwrap_err()
+            .message
             .contains("HTTPS"));
         let session = ProxmoxSession {
             server_url: "http://127.0.0.1:1".into(),
@@ -658,18 +700,70 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn utm_download_logs_success_only_after_download_completes() {
+        use tauri::Manager;
+
+        // The tail is shared, so an earlier UTM test may have left its own success line
+        crate::diagnostics::clear_test_log_tail();
+        let app = tauri::test::mock_app();
+        app.manage(PendingUtmImages::default());
+        let channel = Channel::new(|_| {
+            let tail = crate::diagnostics::test_log_tail();
+            assert!(!tail
+                .iter()
+                .any(|line| line.contains("rust utm_download") && line.contains(" success ")));
+            Ok(())
+        });
+        let path = download_utm_image(channel, app.state()).await.unwrap();
+        let tail = crate::diagnostics::test_log_tail();
+        assert_eq!(
+            tail.iter()
+                .filter(|line| line.contains("rust utm_download") && line.contains(" success "))
+                .count(),
+            1
+        );
+        assert!(tail
+            .iter()
+            .any(|line| line.contains("rust utm_download complete success ")));
+        discard_utm_image(path, app.state());
+    }
+
+    #[cfg(all(not(feature = "mock"), not(target_os = "macos")))]
+    #[tokio::test]
+    async fn utm_download_logs_failed_precheck_without_success() {
+        use tauri::Manager;
+
+        let app = tauri::test::mock_app();
+        app.manage(PendingUtmImages::default());
+        let channel = Channel::new(|_| panic!("An unsupported UTM download must not start"));
+        let error = download_utm_image(channel, app.state()).await.unwrap_err();
+        assert_eq!(error.code, "unsupported_platform");
+        // The log category is the same fixed code the view receives
+        let tail = crate::diagnostics::test_log_tail();
+        assert!(tail
+            .iter()
+            .any(|line| line.contains("rust utm_download preparing unsupported_platform ")));
+        assert!(!tail
+            .iter()
+            .any(|line| line.contains("rust utm_download") && line.contains(" success ")));
+    }
+
     #[test]
-    fn test_proxmox_lookup_error_preserves_authentication_failure() {
-        let expired = ProxmoxLookupError::from(hai_core::Error::ProxmoxSessionExpired);
+    fn proxmox_lookups_keep_session_expiry_as_its_own_code() {
+        // The configure step offers Reconnect for this code instead of a retry
+        let expired = CommandError::from_query(hai_core::Error::ProxmoxSessionExpired);
         let value = tauri::ipc::InvokeError::from(expired).0;
-        assert_eq!(value["session_expired"], true);
+        assert_eq!(value["code"], "proxmox_session_expired");
+        assert_eq!(value["retryable"], false);
         assert!(value["message"].as_str().unwrap().contains("reconnect"));
 
         let denied =
-            ProxmoxLookupError::from(hai_core::Error::ProxmoxApi("Access denied".to_string()));
+            CommandError::from_query(hai_core::Error::ProxmoxApi("Access denied".to_string()));
         let value = tauri::ipc::InvokeError::from(denied).0;
-        assert_eq!(value["session_expired"], false);
-        assert_eq!(value["message"], "Proxmox API error: Access denied");
+        assert_eq!(value["code"], "proxmox_api");
     }
 
     #[test]
@@ -696,42 +790,26 @@ mod tests {
 
     #[test]
     fn flash_command_result_keeps_its_wire_shape() {
-        let result = FlashResult {
-            success: true,
-            error: None,
-            duration_secs: 42,
-        };
+        // Failures reject the command with a CommandError instead
+        let result = FlashResult { duration_secs: 42 };
         assert_eq!(
             serde_json::to_value(result).unwrap(),
-            serde_json::json!({"success": true, "error": null, "duration_secs": 42})
+            serde_json::json!({"duration_secs": 42})
         );
     }
 
     #[test]
-    fn write_error_message_shows_write_protection_without_a_prefix() {
-        let msg = write_error_message(hai_core::Error::WriteProtected);
-        assert_eq!(msg, hai_core::Error::WriteProtected.to_string());
-        assert!(!msg.starts_with("Write failed"), "{msg}");
+    fn write_protection_has_a_stable_code() {
+        let error = CommandError::from(hai_core::Error::WriteProtected);
+        assert_eq!(error.code, "write_protected");
+        assert!(!error.retryable);
     }
 
     #[test]
-    fn write_error_message_shows_capacity_failure_without_a_prefix() {
-        for written in [0, 3_000_000_000] {
-            let msg = write_error_message(hai_core::Error::ImageTooLarge {
-                written,
-                image_size: 4_000_000_000,
-            });
-            assert_eq!(
-                msg,
-                "Image is larger than the selected drive: image size is 4000000000 bytes"
-            );
-        }
-    }
-
-    #[test]
-    fn write_error_message_prefixes_a_plain_io_error() {
-        let msg = write_error_message(hai_core::Error::Io(std::io::Error::other("boom")));
-        assert!(msg.starts_with("Write failed"), "{msg}");
+    fn io_error_does_not_expose_raw_details() {
+        let error = CommandError::from(hai_core::Error::Io(std::io::Error::other("boom")));
+        assert_eq!(error.code, "io");
+        assert!(!error.message.contains("boom"));
     }
 
     // ===== Manifest Tests =====
@@ -812,7 +890,8 @@ mod tests {
         let error = release_for_selection(&SelectionReleaseBackend, None, Some("retired-board"))
             .await
             .unwrap_err();
-        assert!(error.contains("Board unavailable"));
+        // Remote details stay out of the error; the code says what happened
+        assert_eq!(error.code, "download_failed");
     }
 
     #[tokio::test]
@@ -910,7 +989,7 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     fn test_start_utm_vm_unsupported_off_macos() {
         let err = start_utm_vm("test-vm".to_string()).unwrap_err();
-        assert!(err.contains("only available on macOS"), "{err}");
+        assert_eq!(err.code, "unsupported_platform");
     }
 
     #[cfg(not(feature = "mock"))] // asserts on the real backend's answers
@@ -918,7 +997,7 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     fn test_resize_utm_vm_disk_unsupported_off_macos() {
         let err = resize_utm_vm_disk("test-vm".to_string(), 64).unwrap_err();
-        assert!(err.contains("only available on macOS"), "{err}");
+        assert_eq!(err.code, "unsupported_platform");
     }
 
     #[test]
@@ -973,7 +1052,7 @@ mod tests {
     fn test_find_flash_target_rejects_unknown_device() {
         let devices = [flash_target("/dev/sdb", true)];
         let err = find_flash_target(&devices, "/dev/sdz", &expected(), "rpi5-64").unwrap_err();
-        assert!(err.contains("not found"), "{err}");
+        assert_eq!(err.code, "device_not_found");
     }
 
     #[test]
@@ -981,14 +1060,14 @@ mod tests {
         let devices = [flash_target("\\\\.\\PhysicalDrive1", false)];
         let err = find_flash_target(&devices, "\\\\.\\PhysicalDrive1", &expected(), "rpi5-64")
             .unwrap_err();
-        assert!(err.contains("not a removable drive"), "{err}");
+        assert!(err.message.contains("not a removable drive"), "{err}");
     }
 
     #[test]
     fn test_find_flash_target_rejects_empty_device_id() {
         let devices = [flash_target("/dev/sdb", true)];
         let err = find_flash_target(&devices, "", &expected(), "rpi5-64").unwrap_err();
-        assert!(err.contains("not found"), "{err}");
+        assert_eq!(err.code, "device_not_found");
     }
 
     #[test]
@@ -996,7 +1075,10 @@ mod tests {
         let mut device = flash_target("/dev/sdb", true);
         device.model = Some("Extreme".to_string());
         let err = find_flash_target(&[device], "/dev/sdb", &expected(), "rpi5-64").unwrap_err();
-        assert!(err.contains("no longer the one you selected"), "{err}");
+        assert!(
+            err.message.contains("no longer the one you selected"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1026,8 +1108,8 @@ mod tests {
             let result = find_flash_target(&devices, "/dev/sdb", &expected, "rpi5-64");
             if size < 15_200_000_000 {
                 let error = result.unwrap_err();
-                assert!(error.contains("too small"), "{error}");
-                assert!(error.contains("16 GB"), "{error}");
+                assert_eq!(error.code, "drive_too_small");
+                assert!(error.message.contains("16 GB"), "{error}");
             } else {
                 assert!(result.is_ok(), "{size}: {result:?}");
             }
@@ -1039,7 +1121,7 @@ mod tests {
         let devices = [flash_target("/dev/sdb", true)];
         let error =
             find_flash_target(&devices, "/dev/sdb", &expected(), "unknown-board").unwrap_err();
-        assert!(error.contains("No storage requirements"), "{error}");
+        assert!(error.message.contains("No storage requirements"), "{error}");
     }
 
     struct PreflightBackend {
@@ -1134,7 +1216,7 @@ mod tests {
         async fn attempt(
             check: fn() -> hai_core::Result<()>,
             callback: &impl ProgressCallback,
-        ) -> Result<FlashResult, String> {
+        ) -> Result<FlashResult, CommandError> {
             let request = FlashRequest {
                 device_id: "unused-device".into(),
                 board: "rpi5-64".into(),
@@ -1146,14 +1228,14 @@ mod tests {
 
         for check in [not_elevated, query_failed] {
             let err = attempt(check, &NoProgressExpected).await.unwrap_err();
-            assert_eq!(err, check().unwrap_err().to_string());
+            assert_eq!(err, CommandError::from(check().unwrap_err()));
         }
 
         // An authorized attempt reaches release lookup without real network I/O.
         let retry = attempt(|| Ok(()), &hai_core::NoOpProgress)
             .await
             .unwrap_err();
-        assert!(retry.contains("release lookup reached"), "{retry}");
+        assert!(retry.message.contains("release lookup reached"), "{retry}");
     }
 }
 
@@ -1218,7 +1300,13 @@ mod mock_tests {
 
     impl DeviceBackend for LifecycleBackend {
         async fn list_devices(&self) -> hai_core::Result<Vec<BlockDevice>> {
-            BackendMock.list_devices().await
+            let mut devices = BackendMock.list_devices().await?;
+            if self.outcome == "oversized" {
+                for device in &mut devices {
+                    device.size = 4;
+                }
+            }
+            Ok(devices)
         }
         async fn write_image<P: ProgressCallback>(
             &self,
@@ -1227,6 +1315,10 @@ mod mock_tests {
             _: bool,
             _: &P,
         ) -> hai_core::Result<()> {
+            assert_ne!(
+                self.outcome, "oversized",
+                "oversized image reached disk writer"
+            );
             assert_eq!(std::fs::read(path).unwrap(), b"image");
             match self.outcome {
                 "write" => Err(hai_core::Error::Io(std::io::Error::other(
@@ -1244,14 +1336,24 @@ mod mock_tests {
 
     #[tokio::test]
     async fn flash_releases_extraction_on_every_exit() {
-        for outcome in ["success", "extract", "write", "cancel", "suspend"] {
+        for outcome in [
+            "success",
+            "extract",
+            "write",
+            "cancel",
+            "suspend",
+            "oversized",
+        ] {
             let backend = LifecycleBackend {
                 cache: tempfile::tempdir().unwrap(),
                 outcome,
                 extracted: Default::default(),
                 write_started: Default::default(),
             };
-            let request = request("mock-sd-card-32gb", "rpi5-64").await;
+            let mut request = request("mock-sd-card-32gb", "rpi5-64").await;
+            if outcome == "oversized" {
+                request.expected_device.size = Some(4);
+            }
             let result = if outcome == "suspend" {
                 let flash = run_flash(&backend, &request, &NoOpProgress);
                 tokio::pin!(flash);
@@ -1263,9 +1365,19 @@ mod mock_tests {
                 Some(run_flash(&backend, &request, &NoOpProgress).await)
             };
             match outcome {
-                "success" => assert!(result.unwrap().unwrap().success),
+                "success" => {
+                    result.unwrap().unwrap();
+                }
                 "suspend" => assert!(result.is_none()),
-                "cancel" => assert!(result.unwrap().unwrap_err().contains("cancelled")),
+                "cancel" => assert!(result.unwrap().unwrap_err().message.contains("cancelled")),
+                "oversized" => {
+                    // The board minimum stops a drive this small at the check
+                    // before writing; ensure_image_fits has its own tests for
+                    // the image size check that follows it.
+                    let error = result.unwrap().unwrap_err();
+                    assert_eq!(error.code, "drive_too_small");
+                    assert!(!error.retryable);
+                }
                 _ => assert!(result.unwrap().is_err()),
             }
             let path = backend.extracted.lock().unwrap().clone().unwrap();
@@ -1353,6 +1465,9 @@ mod mock_tests {
                     path: None,
                 }),
                 "rejected" => Err(hai_core::Error::Utm("Invalid configuration".into())),
+                "start-failed" => Err(hai_core::Error::UtmVmCreated(
+                    "The VM was created. Open UTM to start it.".into(),
+                )),
                 "timeout" => Err(hai_core::Error::UtmOperationUncertain(
                     "AppleEvent timed out (-1712)".into(),
                 )),
@@ -1380,6 +1495,7 @@ mod mock_tests {
         for outcome in [
             "success",
             "rejected",
+            "start-failed",
             "timeout",
             "transport",
             "cancelled",
@@ -1433,18 +1549,26 @@ mod mock_tests {
                 }
                 if matches!(outcome, "timeout" | "transport") {
                     let error = result.as_ref().unwrap_err();
-                    assert!(error.contains(&format!(
+                    assert!(error.message.contains(&format!(
                         "Source retained at {}.",
                         path.parent().unwrap().display()
                     )));
-                    assert!(!error.contains(&config.image_path));
-                    assert!(error.contains("manually"));
+                    assert!(!error.message.contains(&config.image_path));
+                    assert!(error.message.contains("manually"));
+                }
+                if outcome == "start-failed" {
+                    let error = result.as_ref().unwrap_err();
+                    assert_eq!(error.code, "utm_vm_created");
+                    assert!(!error.retryable);
+                    assert!(error.message.contains("Open UTM"));
                 }
                 if outcome == "marker-failure" {
                     let error = result.unwrap_err();
-                    assert!(error.contains("UTM was not contacted"));
-                    assert!(error.contains(path.parent().unwrap().to_str().unwrap()));
-                    assert!(error.contains("manually"));
+                    assert!(error.message.contains("UTM was not contacted"));
+                    assert!(error
+                        .message
+                        .contains(path.parent().unwrap().to_str().unwrap()));
+                    assert!(error.message.contains("manually"));
                 }
             }
             // This is the same removal used by the frontend's discard command.
@@ -1453,7 +1577,7 @@ mod mock_tests {
             hai_core::download::prune_cached_images(cache.path()).unwrap();
             assert_eq!(
                 path.exists(),
-                !matches!(outcome, "success" | "rejected"),
+                !matches!(outcome, "success" | "rejected" | "start-failed"),
                 "{outcome}"
             );
         }
@@ -1578,12 +1702,14 @@ mod mock_tests {
         )
         .await
         .unwrap_err();
-        assert!(error.contains("Checksum mismatch"));
+        assert_eq!(error.code, "checksum_mismatch");
+        assert!(error.retryable);
         for board in ["generic-aarch64", "ova"] {
             let error = run_utm_download(&backend, board, &NoOpProgress)
                 .await
                 .unwrap_err();
-            assert!(error.contains("Checksum mismatch"));
+            assert_eq!(error.code, "checksum_mismatch");
+            assert!(error.retryable);
         }
     }
 
@@ -1597,7 +1723,7 @@ mod mock_tests {
         )
         .await
         .unwrap();
-        assert!(result.success);
+        assert!(result.duration_secs < 60);
     }
 
     #[tokio::test]
@@ -1610,7 +1736,7 @@ mod mock_tests {
         )
         .await
         .unwrap_err();
-        assert!(err.contains("No image found"));
+        assert_eq!(err.code, "invalid_config");
     }
 
     #[tokio::test]
@@ -1623,7 +1749,7 @@ mod mock_tests {
         )
         .await
         .unwrap_err();
-        assert!(err.contains("not a removable drive"));
+        assert!(err.message.contains("not a removable drive"));
     }
 
     #[tokio::test]
@@ -1634,7 +1760,7 @@ mod mock_tests {
         let err = run_flash(&BackendMock, &request, &NoOpProgress)
             .await
             .unwrap_err();
-        assert!(err.contains("no longer the one you selected"));
+        assert!(err.message.contains("no longer the one you selected"));
     }
 
     #[tokio::test]

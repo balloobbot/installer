@@ -1,9 +1,21 @@
+import {
+  installerError,
+  renderErrorHelp,
+  type InstallerError,
+} from "../../utils/installer-error.js";
 import { LitElement, html, css } from "lit";
 import {
   ViewAccessibility,
   reducedMotionStyles,
 } from "../../utils/view-accessibility.js";
+import { InstallDiagnostics } from "../../utils/diagnostics.js";
 import { customElement, state } from "lit/decorators.js";
+import type WaInput from "@home-assistant/webawesome/dist/components/input/input.js";
+import "@home-assistant/webawesome/dist/components/input/input.js";
+import type WaSlider from "@home-assistant/webawesome/dist/components/slider/slider.js";
+import "@home-assistant/webawesome/dist/components/slider/slider.js";
+import type WaSelect from "@home-assistant/webawesome/dist/components/select/select.js";
+import "@home-assistant/webawesome/dist/components/select/select.js";
 import { wizardState, type WizardState } from "../../state/wizard-state.js";
 import {
   proxmoxListNodes,
@@ -25,6 +37,24 @@ import {
   DEFAULT_PROXMOX_VM_ID,
   DEFAULT_PROXMOX_VM_NAME,
 } from "../../state/vm-defaults.js";
+
+/** Lookups report an expired session as its own code, answered with Reconnect */
+const SESSION_EXPIRED = "proxmox_session_expired";
+
+/**
+ * A changed certificate needs the same answer: reconnecting shows the new
+ * certificate to confirm, while retrying would keep hitting the old pin.
+ */
+const CERTIFICATE_CHANGED = "proxmox_certificate_changed";
+
+function isSessionExpired(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error.code === SESSION_EXPIRED || error.code === CERTIFICATE_CHANGED)
+  );
+}
 
 @customElement("proxmox-configure-view")
 export class ProxmoxConfigureView extends LitElement {
@@ -102,6 +132,10 @@ export class ProxmoxConfigureView extends LitElement {
       min-width: 0;
     }
 
+    wa-slider::part(label) {
+      display: block;
+    }
+
     .setting-header {
       display: flex;
       justify-content: space-between;
@@ -127,141 +161,6 @@ export class ProxmoxConfigureView extends LitElement {
       color: var(--ha-secondary-text-color, #9e9e9e);
       margin: 0;
       line-height: 1.3;
-    }
-
-    .name-input {
-      padding: 0.5rem 0.75rem;
-      font-size: 0.875rem;
-      color: var(--ha-text-color, #212121);
-      background-color: var(--ha-background-color, #ffffff);
-      border: 1px solid var(--ha-border-color, #e0e0e0);
-      border-radius: 6px;
-      outline: none;
-      transition: border-color 0.2s ease;
-      width: 100%;
-      box-sizing: border-box;
-    }
-
-    .name-input:focus {
-      border-color: var(--ha-primary-color, #03a9f4);
-    }
-
-    @media (prefers-color-scheme: dark) {
-      .name-input {
-        background-color: var(--ha-background-color, #121212);
-        border-color: var(--ha-border-color, #333333);
-        color: var(--ha-text-color, #e0e0e0);
-      }
-    }
-
-    /* Select dropdown styles */
-    .select-dropdown {
-      padding: 0.5rem 0.75rem;
-      font-size: 0.875rem;
-      color: var(--ha-text-color, #212121);
-      background-color: var(--ha-background-color, #ffffff);
-      border: 1px solid var(--ha-border-color, #e0e0e0);
-      border-radius: 6px;
-      outline: none;
-      transition: border-color 0.2s ease;
-      width: 100%;
-      box-sizing: border-box;
-      cursor: pointer;
-      -webkit-appearance: none;
-      -moz-appearance: none;
-      appearance: none;
-      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24'%3E%3Cpath fill='%23727272' d='M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6 1.41-1.41z'/%3E%3C/svg%3E");
-      background-repeat: no-repeat;
-      background-position: right 0.75rem center;
-      padding-right: 2rem;
-    }
-
-    .select-dropdown:focus {
-      border-color: var(--ha-primary-color, #03a9f4);
-    }
-
-    .select-dropdown:disabled {
-      opacity: 0.6;
-      cursor: not-allowed;
-    }
-
-    @media (prefers-color-scheme: dark) {
-      .select-dropdown {
-        background-color: var(--ha-background-color, #121212);
-        border-color: var(--ha-border-color, #333333);
-        color: var(--ha-text-color, #e0e0e0);
-        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24'%3E%3Cpath fill='%23e0e0e0' d='M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6 1.41-1.41z'/%3E%3C/svg%3E");
-      }
-    }
-
-    /* Slider container */
-    .slider-container {
-      position: relative;
-      width: 100%;
-      padding-bottom: 4px;
-    }
-
-    /* Slider styles */
-    input[type="range"] {
-      -webkit-appearance: none;
-      appearance: none;
-      width: 100%;
-      height: 6px;
-      background: var(--ha-border-color, #e0e0e0);
-      border-radius: 3px;
-      outline: none;
-      cursor: pointer;
-    }
-
-    input[type="range"]::-webkit-slider-thumb {
-      -webkit-appearance: none;
-      appearance: none;
-      width: 18px;
-      height: 18px;
-      background: var(--ha-primary-color, #03a9f4);
-      border-radius: 50%;
-      cursor: pointer;
-      transition: transform 0.1s ease;
-    }
-
-    input[type="range"]::-webkit-slider-thumb:hover {
-      transform: scale(1.1);
-    }
-
-    input[type="range"]::-moz-range-thumb {
-      width: 18px;
-      height: 18px;
-      background: var(--ha-primary-color, #03a9f4);
-      border-radius: 50%;
-      border: none;
-      cursor: pointer;
-    }
-
-    @media (prefers-color-scheme: dark) {
-      input[type="range"] {
-        background: var(--ha-border-color, #333333);
-      }
-    }
-
-    /* Tick marks */
-    .slider-ticks {
-      display: flex;
-      justify-content: space-between;
-      padding: 0 9px;
-      margin-top: 4px;
-    }
-
-    .slider-tick {
-      width: 2px;
-      height: 6px;
-      background: #c0c0c0;
-      border-radius: 1px;
-    }
-
-    @media (prefers-color-scheme: dark) {
-      .slider-tick {
-        background: #555555;
-      }
     }
 
     .loading-text {
@@ -292,7 +191,7 @@ export class ProxmoxConfigureView extends LitElement {
   private _loadingStorage = false;
 
   @state()
-  private _error: string | null = null;
+  private _error: InstallerError | null = null;
 
   @state()
   private _sessionExpired = false;
@@ -381,8 +280,10 @@ export class ProxmoxConfigureView extends LitElement {
 
     if (!session) {
       this._setError({
+        code: SESSION_EXPIRED,
         message: "Connect to Proxmox to continue.",
-        session_expired: true,
+        retryable: false,
+        details: {},
       });
       this._loadingNodes = false;
       return;
@@ -403,8 +304,8 @@ export class ProxmoxConfigureView extends LitElement {
       // from the other lookup, regardless of which one finishes first.
       const failures = results.filter((result) => result.status === "rejected");
       if (failures.length) {
-        const expired = failures.find(
-          (result) => result.reason?.session_expired === true
+        const expired = failures.find((result) =>
+          isSessionExpired(result.reason)
         );
         throw (expired ?? failures[0]).reason;
       }
@@ -482,8 +383,8 @@ export class ProxmoxConfigureView extends LitElement {
         (result): result is PromiseRejectedResult =>
           result.status === "rejected"
       );
-      const expired = failures.find(
-        (result) => result.reason?.session_expired === true
+      const expired = failures.find((result) =>
+        isSessionExpired(result.reason)
       );
       if (!isLatest()) {
         // Session expiry applies to every node, even from a superseded
@@ -537,12 +438,7 @@ export class ProxmoxConfigureView extends LitElement {
       if (!isLatest()) {
         // Session expiry applies to every node, even if this lookup was
         // superseded. Ordinary failures still belong to the old selection.
-        if (
-          typeof error === "object" &&
-          error !== null &&
-          "session_expired" in error &&
-          error.session_expired === true
-        ) {
+        if (isSessionExpired(error)) {
           this._setError(error);
         }
         return;
@@ -561,20 +457,11 @@ export class ProxmoxConfigureView extends LitElement {
   }
 
   private _setError(error: unknown) {
-    this._sessionExpired =
-      typeof error === "object" &&
-      error !== null &&
-      "session_expired" in error &&
-      error.session_expired === true;
-    this._error =
-      typeof error === "string"
-        ? error
-        : typeof error === "object" &&
-            error !== null &&
-            "message" in error &&
-            typeof error.message === "string"
-          ? error.message
-          : "Failed to load Proxmox configuration";
+    // Only reached for the current, connected lookup, so detached or
+    // superseded lookups never add diagnostics
+    new InstallDiagnostics("proxmox").fail(error);
+    this._sessionExpired = isSessionExpired(error);
+    this._error = installerError(error, "Failed to load Proxmox configuration");
     if (this._sessionExpired) {
       wizardState.setSelection("proxmoxSession", undefined);
       wizardState.setSelection("proxmoxConnected", false);
@@ -618,8 +505,8 @@ export class ProxmoxConfigureView extends LitElement {
   }
 
   private async _onNodeChange(e: Event) {
-    const select = e.target as HTMLSelectElement;
-    this._selectedNode = select.value;
+    const select = e.target as WaSelect;
+    this._selectedNode = select.value as string;
     this._selectedStorage = "";
     this._selectedBridge = "";
     this._bridges = [];
@@ -629,28 +516,31 @@ export class ProxmoxConfigureView extends LitElement {
   }
 
   private _onBridgeChange(e: Event) {
-    this._selectedBridge = (e.target as HTMLSelectElement).value;
+    const select = e.target as WaSelect;
+    this._selectedBridge = select.value as string;
     this._saveSelections();
   }
 
   private _onStorageChange(e: Event) {
-    const select = e.target as HTMLSelectElement;
-    this._selectedStorage = select.value;
+    const select = e.target as WaSelect;
+    this._selectedStorage = select.value as string;
     this._saveSelections();
   }
 
   private _onVmIdChange(e: Event) {
-    const input = e.target as HTMLInputElement;
-    this._vmId = parseInt(input.value, 10) || DEFAULT_PROXMOX_VM_ID;
+    const input = e.target as WaInput;
+    this._vmId = parseInt(input.value ?? "", 10) || DEFAULT_PROXMOX_VM_ID;
     this._vmIdChosen = true;
     this._saveSelections();
   }
 
   private _onNameChange(e: Event) {
-    const input = e.target as HTMLInputElement;
+    const input = e.target as WaInput;
     // Proxmox VM names: alphanumeric, dash, underscore, period only
     // Replace spaces with dashes and remove invalid characters
-    let name = input.value.replace(/\s+/g, "-").replace(/[^a-zA-Z0-9._-]/g, "");
+    let name = (input.value ?? "")
+      .replace(/\s+/g, "-")
+      .replace(/[^a-zA-Z0-9._-]/g, "");
     // Max 63 characters
     name = name.slice(0, 63);
     this._vmName = name || DEFAULT_PROXMOX_VM_NAME;
@@ -660,24 +550,24 @@ export class ProxmoxConfigureView extends LitElement {
   }
 
   private _onCoresChange(e: Event) {
-    const input = e.target as HTMLInputElement;
-    const index = parseInt(input.value, 10);
+    const input = e.target as WaSlider;
+    const index = input.value;
     const coreOptions = this._getCoreOptions();
     this._cpuCores = coreOptions[index] || DEFAULT_CPU_CORES;
     this._saveSelections();
   }
 
   private _onMemoryChange(e: Event) {
-    const input = e.target as HTMLInputElement;
-    const index = parseInt(input.value, 10);
+    const input = e.target as WaSlider;
+    const index = input.value;
     const memoryOptions = this._getMemoryOptions();
     this._memoryMb = memoryOptions[index] || DEFAULT_MEMORY_MB;
     this._saveSelections();
   }
 
   private _onDiskSizeChange(e: Event) {
-    const input = e.target as HTMLInputElement;
-    const index = parseInt(input.value, 10);
+    const input = e.target as WaSlider;
+    const index = input.value;
     const diskOptions = this._getDiskSizeOptions();
     this._diskSizeGb = diskOptions[index] || DEFAULT_DISK_SIZE_GB;
     this._saveSelections();
@@ -798,30 +688,25 @@ export class ProxmoxConfigureView extends LitElement {
     </svg>`;
   }
 
-  private _renderTicks(count: number) {
-    return html`
-      <div class="slider-ticks">
-        ${Array(count)
-          .fill(0)
-          .map(() => html`<div class="slider-tick"></div>`)}
-      </div>
-    `;
-  }
-
   render() {
     if (this._error) {
       return html`
         <h2>Configure virtual machine</h2>
         <p class="subtitle">Configure your Home Assistant VM on Proxmox</p>
         <div class="config-card">
-          <p class="error-text" role="alert">${this._error}</p>
-          <wa-button
-            variant="brand"
-            @click=${this._sessionExpired ? this._reconnect : this._retry}
-            ?disabled=${this._loadingNodes || this._loadingStorage}
-          >
-            ${this._sessionExpired ? "Reconnect" : "Try again"}
-          </wa-button>
+          <p class="error-text" role="alert" style="overflow-wrap: anywhere;">
+            ${this._error.message}
+          </p>
+          ${renderErrorHelp()}
+          ${this._sessionExpired || this._error.retryable
+            ? html`<wa-button
+                variant="brand"
+                @click=${this._sessionExpired ? this._reconnect : this._retry}
+                ?disabled=${this._loadingNodes || this._loadingStorage}
+              >
+                ${this._sessionExpired ? "Reconnect" : "Try again"}
+              </wa-button>`
+            : ""}
         </div>
       `;
     }
@@ -843,17 +728,17 @@ export class ProxmoxConfigureView extends LitElement {
         <div class="setting-row">
           <div class="setting-icon">${this._renderLabelIcon()}</div>
           <div class="setting-content">
-            <span class="setting-label">Display name</span>
-            <input
+            <wa-input
+              label="Display name"
               type="text"
-              class="name-input"
+              size="s"
               .value=${this._vmName}
               @input=${this._onNameChange}
               placeholder="home-assistant"
               maxlength="63"
               pattern="[a-zA-Z0-9._-]+"
               title="Only letters, numbers, dash, underscore, and period allowed"
-            />
+            ></wa-input>
             <p class="setting-description">
               Name shown in Proxmox (letters, numbers, dash, underscore only)
             </p>
@@ -864,28 +749,27 @@ export class ProxmoxConfigureView extends LitElement {
         <div class="setting-row">
           <div class="setting-icon">${this._renderServerIcon()}</div>
           <div class="setting-content">
-            <span class="setting-label">Node</span>
             ${this._loadingNodes
               ? html`<span class="loading-text">Loading nodes...</span>`
               : html`
-                  <select class="select-dropdown" @change=${this._onNodeChange}>
+                  <wa-select
+                    label="Node"
+                    size="s"
+                    .value=${this._selectedNode}
+                    @change=${this._onNodeChange}
+                  >
                     ${this._nodes.map(
-                      // Selecting on the option, not the select: the select's
-                      // value is set before its options exist, so a restored
-                      // node other than the first would not show
                       (node) => html`
-                        <option
-                          value=${node.name}
-                          ?selected=${node.name === this._selectedNode}
-                        >
-                          ${node.name}
-                          ${node.cpu_usage != null
-                            ? `(CPU: ${node.cpu_usage.toFixed(1)}%)`
-                            : ""}
-                        </option>
+                        <wa-option value=${node.name}>
+                          ${`${node.name}${
+                            node.cpu_usage != null
+                              ? ` (CPU: ${node.cpu_usage.toFixed(1)}%)`
+                              : ""
+                          }`}
+                        </wa-option>
                       `
                     )}
-                  </select>
+                  </wa-select>
                 `}
             <p class="setting-description">
               Proxmox node where the VM will be created
@@ -897,27 +781,24 @@ export class ProxmoxConfigureView extends LitElement {
         <div class="setting-row">
           <div class="setting-icon">${this._renderDatabaseIcon()}</div>
           <div class="setting-content">
-            <span class="setting-label">Storage</span>
             ${this._loadingStorage
               ? html`<span class="loading-text">Loading storage...</span>`
               : html`
-                  <select
-                    class="select-dropdown"
+                  <wa-select
+                    label="Storage"
+                    size="s"
+                    .value=${this._selectedStorage}
                     @change=${this._onStorageChange}
                     ?disabled=${this._storages.length === 0}
                   >
                     ${this._storages.map(
                       (storage) => html`
-                        <option
-                          value=${storage.name}
-                          ?selected=${storage.name === this._selectedStorage}
-                        >
-                          ${storage.name} (${formatBytes(storage.available)}
-                          free)
-                        </option>
+                        <wa-option value=${storage.name}>
+                          ${`${storage.name} (${formatBytes(storage.available)} free)`}
+                        </wa-option>
                       `
                     )}
-                  </select>
+                  </wa-select>
                 `}
             <p class="setting-description">
               Storage location for the VM disk image
@@ -928,34 +809,31 @@ export class ProxmoxConfigureView extends LitElement {
         <div class="setting-row">
           <div class="setting-icon">${this._renderServerIcon()}</div>
           <div class="setting-content">
-            <label class="setting-label" for="network-bridge"
-              >Network bridge</label
-            >
             ${this._loadingStorage || this._loadingNodes
               ? html`<span class="loading-text"
                   >Loading network bridges...</span
                 >`
               : html`
-                  <select
+                  <wa-select
                     id="network-bridge"
-                    class="select-dropdown"
+                    label="Network bridge"
+                    size="s"
+                    .value=${this._selectedBridge}
                     @change=${this._onBridgeChange}
                     ?disabled=${this._bridges.length === 0}
                   >
                     ${this._bridges.map(
-                      (bridge) =>
-                        html` <option
-                          value=${bridge.name}
-                          ?selected=${bridge.name === this._selectedBridge}
-                        >
+                      (bridge) => html`
+                        <wa-option value=${bridge.name}>
                           ${bridge.name}${bridge.network_type === "vnet"
                             ? " (SDN VNet)"
                             : ""}${bridge.comments
                             ? ` - ${bridge.comments.trim()}`
                             : ""}
-                        </option>`
+                        </wa-option>
+                      `
                     )}
-                  </select>
+                  </wa-select>
                   ${this._bridges.length === 0 &&
                   this._bridgesNode === this._selectedNode &&
                   !this._error
@@ -980,15 +858,15 @@ export class ProxmoxConfigureView extends LitElement {
         <div class="setting-row">
           <div class="setting-icon">${this._renderIdIcon()}</div>
           <div class="setting-content">
-            <span class="setting-label">VM ID</span>
-            <input
+            <wa-input
+              label="VM ID"
               type="number"
-              class="name-input"
+              size="s"
               .value=${String(this._vmId)}
               @input=${this._onVmIdChange}
               min="100"
               max="999999999"
-            />
+            ></wa-input>
             <p class="setting-description">
               Unique identifier for the virtual machine
             </p>
@@ -999,21 +877,23 @@ export class ProxmoxConfigureView extends LitElement {
         <div class="setting-row">
           <div class="setting-icon">${this._renderCpuIcon()}</div>
           <div class="setting-content">
-            <div class="setting-header">
-              <span class="setting-label">CPU cores</span>
-              <span class="setting-value">${this._cpuCores} cores</span>
-            </div>
-            <div class="slider-container">
-              <input
-                type="range"
-                min="0"
-                max=${coreOptions.length - 1}
-                step="1"
-                .value=${String(coreIndex >= 0 ? coreIndex : 1)}
-                @input=${this._onCoresChange}
-              />
-              ${this._renderTicks(coreOptions.length)}
-            </div>
+            <wa-slider
+              with-markers
+              with-tooltip
+              min="0"
+              max=${coreOptions.length - 1}
+              step="1"
+              .value=${coreIndex >= 0 ? coreIndex : 1}
+              @input=${this._onCoresChange}
+              .valueFormatter=${(index: number) =>
+                `${coreOptions[index]} cores`}
+              ><div slot="label" class="setting-header">
+                <span class="setting-label">CPU cores</span
+                ><span class="setting-value" aria-hidden="true"
+                  >${this._cpuCores} cores</span
+                >
+              </div></wa-slider
+            >
             <p class="setting-description">${this._getCpuDescription()}</p>
           </div>
         </div>
@@ -1022,23 +902,23 @@ export class ProxmoxConfigureView extends LitElement {
         <div class="setting-row">
           <div class="setting-icon">${this._renderMemoryIcon()}</div>
           <div class="setting-content">
-            <div class="setting-header">
-              <span class="setting-label">Memory</span>
-              <span class="setting-value"
-                >${this._formatMemory(this._memoryMb)}</span
-              >
-            </div>
-            <div class="slider-container">
-              <input
-                type="range"
-                min="0"
-                max=${memoryOptions.length - 1}
-                step="1"
-                .value=${String(memoryIndex >= 0 ? memoryIndex : 1)}
-                @input=${this._onMemoryChange}
-              />
-              ${this._renderTicks(memoryOptions.length)}
-            </div>
+            <wa-slider
+              with-markers
+              with-tooltip
+              min="0"
+              max=${memoryOptions.length - 1}
+              step="1"
+              .value=${memoryIndex >= 0 ? memoryIndex : 1}
+              @input=${this._onMemoryChange}
+              .valueFormatter=${(index: number) =>
+                this._formatMemory(memoryOptions[index])}
+              ><div slot="label" class="setting-header">
+                <span class="setting-label">Memory</span
+                ><span class="setting-value" aria-hidden="true"
+                  >${this._formatMemory(this._memoryMb)}</span
+                >
+              </div></wa-slider
+            >
             <p class="setting-description">${this._getMemoryDescription()}</p>
           </div>
         </div>
@@ -1047,23 +927,23 @@ export class ProxmoxConfigureView extends LitElement {
         <div class="setting-row">
           <div class="setting-icon">${this._renderDiskIcon()}</div>
           <div class="setting-content">
-            <div class="setting-header">
-              <span class="setting-label">Disk size</span>
-              <span class="setting-value"
-                >${this._formatDiskSize(this._diskSizeGb)}</span
-              >
-            </div>
-            <div class="slider-container">
-              <input
-                type="range"
-                min="0"
-                max=${diskSizeOptions.length - 1}
-                step="1"
-                .value=${String(diskIndex >= 0 ? diskIndex : 0)}
-                @input=${this._onDiskSizeChange}
-              />
-              ${this._renderTicks(diskSizeOptions.length)}
-            </div>
+            <wa-slider
+              with-markers
+              with-tooltip
+              min="0"
+              max=${diskSizeOptions.length - 1}
+              step="1"
+              .value=${diskIndex >= 0 ? diskIndex : 0}
+              @input=${this._onDiskSizeChange}
+              .valueFormatter=${(index: number) =>
+                this._formatDiskSize(diskSizeOptions[index])}
+              ><div slot="label" class="setting-header">
+                <span class="setting-label">Disk size</span
+                ><span class="setting-value" aria-hidden="true"
+                  >${this._formatDiskSize(this._diskSizeGb)}</span
+                >
+              </div></wa-slider
+            >
             <p class="setting-description">${this._getDiskDescription()}</p>
           </div>
         </div>

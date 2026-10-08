@@ -33,6 +33,8 @@ test.describe("Proxmox TOTP login", () => {
       win.authenticatedCalls = [];
       win.__TAURI_INTERNALS__ = {
         invoke: async (cmd, args) => {
+          // A trusted certificate: nothing to confirm before the login
+          if (cmd === "proxmox_certificate_fingerprint") return null;
           if (cmd === "proxmox_connect") {
             const { credentials } = args as {
               credentials: ProxmoxCredentials;
@@ -49,6 +51,8 @@ test.describe("Proxmox TOTP login", () => {
 
           // The connection check before each flow is not a Proxmox request
           if (cmd === "check_connection") return undefined;
+          // Diagnostics logging is local, not a Proxmox request either
+          if (cmd === "log_frontend_event") return undefined;
 
           win.authenticatedCalls.push(cmd);
           const { session: supplied } = args as { session: ProxmoxSession };

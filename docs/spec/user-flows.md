@@ -226,32 +226,30 @@ Then continues to drive selection and flashing.
 
 ### Step 1: Connect
 
-Before authentication, the installer probes TLS without sending an HTTP request.
-Servers trusted by the operating system use normal certificate validation. An
-untrusted issuer prompts the user to compare the SHA-256 fingerprint with the
-node's System > Certificates page through an already trusted connection. Only
-after the user checks that the fingerprints match and chooses "Trust for this
-session" are credentials sent. Cancel, Escape, or closing the view sends none.
+Before authentication, the installer looks at the server's certificate without
+sending an HTTP request. A certificate the operating system trusts is validated
+the normal way, and the login continues without a question.
 
-The exact approved leaf certificate is pinned for the login session, including
-all preflight, upload, and VM API requests. Renewed or changed certificates are
-rejected and require a new login and comparison. Pins are not saved to disk.
-Explicit pin approval replaces issuer, hostname, and expiry validation for that
-specific certificate, while TLS handshake signatures are still verified. Other
-certificate failures use normal validation and are not offered an override.
-For unknown issuers, only ordinary unconstrained supplied CAs support approval:
-the final supplied CA may carry CA/signing usage and noncritical key identifiers,
-but EKU, path-length, name/policy constraints or other extensions are intentionally
-not promoted to a trust anchor. Malformed or duplicate extensions are rejected.
-Install the appropriate CA in the operating system trust store for these chains;
-normal platform-trusted validation remains unchanged. Fingerprint approval is
-not a way to bypass an invalid or unsupported supplied intermediate.
-Self-signed and private-CA leaves sent without an issuer retain their existing
-approval checks; a supplied chain must reach its temporary anchor.
+Any other certificate opens a "Trust this Proxmox server?" dialog. Most Proxmox
+servers use the certificate Proxmox created during installation, and people
+reach them by IP address, a local name, or a VPN address, so this is the common
+case. The dialog says so, points out that the browser shows the same warning for
+the Proxmox web interface, and shows the SHA-256 fingerprint for anyone who
+wants to compare it with System > Certificates. Credentials are only sent after
+"Trust and connect". Cancel, Escape, or leaving the view sends none.
+
+The trusted certificate is pinned for the login session: every later request,
+including uploads and VM API calls, must present exactly that certificate, and
+the TLS handshake signature is still verified. A changed certificate is refused
+and sends the user back to reconnect, where the new certificate gets the same
+question. The answer is remembered for the same server address and certificate,
+so a second attempt (an authenticator code, a mistyped password) doesn't ask
+again. Nothing is saved to disk.
+
 Server URLs must be bare HTTPS origins without embedded credentials, paths,
-queries, or fragments. API redirects are not followed.
-Proxmox connections are direct and do not use system proxies, so an HTTPS proxy's
-certificate cannot be mistaken for the Proxmox certificate during inspection.
+queries, or fragments. API redirects are not followed. Proxmox connections are
+direct and do not use system proxies, so a proxy's certificate cannot be
+mistaken for the Proxmox certificate.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐

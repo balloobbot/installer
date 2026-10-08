@@ -1,8 +1,14 @@
+import {
+  installerError,
+  renderErrorHelp,
+  type InstallerError,
+} from "../../utils/installer-error.js";
 import { LitElement, html, css } from "lit";
 import {
   ViewAccessibility,
   reducedMotionStyles,
 } from "../../utils/view-accessibility.js";
+import { InstallDiagnostics } from "../../utils/diagnostics.js";
 import { customElement, state } from "lit/decorators.js";
 import {
   formatBytes,
@@ -217,7 +223,7 @@ export class DriveSelectionView extends LitElement {
   private _loading = true;
 
   @state()
-  private _error: string | null = null;
+  private _error: InstallerError | null = null;
 
   @state()
   private _selectedDriveId: string | null = null;
@@ -241,11 +247,13 @@ export class DriveSelectionView extends LitElement {
     this._error = null;
 
     let drives: BlockDevice[];
-    let error: string | null = null;
+    let error: InstallerError | null = null;
+    let scanError: unknown;
     try {
       drives = (await listBlockDevices()).filter((drive) => drive.removable);
     } catch (err) {
-      error = err instanceof Error ? err.message : "Failed to load drives";
+      scanError = err;
+      error = installerError(err, "Failed to load drives");
       // The scan failed, so the selection cannot be confirmed. Drop it rather
       // than let a stale path through to the write.
       drives = [];
@@ -259,6 +267,7 @@ export class DriveSelectionView extends LitElement {
 
     this._drives = drives;
     this._error = error;
+    if (error) new InstallDiagnostics("flash").fail(scanError);
     this._loading = false;
     this._reconcileSelection();
   }
@@ -355,14 +364,23 @@ export class DriveSelectionView extends LitElement {
       return html`
         <div class="error">
           <span class="error-icon">⚠️</span>
-          <p class="error-message" role="alert">${this._error}</p>
-          <wa-button
-            variant="brand"
-            appearance="outlined"
-            @click=${this._loadDrives}
+          <p
+            class="error-message"
+            role="alert"
+            style="overflow-wrap: anywhere;"
           >
-            Try again
-          </wa-button>
+            ${this._error?.message}
+          </p>
+          ${renderErrorHelp()}
+          ${this._error.retryable
+            ? html`<wa-button
+                variant="brand"
+                appearance="outlined"
+                @click=${this._loadDrives}
+              >
+                Try again
+              </wa-button>`
+            : ""}
         </div>
       `;
     }

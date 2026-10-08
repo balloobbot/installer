@@ -28,6 +28,7 @@ import "../views/proxmox/proxmox-success-view.js";
 // Import components
 import "./wizard-shell.js";
 import "./confirm-dialog.js";
+import "./diagnostics-actions.js";
 
 // Import state
 import {
@@ -65,6 +66,13 @@ export class AppShell extends LitElement {
     :host > * {
       flex: 1;
     }
+
+    diagnostics-actions {
+      position: absolute;
+      bottom: 1rem;
+      left: 1rem;
+      z-index: 1;
+    }
   `;
 
   @state()
@@ -84,6 +92,9 @@ export class AppShell extends LitElement {
 
   @state()
   private _proxmoxInstallError = false;
+
+  @state()
+  private _installRetryable = false;
 
   @state()
   private _proxmoxConnecting = false;
@@ -112,6 +123,9 @@ export class AppShell extends LitElement {
     return html`
       ${this._renderView()}
       ${this._currentView === "welcome" ? this._renderToolboxButton() : ""}
+      ${this._currentView === "welcome"
+        ? html`<diagnostics-actions about></diagnostics-actions>`
+        : ""}
       <confirm-dialog
         ?open=${this._showConfirmDialog}
         .driveName=${selections.driveName || "the selected drive"}
@@ -179,7 +193,13 @@ export class AppShell extends LitElement {
       (flow === "proxmox" && currentStep?.id === "install");
 
     // Determine when to hide next button
-    const hideNext = currentStep?.id === "method";
+    const hideNext =
+      currentStep?.id === "method" ||
+      (currentStep?.id === "install" &&
+        (this._flashError ||
+          this._utmInstallError ||
+          this._proxmoxInstallError) &&
+        !this._installRetryable);
 
     return html`
       <wizard-shell
@@ -206,7 +226,7 @@ export class AppShell extends LitElement {
 
   private _getNextLabel(stepId: string | undefined): string {
     if (stepId === "flash" && this._flashError) {
-      return "Try again";
+      return this._installRetryable ? "Try again" : "Choose another drive";
     }
     if (
       stepId === "install" &&
@@ -422,15 +442,29 @@ export class AppShell extends LitElement {
     this._flashError = false;
     this._utmInstallError = false;
     this._proxmoxInstallError = false;
+    this._installRetryable = false;
   }
 
   private async _onWizardNext() {
     const currentStep = wizardState.currentStep;
     const flow = this._wizardState.currentFlow;
 
+    if (
+      currentStep?.id === "install" &&
+      (this._flashError ||
+        this._utmInstallError ||
+        this._proxmoxInstallError) &&
+      !this._installRetryable
+    )
+      return;
+
     // Handle retry on flash error
     if (currentStep?.id === "flash" && this._flashError) {
       this._flashError = false;
+      if (!this._installRetryable) {
+        this._goToDriveStep();
+        return;
+      }
       const wizardShell = this.shadowRoot?.querySelector("wizard-shell");
       const progressView = wizardShell?.querySelector("progress-view") as
         | (HTMLElement & { retry: () => void })
@@ -608,7 +642,8 @@ export class AppShell extends LitElement {
     wizardState.nextStep();
   }
 
-  private _onFlashError() {
+  private _onFlashError(event: CustomEvent<{ retryable?: boolean }>) {
+    this._installRetryable = event.detail?.retryable === true;
     this._flashError = true;
   }
 
@@ -617,7 +652,8 @@ export class AppShell extends LitElement {
     wizardState.nextStep();
   }
 
-  private _onUtmInstallError() {
+  private _onUtmInstallError(event: CustomEvent<{ retryable?: boolean }>) {
+    this._installRetryable = event.detail?.retryable === true;
     this._utmInstallError = true;
   }
 
@@ -626,7 +662,8 @@ export class AppShell extends LitElement {
     wizardState.nextStep();
   }
 
-  private _onProxmoxInstallError() {
+  private _onProxmoxInstallError(event: CustomEvent<{ retryable?: boolean }>) {
+    this._installRetryable = event.detail?.retryable === true;
     this._proxmoxInstallError = true;
   }
 

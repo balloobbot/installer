@@ -24,7 +24,6 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 rustls = { workspace = true }
 rustls-platform-verifier = { workspace = true }
-x509-parser = { workspace = true }
 xz2 = { workspace = true }
 directories = { workspace = true }
 fs2 = { workspace = true }
@@ -36,8 +35,6 @@ tempfile = { workspace = true }
 libc = { workspace = true }
 plist = { workspace = true }
 security-framework = { workspace = true }
-security-framework-sys = { workspace = true }
-core-foundation = { workspace = true }
 rustix = { workspace = true }
 
 # Linux specific

@@ -6,6 +6,8 @@ import {
   waitUntil,
 } from "@open-wc/testing";
 import type { ProxmoxStorage } from "../../../../src/api/types.js";
+import type WaSelect from "@home-assistant/webawesome/dist/components/select/select.js";
+import { findByRole, fullA11ySnapshot } from "../../helpers/a11y.js";
 import { wizardState } from "../../../../src/state/wizard-state.js";
 import "../../../../src/views/proxmox/proxmox-configure-view.js";
 import type { ProxmoxConfigureView } from "../../../../src/views/proxmox/proxmox-configure-view.js";
@@ -25,7 +27,7 @@ async function mount(): Promise<ProxmoxConfigureView> {
   // All dropdowns only render once their lookups have finished, which is
   // also when the view saves what it settled on
   await waitUntil(
-    () => el.shadowRoot!.querySelectorAll(".select-dropdown").length === 3,
+    () => el.shadowRoot!.querySelectorAll("wa-select").length === 3,
     "the node, storage and bridge dropdowns never loaded",
     { timeout: 4000 }
   );
@@ -85,14 +87,51 @@ describe("proxmox-configure-view", () => {
       <proxmox-configure-view></proxmox-configure-view>
     `);
     await waitUntil(
-      () => el.shadowRoot!.querySelectorAll(".select-dropdown option").length,
+      () => el.shadowRoot!.querySelectorAll("wa-select wa-option").length,
       "the node dropdown never rendered"
     );
 
     const options = [
-      ...el.shadowRoot!.querySelectorAll(".select-dropdown option"),
-    ].map((option) => option.textContent!.replace(/\s+/g, " ").trim());
+      ...el.shadowRoot!.querySelectorAll("wa-select wa-option"),
+    ].map((option) => option.textContent!.trim());
     expect(options).to.include.members(["pve (CPU: 12.5%)", "pve2"]);
+    const select = el.shadowRoot!.querySelector("wa-select")!;
+    await waitUntil(() => select.displayLabel === "pve (CPU: 12.5%)");
+    expect(select.displayInput.value).to.equal("pve (CPU: 12.5%)");
+  });
+
+  it("exposes named controls and announces actual slider sizes", async () => {
+    const el = await mount();
+    const sliders = [...el.shadowRoot!.querySelectorAll("wa-slider")];
+    await Promise.all(sliders.map((slider) => slider.updateComplete));
+    const snapshot = await fullA11ySnapshot();
+    expect(findByRole(snapshot, "textbox").map((node) => node.name)).to.include(
+      "Display name"
+    );
+    expect(
+      findByRole(snapshot, "slider").map((node) => node.name)
+    ).to.deep.equal(["CPU cores", "Memory", "Disk size"]);
+    expect(
+      sliders.map((slider) =>
+        slider
+          .shadowRoot!.querySelector('[role="slider"]')!
+          .getAttribute("aria-valuetext")
+      )
+    ).to.deep.equal(["4 cores", "4 GB", "32 GB"]);
+    expect(
+      findByRole(snapshot, "combobox").map((node) => node.name)
+    ).to.deep.equal(["Node", "Storage", "Network bridge"]);
+    expect(
+      findByRole(snapshot, "spinbutton").map((node) => node.name)
+    ).to.include("VM ID");
+  });
+
+  it("shows storage labels without template indentation", async () => {
+    const el = await mount();
+    const select = el.shadowRoot!.querySelectorAll("wa-select")[1];
+    // Decimal units: the 200 GiB mock storage is 214.7 GB
+    await waitUntil(() => select.displayLabel === "local (214.7 GB free)");
+    expect(select.displayInput.value).to.equal("local (214.7 GB free)");
   });
 
   it("saves the defaults on a first visit", async () => {
@@ -132,8 +171,8 @@ describe("proxmox-configure-view", () => {
 
     // And they are what the form shows, not just what is in the state
     const [nodeSelect, storageSelect] = el.shadowRoot!.querySelectorAll(
-      "select.select-dropdown"
-    ) as NodeListOf<HTMLSelectElement>;
+      "wa-select"
+    ) as NodeListOf<WaSelect>;
     expect(nodeSelect.value).to.equal("pve2");
     expect(storageSelect.value).to.equal("local-lvm");
     const text = el.shadowRoot!.textContent!;
@@ -241,9 +280,7 @@ describe("proxmox-configure-view", () => {
     });
 
     const el = await mount();
-    const nodeSelect = el.shadowRoot!.querySelector(
-      "select.select-dropdown"
-    ) as HTMLSelectElement;
+    const nodeSelect = el.shadowRoot!.querySelector("wa-select") as WaSelect;
     const pickNode = (node: string) => {
       nodeSelect.value = node;
       nodeSelect.dispatchEvent(new Event("change"));
@@ -302,9 +339,7 @@ describe("proxmox-configure-view", () => {
     });
 
     const el = await mount();
-    const nodeSelect = el.shadowRoot!.querySelector(
-      "select.select-dropdown"
-    ) as HTMLSelectElement;
+    const nodeSelect = el.shadowRoot!.querySelector("wa-select") as WaSelect;
     const pickNode = (node: string) => {
       nodeSelect.value = node;
       nodeSelect.dispatchEvent(new Event("change"));
@@ -375,7 +410,7 @@ describe("proxmox-configure-view", () => {
         throw new Error(`Unexpected IPC command: ${cmd}`);
       });
       const el = await mount();
-      const nodeSelect = el.shadowRoot!.querySelector("select")!;
+      const nodeSelect = el.shadowRoot!.querySelector("wa-select")!;
       nodeSelect.value = "pve2";
       nodeSelect.dispatchEvent(new Event("change"));
       nodeSelect.value = "pve";
@@ -389,7 +424,12 @@ describe("proxmox-configure-view", () => {
         expect(wizardState.getState().selections.proxmoxConfigureReady).to.be
           .true;
       } else if (outcome === "retry failure last") {
-        newer.reject({ message: "Temporary failure", session_expired: false });
+        newer.reject({
+          message: "Temporary failure",
+          code: "proxmox_api",
+          retryable: true,
+          details: {},
+        });
         await settle();
         el.shadowRoot!.querySelector("wa-button")!.click();
         await settle();
@@ -400,15 +440,27 @@ describe("proxmox-configure-view", () => {
       } else if (outcome === "detached view") {
         el.remove();
       }
-      older.reject({ message: "Session expired", session_expired: true });
+      older.reject({
+        message: "Session expired",
+        code: "proxmox_session_expired",
+        retryable: false,
+        details: {},
+      });
       await settle();
       if (outcome === "retry failure last") {
         retryNodes.reject({
           message: "Temporary failure",
-          session_expired: false,
+          code: "proxmox_api",
+          retryable: true,
+          details: {},
         });
       } else if (outcome === "newer failure last") {
-        newer.reject({ message: "Temporary failure", session_expired: false });
+        newer.reject({
+          message: "Temporary failure",
+          code: "proxmox_api",
+          retryable: true,
+          details: {},
+        });
       } else if (outcome !== "newer success first") {
         newer.resolve(storages);
       }
@@ -518,7 +570,12 @@ describe("proxmox-configure-view", () => {
       mockTauriIpc((cmd) => {
         calls.push(cmd);
         if (failing && cmd === failingCommand) {
-          throw { message: "Temporary failure", session_expired: false };
+          throw {
+            message: "Temporary failure",
+            code: "proxmox_api",
+            retryable: true,
+            details: {},
+          };
         }
         switch (cmd) {
           case "proxmox_list_nodes":
@@ -545,7 +602,8 @@ describe("proxmox-configure-view", () => {
         <proxmox-configure-view></proxmox-configure-view>
       `);
       await waitUntil(() => !!el.shadowRoot!.querySelector("[role=alert]"));
-      expect(el.shadowRoot!.textContent).to.contain("Temporary failure");
+      // Remote details stay out of the view; the code picks a safe message
+      expect(el.shadowRoot!.textContent).to.contain("account permissions");
       expect(wizardState.getState().selections.proxmoxConfigureReady).to.be
         .false;
       expect(wizardState.getState().selections.proxmoxSession).to.exist;
@@ -587,7 +645,9 @@ describe("proxmox-configure-view", () => {
         if (cmd === failingCommand) {
           throw {
             message: "Session expired. Please reconnect.",
-            session_expired: true,
+            code: "proxmox_session_expired",
+            retryable: false,
+            details: {},
           };
         }
         if (cmd === "proxmox_list_nodes")
@@ -650,12 +710,16 @@ describe("proxmox-configure-view", () => {
           const rejectExpired = () =>
             expired.reject({
               message: "Session expired",
-              session_expired: true,
+              code: "proxmox_session_expired",
+              retryable: false,
+              details: {},
             });
           const rejectTemporary = () =>
             temporary.reject({
               message: "Temporary failure",
-              session_expired: false,
+              code: "proxmox_api",
+              retryable: true,
+              details: {},
             });
 
           (expiredFirst ? rejectExpired : rejectTemporary)();
@@ -701,7 +765,12 @@ describe("proxmox-configure-view", () => {
       <proxmox-configure-view></proxmox-configure-view>
     `);
     el.remove();
-    nodes.reject({ message: "Expired", session_expired: true });
+    nodes.reject({
+      message: "Expired",
+      code: "proxmox_session_expired",
+      retryable: false,
+      details: {},
+    });
     await settle();
     expect(wizardState.getState().selections.proxmoxSession).to.exist;
   });
@@ -722,7 +791,12 @@ describe("proxmox-configure-view", () => {
     wizardState.setSelection("proxmoxStorage", "local-lvm");
     const session = wizardState.getState().selections.proxmoxSession;
     mockTauriIpc(() => {
-      throw { message: "Session expired", session_expired: true };
+      throw {
+        message: "Session expired",
+        code: "proxmox_session_expired",
+        retryable: false,
+        details: {},
+      };
     });
     const el = await fixture<ProxmoxConfigureView>(html`
       <proxmox-configure-view></proxmox-configure-view>
@@ -744,7 +818,7 @@ describe("proxmox-configure-view", () => {
       "local-lvm"
     );
     expect(
-      reconnected.shadowRoot!.querySelectorAll("select")[1].value
+      reconnected.shadowRoot!.querySelectorAll("wa-select")[1].value
     ).to.equal("local-lvm");
   });
 
