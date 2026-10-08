@@ -191,7 +191,7 @@ export class ProxmoxConnectView extends LitElement {
       wizardState.setSelection("proxmoxConnected", true);
       return true;
     } catch (error) {
-      diagnostics.fail(error);
+      if (this.isConnected) diagnostics.fail(error);
       this._error = installerError(error, "Failed to connect to Proxmox");
       wizardState.setSelection("proxmoxConnected", false);
       return false;

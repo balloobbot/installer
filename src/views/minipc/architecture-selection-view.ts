@@ -233,7 +233,7 @@ export class MiniPCArchitectureSelectionView extends LitElement {
       }
       wizardState.setSelection("deviceCatalogReady", true);
     } catch (err) {
-      new InstallDiagnostics("flash").fail(err);
+      if (this.isConnected) new InstallDiagnostics("flash").fail(err);
       this._error = installerError(err, "Failed to load architectures");
     } finally {
       this._loading = false;
