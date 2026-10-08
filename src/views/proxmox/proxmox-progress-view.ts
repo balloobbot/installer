@@ -1,3 +1,4 @@
+import { formatNumber, localize } from "../../localization/localize.js";
 import { LitElement, html, css, svg } from "lit";
 import { customElement, state } from "lit/decorators.js";
 import { wizardState, type WizardState } from "../../state/wizard-state.js";
@@ -394,7 +395,11 @@ export class ProxmoxProgressView extends LitElement {
     const session = selections.proxmoxSession;
 
     if (!session) {
-      this._setError("No Proxmox session available");
+      this._setError(
+        localize(
+          "views.proxmox.proxmox_progress_view.no_proxmox_session_available"
+        )
+      );
       return;
     }
 
@@ -474,7 +479,9 @@ export class ProxmoxProgressView extends LitElement {
           ? error
           : error instanceof Error
             ? error.message
-            : "Failed to create virtual machine"
+            : localize(
+                "views.proxmox.proxmox_progress_view.failed_to_create_virtual_machine"
+              )
       );
     } finally {
       // A newer attempt may own the component by now (cancel, then retry)
@@ -526,7 +533,9 @@ export class ProxmoxProgressView extends LitElement {
 
       <h2>${description}</h2>
       <p class="stage-description">
-        Please keep this window open during installation
+        ${localize(
+          "views.proxmox.proxmox_progress_view.please_keep_this_window_open_during_installation"
+        )}
       </p>
 
       ${this._renderStagesIndicator(stage)}
@@ -540,7 +549,10 @@ export class ProxmoxProgressView extends LitElement {
           <div class="progress-left">
             <span class="bytes-info"
               >${hasMeasurable && this._totalBytes > 0
-                ? `${formatBytes(this._bytesProcessed)} / ${formatBytes(this._totalBytes)}`
+                ? localize("format.byte_progress", {
+                    completed: formatBytes(this._bytesProcessed),
+                    total: formatBytes(this._totalBytes),
+                  })
                 : ""}</span
             >
             <span class="speed"
@@ -551,11 +563,14 @@ export class ProxmoxProgressView extends LitElement {
           </div>
           <div class="progress-right">
             <span class="percentage"
-              >${hasMeasurable ? `${percentage}%` : ""}</span
+              >${hasMeasurable
+                ? `${formatNumber(percentage / 100, { style: "percent", maximumFractionDigits: 20 })}`
+                : ""}</span
             >
             <span class="eta"
               >${hasMeasurable && this._totalBytes > 0
-                ? this._calculateEta() || "Calculating..."
+                ? this._calculateEta() ||
+                  localize("views.sbc.progress_view.calculating")
                 : ""}</span
             >
           </div>
@@ -568,7 +583,9 @@ export class ProxmoxProgressView extends LitElement {
     return html`
       <div class="mascot-container">${this._renderCasitaSad()}</div>
 
-      <h2>Installation failed</h2>
+      <h2>
+        ${localize("views.proxmox.proxmox_progress_view.installation_failed")}
+      </h2>
 
       <p class="error-message">${this._error}</p>
     `;
@@ -576,13 +593,48 @@ export class ProxmoxProgressView extends LitElement {
 
   private _renderStagesIndicator(currentStage: string) {
     const stages = [
-      { id: "downloading", label: "Downloading Home Assistant OS" },
-      { id: "extracting", label: "Uploading image to Proxmox" },
-      { id: "writing", label: "Creating virtual machine" },
-      { id: "verifying", label: "Starting Home Assistant OS" },
-      { id: "finalizing", label: "Waiting for network connection" },
-      { id: "ready", label: "Waiting for Home Assistant" },
-      { id: "updating", label: "Installing latest Home Assistant" },
+      {
+        id: "downloading",
+        label: localize(
+          "views.proxmox.proxmox_progress_view.downloading_home_assistant_os"
+        ),
+      },
+      {
+        id: "extracting",
+        label: localize(
+          "views.proxmox.proxmox_progress_view.uploading_image_to_proxmox"
+        ),
+      },
+      {
+        id: "writing",
+        label: localize(
+          "views.proxmox.proxmox_progress_view.creating_virtual_machine"
+        ),
+      },
+      {
+        id: "verifying",
+        label: localize(
+          "views.proxmox.proxmox_progress_view.starting_home_assistant_os"
+        ),
+      },
+      {
+        id: "finalizing",
+        label: localize(
+          "views.proxmox.proxmox_progress_view.waiting_for_network_connection"
+        ),
+      },
+      {
+        id: "ready",
+        label: localize(
+          "views.proxmox.proxmox_progress_view.waiting_for_home_assistant"
+        ),
+      },
+      {
+        id: "updating",
+        label: localize(
+          "views.proxmox.proxmox_progress_view.installing_latest_home_assistant"
+        ),
+      },
     ];
     const currentIndex = stages.findIndex((s) => s.id === currentStage);
     const isComplete = currentStage === "complete";
@@ -628,14 +680,22 @@ export class ProxmoxProgressView extends LitElement {
     if (remainingSeconds < 0 || !isFinite(remainingSeconds)) return null;
 
     if (remainingSeconds < 60) {
-      return "Less than a minute remaining";
+      return localize(
+        "views.proxmox.proxmox_progress_view.less_than_a_minute_remaining"
+      );
     } else if (remainingSeconds < 3600) {
       const minutes = Math.ceil(remainingSeconds / 60);
-      return `About ${minutes} minute${minutes !== 1 ? "s" : ""} remaining`;
+      return localize(
+        "views.proxmox.proxmox_progress_view.about_value_minutevalue_remaining",
+        { value0: minutes }
+      );
     } else {
       const hours = Math.floor(remainingSeconds / 3600);
       const minutes = Math.ceil((remainingSeconds % 3600) / 60);
-      return `About ${hours}h ${minutes}m remaining`;
+      return localize(
+        "views.proxmox.proxmox_progress_view.about_valueh_valuem_remaining",
+        { value0: hours, value1: minutes }
+      );
     }
   }
 
@@ -653,7 +713,9 @@ export class ProxmoxProgressView extends LitElement {
     const bytesPerSecond = bytesInStage / elapsed;
     if (bytesPerSecond <= 0 || !isFinite(bytesPerSecond)) return "";
 
-    return `${formatBytes(bytesPerSecond)}/s`;
+    return localize("views.proxmox.proxmox_progress_view.value_s", {
+      value0: formatBytes(bytesPerSecond),
+    });
   }
 
   /** Check if the current stage uses indeterminate progress */
@@ -669,48 +731,64 @@ export class ProxmoxProgressView extends LitElement {
   private _getStageTitle(stage: string): string {
     switch (stage) {
       case "downloading":
-        return "Downloading";
+        return localize("views.proxmox.proxmox_progress_view.downloading");
       case "extracting":
-        return "Uploading";
+        return localize("views.proxmox.proxmox_progress_view.uploading");
       case "writing":
-        return "Creating";
+        return localize("views.proxmox.proxmox_progress_view.creating");
       case "verifying":
-        return "Starting";
+        return localize("views.proxmox.proxmox_progress_view.starting");
       case "finalizing":
-        return "Connecting";
+        return localize("views.proxmox.proxmox_progress_view.connecting");
       case "ready":
-        return "Waiting";
+        return localize("views.proxmox.proxmox_progress_view.waiting");
       case "updating":
-        return "Updating";
+        return localize("views.proxmox.proxmox_progress_view.updating");
       case "complete":
-        return "Complete!";
+        return localize("views.proxmox.proxmox_progress_view.complete");
       case "error":
-        return "Error";
+        return localize("common.error");
       default:
-        return "Installing";
+        return localize("views.proxmox.proxmox_progress_view.installing");
     }
   }
 
   private _getStageDescription(stage: string): string {
     switch (stage) {
       case "downloading":
-        return "Downloading Home Assistant OS";
+        return localize(
+          "views.proxmox.proxmox_progress_view.downloading_home_assistant_os"
+        );
       case "extracting":
-        return "Uploading image to Proxmox";
+        return localize(
+          "views.proxmox.proxmox_progress_view.uploading_image_to_proxmox"
+        );
       case "writing":
-        return "Creating virtual machine";
+        return localize(
+          "views.proxmox.proxmox_progress_view.creating_virtual_machine"
+        );
       case "verifying":
-        return "Starting Home Assistant OS";
+        return localize(
+          "views.proxmox.proxmox_progress_view.starting_home_assistant_os"
+        );
       case "finalizing":
-        return "Waiting for network connection";
+        return localize(
+          "views.proxmox.proxmox_progress_view.waiting_for_network_connection"
+        );
       case "ready":
-        return "Waiting for Home Assistant";
+        return localize(
+          "views.proxmox.proxmox_progress_view.waiting_for_home_assistant"
+        );
       case "updating":
-        return "Installing latest Home Assistant (this can take up to 20 minutes)";
+        return localize(
+          "views.proxmox.proxmox_progress_view.installing_latest_home_assistant_this_can_take_up_to_20_minutes"
+        );
       case "complete":
-        return "Installation complete!";
+        return localize("api.commands.installation_complete");
       default:
-        return "Installing Home Assistant";
+        return localize(
+          "views.proxmox.proxmox_progress_view.installing_home_assistant"
+        );
     }
   }
 

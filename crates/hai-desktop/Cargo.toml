@@ -27,6 +27,7 @@ hai-core = { workspace = true, features = ["proxmox", "utm"] }
 # Tauri
 tauri = { workspace = true }
 tauri-plugin-opener = { workspace = true }
+tauri-plugin-os = { workspace = true }
 
 # Serialization (for Tauri commands)
 serde = { workspace = true }

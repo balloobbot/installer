@@ -1,3 +1,4 @@
+import { formatNumber, localize } from "../../localization/localize.js";
 import { LitElement, html, css, svg } from "lit";
 import { customElement, state } from "lit/decorators.js";
 import { wizardState, type WizardState } from "../../state/wizard-state.js";
@@ -529,7 +530,9 @@ export class UtmProgressView extends LitElement {
           ? error.message
           : typeof error === "string" && error.trim()
             ? error
-            : "Failed to create virtual machine";
+            : localize(
+                "views.proxmox.proxmox_progress_view.failed_to_create_virtual_machine"
+              );
       this.dispatchEvent(
         new CustomEvent("install-error", {
           bubbles: true,
@@ -640,7 +643,9 @@ export class UtmProgressView extends LitElement {
 
       <h2>${description}</h2>
       <p class="stage-description">
-        Please keep this window open during installation
+        ${localize(
+          "views.proxmox.proxmox_progress_view.please_keep_this_window_open_during_installation"
+        )}
       </p>
 
       ${this._renderStagesIndicator(stage)}
@@ -656,7 +661,10 @@ export class UtmProgressView extends LitElement {
                 <div class="progress-left">
                   <span class="bytes-info"
                     >${this._totalBytes > 0
-                      ? `${formatBytes(this._bytesProcessed)} / ${formatBytes(this._totalBytes)}`
+                      ? localize("format.byte_progress", {
+                          completed: formatBytes(this._bytesProcessed),
+                          total: formatBytes(this._totalBytes),
+                        })
                       : ""}</span
                   >
                   <span class="speed"
@@ -664,10 +672,16 @@ export class UtmProgressView extends LitElement {
                   >
                 </div>
                 <div class="progress-right">
-                  <span class="percentage">${percentage}%</span>
+                  <span class="percentage"
+                    >${formatNumber(percentage / 100, {
+                      style: "percent",
+                      maximumFractionDigits: 20,
+                    })}</span
+                  >
                   <span class="eta"
                     >${this._totalBytes > 0
-                      ? this._calculateEta() || "Calculating..."
+                      ? this._calculateEta() ||
+                        localize("views.sbc.progress_view.calculating")
                       : ""}</span
                   >
                 </div>
@@ -682,7 +696,9 @@ export class UtmProgressView extends LitElement {
     return html`
       <div class="mascot-container">${this._renderCasitaSad()}</div>
 
-      <h2>Installation failed</h2>
+      <h2>
+        ${localize("views.proxmox.proxmox_progress_view.installation_failed")}
+      </h2>
 
       <p class="error-message">${this._error}</p>
     `;
@@ -690,13 +706,46 @@ export class UtmProgressView extends LitElement {
 
   private _renderStagesIndicator(currentStage: string) {
     const stages = [
-      { id: "downloading", label: "Downloading Home Assistant OS" },
-      { id: "extracting", label: "Extracting the image" },
-      { id: "creating", label: "Creating virtual machine" },
-      { id: "starting", label: "Starting Home Assistant OS" },
-      { id: "waiting", label: "Waiting for network connection" },
-      { id: "ready", label: "Waiting for Home Assistant" },
-      { id: "updating", label: "Installing latest Home Assistant" },
+      {
+        id: "downloading",
+        label: localize(
+          "views.proxmox.proxmox_progress_view.downloading_home_assistant_os"
+        ),
+      },
+      {
+        id: "extracting",
+        label: localize("views.sbc.progress_view.extracting_the_image"),
+      },
+      {
+        id: "creating",
+        label: localize(
+          "views.proxmox.proxmox_progress_view.creating_virtual_machine"
+        ),
+      },
+      {
+        id: "starting",
+        label: localize(
+          "views.proxmox.proxmox_progress_view.starting_home_assistant_os"
+        ),
+      },
+      {
+        id: "waiting",
+        label: localize(
+          "views.proxmox.proxmox_progress_view.waiting_for_network_connection"
+        ),
+      },
+      {
+        id: "ready",
+        label: localize(
+          "views.proxmox.proxmox_progress_view.waiting_for_home_assistant"
+        ),
+      },
+      {
+        id: "updating",
+        label: localize(
+          "views.proxmox.proxmox_progress_view.installing_latest_home_assistant"
+        ),
+      },
     ];
     const currentIndex = stages.findIndex((s) => s.id === currentStage);
     const isComplete = currentStage === "complete";
@@ -742,14 +791,22 @@ export class UtmProgressView extends LitElement {
     if (remainingSeconds < 0 || !isFinite(remainingSeconds)) return null;
 
     if (remainingSeconds < 60) {
-      return "Less than a minute remaining";
+      return localize(
+        "views.proxmox.proxmox_progress_view.less_than_a_minute_remaining"
+      );
     } else if (remainingSeconds < 3600) {
       const minutes = Math.ceil(remainingSeconds / 60);
-      return `About ${minutes} minute${minutes !== 1 ? "s" : ""} remaining`;
+      return localize(
+        "views.proxmox.proxmox_progress_view.about_value_minutevalue_remaining",
+        { value0: minutes }
+      );
     } else {
       const hours = Math.floor(remainingSeconds / 3600);
       const minutes = Math.ceil((remainingSeconds % 3600) / 60);
-      return `About ${hours}h ${minutes}m remaining`;
+      return localize(
+        "views.proxmox.proxmox_progress_view.about_valueh_valuem_remaining",
+        { value0: hours, value1: minutes }
+      );
     }
   }
 
@@ -767,54 +824,70 @@ export class UtmProgressView extends LitElement {
     const bytesPerSecond = bytesInStage / elapsed;
     if (bytesPerSecond <= 0 || !isFinite(bytesPerSecond)) return "";
 
-    return `${formatBytes(bytesPerSecond)}/s`;
+    return localize("views.proxmox.proxmox_progress_view.value_s", {
+      value0: formatBytes(bytesPerSecond),
+    });
   }
 
   private _getStageTitle(stage: string): string {
     switch (stage) {
       case "downloading":
-        return "Downloading";
+        return localize("views.proxmox.proxmox_progress_view.downloading");
       case "extracting":
-        return "Extracting";
+        return localize("views.sbc.progress_view.extracting");
       case "creating":
-        return "Creating";
+        return localize("views.proxmox.proxmox_progress_view.creating");
       case "starting":
-        return "Starting";
+        return localize("views.proxmox.proxmox_progress_view.starting");
       case "waiting":
-        return "Waiting";
+        return localize("views.proxmox.proxmox_progress_view.waiting");
       case "ready":
-        return "Waiting";
+        return localize("views.proxmox.proxmox_progress_view.waiting");
       case "updating":
-        return "Updating";
+        return localize("views.proxmox.proxmox_progress_view.updating");
       case "complete":
-        return "Complete!";
+        return localize("views.proxmox.proxmox_progress_view.complete");
       case "error":
-        return "Error";
+        return localize("common.error");
       default:
-        return "Installing";
+        return localize("views.proxmox.proxmox_progress_view.installing");
     }
   }
 
   private _getStageDescription(stage: string): string {
     switch (stage) {
       case "downloading":
-        return "Downloading Home Assistant OS";
+        return localize(
+          "views.proxmox.proxmox_progress_view.downloading_home_assistant_os"
+        );
       case "extracting":
-        return "Extracting the image";
+        return localize("views.sbc.progress_view.extracting_the_image");
       case "creating":
-        return "Creating virtual machine";
+        return localize(
+          "views.proxmox.proxmox_progress_view.creating_virtual_machine"
+        );
       case "starting":
-        return "Starting Home Assistant OS";
+        return localize(
+          "views.proxmox.proxmox_progress_view.starting_home_assistant_os"
+        );
       case "waiting":
-        return "Waiting for network connection";
+        return localize(
+          "views.proxmox.proxmox_progress_view.waiting_for_network_connection"
+        );
       case "ready":
-        return "Waiting for Home Assistant";
+        return localize(
+          "views.proxmox.proxmox_progress_view.waiting_for_home_assistant"
+        );
       case "updating":
-        return "Installing latest Home Assistant (this can take up to 20 minutes)";
+        return localize(
+          "views.proxmox.proxmox_progress_view.installing_latest_home_assistant_this_can_take_up_to_20_minutes"
+        );
       case "complete":
-        return "Installation complete!";
+        return localize("api.commands.installation_complete");
       default:
-        return "Installing Home Assistant";
+        return localize(
+          "views.proxmox.proxmox_progress_view.installing_home_assistant"
+        );
     }
   }
 
@@ -837,7 +910,9 @@ export class UtmProgressView extends LitElement {
           interval: POLL_INTERVAL_MS,
           timeout: VM_IP_TIMEOUT_MS,
           signal,
-          timeoutMessage: "The virtual machine did not report an IP address",
+          timeoutMessage: localize(
+            "views.utm.utm_progress_view.the_virtual_machine_did_not_report_an_ip_address"
+          ),
         }
       );
     } catch (error) {
@@ -863,10 +938,10 @@ export class UtmProgressView extends LitElement {
       interval: POLL_INTERVAL_MS,
       timeout: HA_READY_TIMEOUT_MS,
       signal,
-      timeoutMessage:
-        `Home Assistant did not respond at ${ipAddress} within 5 minutes. ` +
-        `The virtual machine was created - check whether it is running in UTM, ` +
-        `then try again to keep waiting for it.`,
+      timeoutMessage: localize(
+        "views.utm.utm_progress_view.home_assistant_did_not_respond_at_value_within_5_minutes",
+        { value0: ipAddress }
+      ),
     });
   }
 
@@ -887,10 +962,9 @@ export class UtmProgressView extends LitElement {
       interval: POLL_INTERVAL_MS,
       timeout: HA_UPDATED_TIMEOUT_MS,
       signal,
-      timeoutMessage:
-        `Home Assistant did not finish installing updates within 60 minutes. ` +
-        `Open http://${ipAddress} to check on it, or try again to keep ` +
-        `waiting for it.`,
+      timeoutMessage: localize("utm.update_timeout", {
+        address: `http://${ipAddress}`,
+      }),
     });
   }
 

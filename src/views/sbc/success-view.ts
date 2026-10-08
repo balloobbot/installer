@@ -1,3 +1,4 @@
+import { localize, localizeContent } from "../../localization/localize.js";
 import { LitElement, html, css, svg } from "lit";
 import { customElement, state } from "lit/decorators.js";
 import { wizardState, type WizardState } from "../../state/wizard-state.js";
@@ -215,58 +216,82 @@ export class SuccessView extends LitElement {
   }
 
   render() {
-    const deviceName =
-      (this._wizardState.selections.deviceName as string) || "your device";
+    const deviceName = this._wizardState.selections.deviceName as
+      | string
+      | undefined;
 
     return html`
       <div class="mascot-container">${this._renderCasitaHappy()}</div>
 
-      <h2>You're all set!</h2>
+      <h2>${localize("views.proxmox.proxmox_success_view.you_re_all_set")}</h2>
       <p class="subtitle">
-        Home Assistant has been installed on your ${deviceName}
+        ${deviceName
+          ? localizeContent(
+              "views.sbc.success_view.home_assistant_has_been_installed_on_your_value",
+              { value0: deviceName }
+            )
+          : localize("sbc.success_installed_unknown_device")}
       </p>
 
       <div class="next-steps">
-        <p class="next-steps-title">Next steps</p>
+        <p class="next-steps-title">
+          ${localize("views.proxmox.proxmox_success_view.next_steps")}
+        </p>
         <ol class="steps-list">
           <li class="step-item">
             <span class="step-number">1</span>
             <span class="step-text"
-              >Remove the storage device from your computer</span
+              >${localize(
+                "views.sbc.success_view.remove_the_storage_device_from_your_computer"
+              )}</span
             >
           </li>
           <li class="step-item">
             <span class="step-number">2</span>
             <span class="step-text"
-              >Insert it into ${deviceName} and power it on</span
+              >${deviceName
+                ? localizeContent(
+                    "views.sbc.success_view.insert_it_into_value_and_power_it_on",
+                    { value0: deviceName }
+                  )
+                : localize("sbc.success_insert_unknown_device")}</span
             >
           </li>
           <li class="step-item">
             <span class="step-number">3</span>
             <span class="step-text"
-              >Wait a few minutes for the initial setup to complete</span
+              >${localize(
+                "views.sbc.success_view.wait_a_few_minutes_for_the_initial_setup_to_complete"
+              )}</span
             >
           </li>
           <li class="step-item">
             <span class="step-number">4</span>
             <span class="step-text"
-              >Open
-              <a
-                href="http://homeassistant.local"
-                target="_blank"
-                rel="noopener noreferrer"
-                @click=${(event: Event) =>
-                  openExternalLink(event, "http://homeassistant.local")}
-                >homeassistant.local</a
-              >
-              in your browser</span
+              >${localizeContent(
+                "views.proxmox.proxmox_success_view.open_value_in_your_browser",
+                {
+                  value0: html`<a
+                    href="http://homeassistant.local"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    @click=${(event: Event) =>
+                      openExternalLink(event, "http://homeassistant.local")}
+                    >${"homeassistant.local"}</a
+                  >`,
+                }
+              )}</span
             >
           </li>
         </ol>
       </div>
 
       <div class="companion-section">
-        <p class="companion-title">Get the Home Assistant Companion App</p>
+        <p class="companion-title">
+          ${localize(
+            "views.proxmox.proxmox_success_view.get_the_home_assistant_companion_app"
+          )}
+        </p>
         <div class="app-links">
           <a
             class="app-link"
@@ -280,7 +305,9 @@ export class SuccessView extends LitElement {
               )}
           >
             ${this._renderAppleIcon()}
-            <span>App Store</span>
+            <span
+              >${localize("views.proxmox.proxmox_success_view.app_store")}</span
+            >
           </a>
           <a
             class="app-link"
@@ -294,7 +321,11 @@ export class SuccessView extends LitElement {
               )}
           >
             ${this._renderGooglePlayIcon()}
-            <span>Google Play</span>
+            <span
+              >${localize(
+                "views.proxmox.proxmox_success_view.google_play"
+              )}</span
+            >
           </a>
         </div>
       </div>

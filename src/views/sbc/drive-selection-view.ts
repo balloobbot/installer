@@ -1,3 +1,8 @@
+import {
+  formatNumber,
+  localize,
+  localizeContent,
+} from "../../localization/localize.js";
 import { LitElement, html, css } from "lit";
 import { customElement, state } from "lit/decorators.js";
 import { listBlockDevices, type BlockDevice } from "../../api/index.js";
@@ -247,7 +252,10 @@ export class DriveSelectionView extends LitElement {
     try {
       drives = (await listBlockDevices()).filter(isEligibleFlashTarget);
     } catch (err) {
-      error = err instanceof Error ? err.message : "Failed to load drives";
+      error =
+        err instanceof Error
+          ? err.message
+          : localize("views.sbc.drive_selection_view.failed_to_load_drives");
       // The scan failed, so the selection cannot be confirmed. Drop it rather
       // than let a stale path through to the write.
       drives = [];
@@ -304,19 +312,28 @@ export class DriveSelectionView extends LitElement {
   render() {
     const isMiniPC = this._isMiniPCFlow();
     const subtitle = isMiniPC
-      ? "Choose the NVMe/SSD drive to install Home Assistant on"
-      : "Choose the SD card or USB drive to install Home Assistant on";
+      ? localize(
+          "views.sbc.drive_selection_view.choose_the_nvme_ssd_drive_to_install_home_assistant_on"
+        )
+      : localize(
+          "views.sbc.drive_selection_view.choose_the_sd_card_or_usb_drive_to_install_home_assistant_on"
+        );
 
     return html`
-      <h2>Select your drive</h2>
+      <h2>${localize("views.sbc.drive_selection_view.select_your_drive")}</h2>
       <p class="subtitle">${subtitle}</p>
 
       <div class="warning">
         <span class="warning-icon">⚠️</span>
         <p class="warning-text">
-          <strong>Warning:</strong> All data on the selected drive will be
-          permanently erased. Make sure you have backed up any important files
-          before proceeding.
+          ${localizeContent(
+            "views.sbc.drive_selection_view.value_all_data_on_the_selected_drive_will_be_permanently_erased_make_sure_y",
+            {
+              value0: html`<strong
+                >${localize("views.sbc.drive_selection_view.warning")}</strong
+              >`,
+            }
+          )}
         </p>
       </div>
 
@@ -329,9 +346,9 @@ export class DriveSelectionView extends LitElement {
               <div class="notice">
                 <span class="notice-icon" aria-hidden="true">🔌</span>
                 <p class="notice-text">
-                  The drive you selected is no longer available, so the
-                  selection was cleared. Devices can reappear under the same
-                  name as a different drive, so please pick your drive again.
+                  ${localize(
+                    "views.sbc.drive_selection_view.the_drive_you_selected_is_no_longer_available_so_the_selection_was_cleared_"
+                  )}
                 </p>
               </div>
             `
@@ -349,7 +366,11 @@ export class DriveSelectionView extends LitElement {
       return html`
         <div class="loading">
           <div class="loading-spinner"></div>
-          <span>Scanning for drives...</span>
+          <span
+            >${localize(
+              "views.sbc.drive_selection_view.scanning_for_drives"
+            )}</span
+          >
         </div>
       `;
     }
@@ -364,7 +385,7 @@ export class DriveSelectionView extends LitElement {
             appearance="outlined"
             @click=${this._loadDrives}
           >
-            Try again
+            ${localize("components.app_shell.try_again")}
           </wa-button>
         </div>
       `;
@@ -372,8 +393,12 @@ export class DriveSelectionView extends LitElement {
 
     if (this._drives.length === 0) {
       const emptyText = this._isMiniPCFlow()
-        ? "Connect your drive using a USB adapter and select Refresh."
-        : "Insert an SD card or USB drive and select Refresh.";
+        ? localize(
+            "views.sbc.drive_selection_view.connect_your_drive_using_a_usb_adapter_and_select_refresh"
+          )
+        : localize(
+            "views.sbc.drive_selection_view.insert_an_sd_card_or_usb_drive_and_select_refresh"
+          );
 
       return html`
         <div class="empty-state">
@@ -384,7 +409,9 @@ export class DriveSelectionView extends LitElement {
               />
             </svg>
           </span>
-          <p class="empty-title">No drives found</p>
+          <p class="empty-title">
+            ${localize("views.sbc.drive_selection_view.no_drives_found")}
+          </p>
           <p class="empty-text">${emptyText}</p>
           <wa-button
             variant="brand"
@@ -392,8 +419,7 @@ export class DriveSelectionView extends LitElement {
             @click=${this._loadDrives}
             style="margin-top: 1rem;"
           >
-            <span slot="start">↻</span>
-            Refresh
+            <span slot="start">↻</span> ${localize("common.refresh")}
           </wa-button>
         </div>
       `;
@@ -401,22 +427,23 @@ export class DriveSelectionView extends LitElement {
 
     return html`
       <div class="drives-header">
-        <p class="drives-title">Available drives</p>
+        <p class="drives-title">
+          ${localize("views.sbc.drive_selection_view.available_drives")}
+        </p>
         <wa-button
           variant="brand"
           appearance="outlined"
           @click=${this._loadDrives}
           ?loading=${this._loading}
         >
-          <span slot="start">↻</span>
-          Refresh
+          <span slot="start">↻</span> ${localize("common.refresh")}
         </wa-button>
       </div>
 
       <wa-radio-group
         class="drives-list"
         radio-tag="drive-card"
-        aria-label="Target drive"
+        aria-label=${localize("views.sbc.confirmation_view.target_drive")}
         .value=${this._selectedDriveId ?? ""}
         @change=${this._onDriveChange}
       >
@@ -445,7 +472,14 @@ export class DriveSelectionView extends LitElement {
                 .vendor=${drive.vendor || ""}
                 .disabled=${tooSmall}
                 .disabledReason=${tooSmall
-                  ? `⚠ Minimum ${minSizeGB} GB required`
+                  ? localize(
+                      "views.sbc.drive_selection_view.minimum_value_gb_required",
+                      {
+                        value0: formatNumber(minSizeGB, {
+                          maximumFractionDigits: 20,
+                        }),
+                      }
+                    )
                   : ""}
               ></drive-card>
             `;

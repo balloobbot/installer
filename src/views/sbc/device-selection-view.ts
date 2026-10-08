@@ -1,3 +1,4 @@
+import { localize } from "../../localization/localize.js";
 import { LitElement, html, css } from "lit";
 import { customElement, state } from "lit/decorators.js";
 import { getManifest, type Device } from "../../api/index.js";
@@ -126,7 +127,11 @@ export class DeviceSelectionView extends LitElement {
       );
     } catch (err) {
       this._error =
-        err instanceof Error ? err.message : "Failed to load devices";
+        err instanceof Error
+          ? err.message
+          : localize(
+              "views.ha_hardware.device_selection_view.failed_to_load_devices"
+            );
     } finally {
       this._loading = false;
     }
@@ -137,7 +142,11 @@ export class DeviceSelectionView extends LitElement {
       return html`
         <div class="loading">
           <div class="loading-spinner"></div>
-          <span>Loading devices...</span>
+          <span
+            >${localize(
+              "views.ha_hardware.device_selection_view.loading_devices"
+            )}</span
+          >
         </div>
       `;
     }
@@ -152,22 +161,26 @@ export class DeviceSelectionView extends LitElement {
             appearance="outlined"
             @click=${this._loadDevices}
           >
-            Try again
+            ${localize("components.app_shell.try_again")}
           </wa-button>
         </div>
       `;
     }
 
     return html`
-      <h2>Select your device</h2>
+      <h2>${localize("views.sbc.device_selection_view.select_your_device")}</h2>
       <p class="subtitle">
-        Choose the single board computer you want to install Home Assistant on
+        ${localize(
+          "views.sbc.device_selection_view.choose_the_single_board_computer_you_want_to_install_home_assistant_on"
+        )}
       </p>
 
       <wa-radio-group
         class="devices-grid"
         radio-tag="device-card"
-        aria-label="Single board computer"
+        aria-label=${localize(
+          "views.sbc.device_selection_view.single_board_computer"
+        )}
         .value=${this._selectedDeviceId ?? ""}
         @change=${this._onDeviceChange}
       >

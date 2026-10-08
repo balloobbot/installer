@@ -1,3 +1,4 @@
+import { localize, localizeContent } from "../../localization/localize.js";
 import { LitElement, html, css, svg } from "lit";
 import { customElement, state } from "lit/decorators.js";
 import { wizardState, type WizardState } from "../../state/wizard-state.js";
@@ -222,53 +223,73 @@ export class UtmSuccessView extends LitElement {
     return html`
       <div class="mascot-container">${this._renderCasitaHappy()}</div>
 
-      <h2>You're all set!</h2>
+      <h2>${localize("views.proxmox.proxmox_success_view.you_re_all_set")}</h2>
       <p class="subtitle">
-        Home Assistant is now running in UTM as "${vmName}"
+        ${localizeContent(
+          "views.utm.utm_success_view.home_assistant_is_now_running_in_utm_as_value",
+          { value0: vmName }
+        )}
       </p>
 
       <div class="next-steps">
-        <p class="next-steps-title">Next steps</p>
+        <p class="next-steps-title">
+          ${localize("views.proxmox.proxmox_success_view.next_steps")}
+        </p>
         <ol class="steps-list">
           <li class="step-item">
             <span class="step-number">1</span>
             <span class="step-text">
-              Wait a few minutes for Home Assistant to complete its initial
-              setup
+              ${localize(
+                "views.proxmox.proxmox_success_view.wait_a_few_minutes_for_home_assistant_to_complete_its_initial_setup"
+              )}
             </span>
           </li>
           <li class="step-item">
             <span class="step-number">2</span>
-            <span class="step-text">
-              Open
-              <a
-                href=${haUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                @click=${(event: Event) => openExternalLink(event, haUrl)}
-              >
-                ${displayUrl}
-              </a>
-              in your browser
-            </span>
+            <span class="step-text"
+              >${localizeContent(
+                "views.proxmox.proxmox_success_view.open_value_in_your_browser",
+                {
+                  value0: html`<a
+                    href=${haUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    @click=${(event: Event) => openExternalLink(event, haUrl)}
+                  >
+                    ${displayUrl}
+                  </a>`,
+                }
+              )}</span
+            >
           </li>
           <li class="step-item">
             <span class="step-number">3</span>
             <span class="step-text">
-              Create your user account and start automating!
+              ${localize(
+                "views.proxmox.proxmox_success_view.create_your_user_account_and_start_automating"
+              )}
             </span>
           </li>
         </ol>
       </div>
 
       <div class="tip-section">
-        <strong>Tip:</strong> You can manage your Home Assistant virtual machine
-        anytime by opening UTM. The virtual machine will continue running in the
-        background even after closing this installer.
+        ${localizeContent(
+          "views.utm.utm_success_view.value_you_can_manage_your_home_assistant_virtual_machine_anytime_by_opening",
+          {
+            value0: html`<strong
+              >${localize("views.proxmox.proxmox_success_view.tip")}</strong
+            >`,
+          }
+        )}
       </div>
 
       <div class="companion-section">
-        <p class="companion-title">Get the Home Assistant Companion App</p>
+        <p class="companion-title">
+          ${localize(
+            "views.proxmox.proxmox_success_view.get_the_home_assistant_companion_app"
+          )}
+        </p>
         <div class="app-links">
           <a
             class="app-link"
@@ -282,7 +303,9 @@ export class UtmSuccessView extends LitElement {
               )}
           >
             ${this._renderAppleIcon()}
-            <span>App Store</span>
+            <span
+              >${localize("views.proxmox.proxmox_success_view.app_store")}</span
+            >
           </a>
           <a
             class="app-link"
@@ -296,7 +319,11 @@ export class UtmSuccessView extends LitElement {
               )}
           >
             ${this._renderGooglePlayIcon()}
-            <span>Google Play</span>
+            <span
+              >${localize(
+                "views.proxmox.proxmox_success_view.google_play"
+              )}</span
+            >
           </a>
         </div>
       </div>

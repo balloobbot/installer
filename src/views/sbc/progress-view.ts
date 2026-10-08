@@ -1,3 +1,4 @@
+import { formatNumber, localize } from "../../localization/localize.js";
 import { LitElement, html, css, svg } from "lit";
 import { customElement, state } from "lit/decorators.js";
 import { wizardState, type WizardState } from "../../state/wizard-state.js";
@@ -373,7 +374,11 @@ export class ProgressView extends LitElement {
 
     if (!drive || !deviceConfig) {
       this._isFlashing = false;
-      this._setError("Missing drive or device configuration");
+      this._setError(
+        localize(
+          "views.sbc.progress_view.missing_drive_or_device_configuration"
+        )
+      );
       return;
     }
 
@@ -409,7 +414,7 @@ export class ProgressView extends LitElement {
       );
 
       if (!result.success) {
-        this._setError(result.error || "Flash failed");
+        this._setError(result.error || localize("flash.failed"));
       }
     } catch (err) {
       // Tauri invoke errors come as strings, not Error objects
@@ -418,7 +423,7 @@ export class ProgressView extends LitElement {
           ? err
           : err instanceof Error
             ? err.message
-            : "An unexpected error occurred";
+            : localize("views.sbc.progress_view.an_unexpected_error_occurred");
       this._setError(errorMessage);
     } finally {
       this._isFlashing = false;
@@ -428,8 +433,7 @@ export class ProgressView extends LitElement {
   private _setError(message: string) {
     // Provide user-friendly messages for specific error types
     if (message.toLowerCase().includes("disconnected")) {
-      this._error =
-        "The storage device was disconnected during the installation. Please reconnect it and try again.";
+      this._error = localize("flash.disconnected");
     } else {
       this._error = message;
     }
@@ -483,7 +487,9 @@ export class ProgressView extends LitElement {
 
       <h2>${description}</h2>
       <p class="stage-description">
-        Please keep this window open during installation
+        ${localize(
+          "views.proxmox.proxmox_progress_view.please_keep_this_window_open_during_installation"
+        )}
       </p>
 
       ${this._renderStagesIndicator(stage)}
@@ -499,7 +505,10 @@ export class ProgressView extends LitElement {
               >${isIndeterminate
                 ? formatBytes(bytesProcessed)
                 : totalBytes > 0
-                  ? `${formatBytes(bytesProcessed)} / ${formatBytes(totalBytes)}`
+                  ? localize("format.byte_progress", {
+                      completed: formatBytes(bytesProcessed),
+                      total: formatBytes(totalBytes),
+                    })
                   : ""}</span
             >
             <span class="speed"
@@ -508,13 +517,17 @@ export class ProgressView extends LitElement {
           </div>
           <div class="progress-right">
             <span class="percentage"
-              >${isIndeterminate ? "" : `${percentage}%`}</span
+              >${isIndeterminate
+                ? ""
+                : `${formatNumber(percentage / 100, { style: "percent", maximumFractionDigits: 20 })}`}</span
             >
             <span class="eta"
               >${totalBytes > 0
                 ? eta
-                  ? `${eta} remaining`
-                  : "Calculating..."
+                  ? localize("views.sbc.progress_view.value_remaining", {
+                      value0: eta,
+                    })
+                  : localize("views.sbc.progress_view.calculating")
                 : ""}</span
             >
           </div>
@@ -527,7 +540,9 @@ export class ProgressView extends LitElement {
     return html`
       <div class="mascot-container">${this._renderCasitaSad()}</div>
 
-      <h2>Installation failed</h2>
+      <h2>
+        ${localize("views.proxmox.proxmox_progress_view.installation_failed")}
+      </h2>
 
       <p class="error-message">${this._error}</p>
     `;
@@ -586,14 +601,19 @@ export class ProgressView extends LitElement {
 
     // Format the time
     if (remainingSeconds < 60) {
-      return "Less than a minute";
+      return localize("views.sbc.progress_view.less_than_a_minute");
     } else if (remainingSeconds < 3600) {
       const minutes = Math.ceil(remainingSeconds / 60);
-      return `About ${minutes} minute${minutes !== 1 ? "s" : ""}`;
+      return localize("views.sbc.progress_view.about_value_minutevalue", {
+        value0: minutes,
+      });
     } else {
       const hours = Math.floor(remainingSeconds / 3600);
       const minutes = Math.ceil((remainingSeconds % 3600) / 60);
-      return `About ${hours}h ${minutes}m`;
+      return localize("views.sbc.progress_view.about_valueh_valuem", {
+        value0: hours,
+        value1: minutes,
+      });
     }
   }
 
@@ -614,46 +634,56 @@ export class ProgressView extends LitElement {
     const bytesPerSecond = bytesInStage / elapsed;
     if (bytesPerSecond <= 0 || !isFinite(bytesPerSecond)) return "";
 
-    return `${formatBytes(bytesPerSecond)}/s`;
+    return localize("views.proxmox.proxmox_progress_view.value_s", {
+      value0: formatBytes(bytesPerSecond),
+    });
   }
 
   private _getStageTitle(stage: string): string {
     switch (stage) {
       case "downloading":
-        return "Downloading";
+        return localize("views.proxmox.proxmox_progress_view.downloading");
       case "extracting":
-        return "Extracting";
+        return localize("views.sbc.progress_view.extracting");
       case "writing":
-        return "Writing";
+        return localize("views.sbc.progress_view.writing");
       case "verifying":
-        return "Verifying";
+        return localize("views.sbc.progress_view.verifying");
       case "finalizing":
-        return "Finalizing";
+        return localize("views.sbc.progress_view.finalizing");
       case "complete":
-        return "Complete!";
+        return localize("views.proxmox.proxmox_progress_view.complete");
       case "error":
-        return "Error";
+        return localize("common.error");
       default:
-        return "Installing";
+        return localize("views.proxmox.proxmox_progress_view.installing");
     }
   }
 
   private _getStageDescription(stage: string): string {
     switch (stage) {
       case "downloading":
-        return "Fetching the Home Assistant image";
+        return localize(
+          "views.sbc.progress_view.fetching_the_home_assistant_image"
+        );
       case "extracting":
-        return "Extracting the image";
+        return localize("views.sbc.progress_view.extracting_the_image");
       case "writing":
-        return "Writing Home Assistant to your drive";
+        return localize(
+          "views.sbc.progress_view.writing_home_assistant_to_your_drive"
+        );
       case "verifying":
-        return "Verifying the written data";
+        return localize("views.sbc.progress_view.verifying_the_written_data");
       case "finalizing":
-        return "Finishing up the installation";
+        return localize(
+          "views.sbc.progress_view.finishing_up_the_installation"
+        );
       case "complete":
-        return "Installation complete!";
+        return localize("api.commands.installation_complete");
       default:
-        return "Installing Home Assistant";
+        return localize(
+          "views.proxmox.proxmox_progress_view.installing_home_assistant"
+        );
     }
   }
 

@@ -1,3 +1,4 @@
+import { formatNumber, localize } from "../localization/localize.js";
 import { html, css, nothing } from "lit";
 import { customElement, property } from "lit/decorators.js";
 import WaRadio from "@home-assistant/webawesome/dist/components/radio/radio.js";
@@ -179,27 +180,34 @@ export class DriveCard extends WaRadio {
   private _getTypeLabel(): string {
     switch (this.deviceType) {
       case "sd_card":
-        return "SD card";
+        return localize("components.drive_card.sd_card");
       case "usb_drive":
-        return "USB drive";
+        return localize("components.drive_card.usb_drive");
       case "ssd":
-        return "SSD";
+        return localize("components.drive_card.ssd");
       case "hdd":
-        return "Hard drive";
+        return localize("components.drive_card.hard_drive");
       case "nvme":
-        return "NVMe";
+        return localize("components.drive_card.nvme");
       default:
-        return "Storage device";
+        return localize("components.drive_card.storage_device");
     }
   }
 
   private _formatSize(bytes: number): string {
-    if (bytes === 0) return "0 GB";
+    if (bytes === 0) return localize("components.drive_card.0_gb");
     const gb = bytes / (1024 * 1024 * 1024);
     if (gb >= 1000) {
-      return `${(gb / 1024).toFixed(1)} TB`;
+      return localize("components.drive_card.value_tb", {
+        value0: formatNumber(Number((gb / 1024).toFixed(1)), {
+          minimumFractionDigits: 1,
+          maximumFractionDigits: 1,
+        }),
+      });
     }
-    return `${gb.toFixed(0)} GB`;
+    return localize("components.drive_card.value_gb", {
+      value0: formatNumber(Number(gb.toFixed(0)), { maximumFractionDigits: 0 }),
+    });
   }
 
   private _renderIcon() {

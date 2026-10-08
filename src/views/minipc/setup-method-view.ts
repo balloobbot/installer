@@ -1,3 +1,4 @@
+import { localize } from "../../localization/localize.js";
 import { LitElement, html, css } from "lit";
 import { customElement, state } from "lit/decorators.js";
 import { wizardState } from "../../state/wizard-state.js";
@@ -109,21 +110,33 @@ export class MiniPCSetupMethodView extends LitElement {
 
   render() {
     return html`
-      <h2>How will you install?</h2>
+      <h2>
+        ${localize("views.minipc.setup_method_view.how_will_you_install")}
+      </h2>
       <p class="subtitle">
-        Choose how you want to install Home Assistant on your mini PC
+        ${localize(
+          "views.minipc.setup_method_view.choose_how_you_want_to_install_home_assistant_on_your_mini_pc"
+        )}
       </p>
 
       <div class="options">
         <div class="option-card" @click=${this._onConnectDrive}>
           <div class="option-icon">
-            <img src="/assets/icons/drive-connect.svg" alt="Connect drive" />
+            <img
+              src="/assets/icons/drive-connect.svg"
+              alt=${localize("views.minipc.setup_method_view.connect_drive")}
+            />
           </div>
           <div class="option-content">
-            <p class="option-title">I can connect the drive</p>
+            <p class="option-title">
+              ${localize(
+                "views.minipc.setup_method_view.i_can_connect_the_drive"
+              )}
+            </p>
             <p class="option-description">
-              Connect the SSD or NVMe drive from your mini PC to this computer
-              via USB adapter
+              ${localize(
+                "views.minipc.setup_method_view.connect_the_ssd_or_nvme_drive_from_your_mini_pc_to_this_computer_via_usb_ad"
+              )}
             </p>
           </div>
           <span class="option-arrow">→</span>
@@ -131,13 +144,21 @@ export class MiniPCSetupMethodView extends LitElement {
 
         <div class="option-card" @click=${this._onUsbBoot}>
           <div class="option-icon">
-            <img src="/assets/icons/usb-boot.svg" alt="USB boot" />
+            <img
+              src="/assets/icons/usb-boot.svg"
+              alt=${localize("views.minipc.setup_method_view.usb_boot")}
+            />
           </div>
           <div class="option-content">
-            <p class="option-title">I need to boot from USB</p>
+            <p class="option-title">
+              ${localize(
+                "views.minipc.setup_method_view.i_need_to_boot_from_usb"
+              )}
+            </p>
             <p class="option-description">
-              Create a bootable USB drive to install Home Assistant directly on
-              the mini PC
+              ${localize(
+                "views.minipc.setup_method_view.create_a_bootable_usb_drive_to_install_home_assistant_directly_on_the_mini_"
+              )}
             </p>
           </div>
           <span class="option-arrow">→</span>
@@ -146,10 +167,14 @@ export class MiniPCSetupMethodView extends LitElement {
 
       <info-dialog
         ?open=${this._showUsbDialog}
-        title="USB boot installation"
-        message="Creating bootable USB drives is not supported by this installer. However, we have detailed instructions in our documentation that will guide you through the process."
-        primaryLabel="View instructions"
-        secondaryLabel="Go back"
+        title=${localize(
+          "views.minipc.setup_method_view.usb_boot_installation"
+        )}
+        message=${localize(
+          "views.minipc.setup_method_view.creating_bootable_usb_drives_is_not_supported_by_this_installer_however_we_"
+        )}
+        primaryLabel=${localize("common.view_instructions")}
+        secondaryLabel=${localize("common.go_back")}
         @dialog-primary=${this._onOpenDocs}
         @dialog-secondary=${this._onCloseDialog}
       ></info-dialog>
