@@ -268,6 +268,29 @@ mistaken for the Proxmox certificate.
 
 ### Step 2: Configure VM
 
+Continuing requires an active, non-ESXi storage with free space that accepts
+Import on the selected node, in addition to storage for the VM disk. Import
+storage can be separate from the selected VM disk storage. Existing usable
+Import storage needs no configuration change or approval.
+
+If none is available, show "Import storage required" and keep continuation
+disabled. Offer active directory storage with free space as candidates for
+"Enable Import...". The confirmation names the chosen storage and explains
+that existing content types are preserved, the change applies cluster-wide,
+and the installer will not automatically restore the previous setting after
+installation. Only choosing "Enable Import" applies the change. "Not now" or
+dismissing the dialog makes no change and shows that installation is paused.
+The user can reopen the dialog, choose another node, or configure storage in
+Proxmox and use "Refresh storage".
+
+After enabling Import, refresh storage and allow continuation only when the
+readiness check succeeds. If enabling fails, show the error and advise checking
+permissions/configuration; an expired session or changed certificate offers
+Reconnect, like the other lookups on this step. If no
+directory storage is eligible, advise freeing space, choosing another node, or
+updating storage in Proxmox. Whenever Import storage is required, provide a link
+to the Proxmox directory storage documentation.
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                                                             │
@@ -306,6 +329,19 @@ mistaken for the Proxmox certificate.
 ```
 
 ### Step 4: Complete
+
+If this flow successfully enabled Import, show a reminder naming the changed
+storages for the current Proxmox server. Do not show it merely because Import
+was already enabled. The reminder describes the change made by this installer,
+not a fresh verification that nobody has subsequently changed the setting.
+Explain that it is cluster-wide and is not restored automatically. Ask the user
+to review the storage in Proxmox and remove Import only if no other workflows
+need it, keeping other content types unchanged; link to the storage documentation.
+
+Reminder records last for this installation flow, including node changes and
+signing back in to the same server. A different server's changes are not shown,
+and resetting or starting a new flow clears the records. A later storage refresh
+failure does not erase knowledge of an already successful change.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
