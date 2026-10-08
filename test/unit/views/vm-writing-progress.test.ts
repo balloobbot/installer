@@ -34,6 +34,14 @@ describe("VM writing progress", () => {
       const view = el as HTMLElement & { updateComplete: Promise<boolean> };
       await view.updateComplete;
 
+      // The shared progress layout renders the bar and counters in its own shadow root
+      const layout = async () => {
+        await view.updateComplete;
+        const progress = el.shadowRoot!.querySelector("install-progress")!;
+        await progress.updateComplete;
+        return progress.shadowRoot!;
+      };
+
       for (const progress of [0, 25, 75, 100]) {
         channel.onmessage({
           stage: "writing",
@@ -42,17 +50,17 @@ describe("VM writing progress", () => {
           total_bytes: 100 * 1024,
           message: "Processing image",
         });
-        await view.updateComplete;
-        const bar = el.shadowRoot!.querySelector("progress-bar")!;
+        const root = await layout();
+        const bar = root.querySelector("progress-bar")!;
         await bar.updateComplete;
         expect(bar.indeterminate).to.be.false;
         expect(bar.progress).to.equal(progress);
-        expect(
-          el.shadowRoot!.querySelector(".percentage")!.textContent
-        ).to.equal(`${progress}%`);
-        expect(
-          el.shadowRoot!.querySelector(".bytes-info")!.textContent
-        ).to.contain(" / 100 KB");
+        expect(root.querySelector(".percentage")!.textContent).to.equal(
+          `${progress}%`
+        );
+        expect(root.querySelector(".bytes-info")!.textContent).to.contain(
+          " / 100 KB"
+        );
       }
 
       channel.onmessage({
@@ -62,14 +70,12 @@ describe("VM writing progress", () => {
         total_bytes: 0,
         message: "Processing image",
       });
-      await view.updateComplete;
-      const bar = el.shadowRoot!.querySelector("progress-bar")!;
+      const root = await layout();
+      const bar = root.querySelector("progress-bar")!;
       await bar.updateComplete;
       expect(bar.indeterminate).to.be.true;
       for (const selector of [".percentage", ".bytes-info", ".speed", ".eta"]) {
-        expect(el.shadowRoot!.querySelector(selector)!.textContent).to.equal(
-          ""
-        );
+        expect(root.querySelector(selector)!.textContent).to.equal("");
       }
     });
   }
