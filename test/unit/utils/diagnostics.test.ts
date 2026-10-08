@@ -25,14 +25,17 @@ describe("diagnostics privacy", () => {
 
   it("never forwards private error details or unknown stage text to IPC or reports", async () => {
     const calls: unknown[] = [];
-    mockTauriIpc((cmd, args) => {
-      if (cmd === "log_frontend_event") {
-        calls.push(args);
-        return;
-      }
-      if (cmd === "get_diagnostics") return data;
-      throw new Error(cmd);
-    });
+    mockTauriIpc(
+      (cmd, args) => {
+        if (cmd === "log_frontend_event") {
+          calls.push(args);
+          return;
+        }
+        if (cmd === "get_diagnostics") return data;
+        throw new Error(cmd);
+      },
+      { includeLogs: true }
+    );
     const run = new InstallDiagnostics("proxmox");
     run.advance("writing");
     run.advance("private-host password=secret");

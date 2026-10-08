@@ -206,32 +206,37 @@ describe("drive-selection diagnostics", () => {
       const message = `${kind === "unknown" ? "Unexpected scan failure" : "Permission denied"}: /home/private-user/image ticket=private-ticket`;
       const rejection = kind === "Error" ? new Error(message) : message;
       const calls: unknown[] = [];
-      mockTauriIpc((cmd, args) => {
-        if (cmd === "list_block_devices") return Promise.reject(rejection);
-        if (cmd === "log_frontend_event") {
-          calls.push(args);
-          return;
-        }
-        if (cmd === "get_diagnostics") {
-          return {
-            version: "0.1.0",
-            os: "linux",
-            os_version: "6.12",
-            architecture: "x86_64",
-            package_type: "AppImage",
-            log_tail: "",
-          };
-        }
-        throw new Error(cmd);
-      });
+      mockTauriIpc(
+        (cmd, args) => {
+          if (cmd === "list_block_devices") return Promise.reject(rejection);
+          if (cmd === "log_frontend_event") {
+            calls.push(args);
+            return;
+          }
+          if (cmd === "get_diagnostics") {
+            return {
+              version: "0.1.0",
+              os: "linux",
+              os_version: "6.12",
+              architecture: "x86_64",
+              package_type: "AppImage",
+              log_tail: "",
+            };
+          }
+          throw new Error(cmd);
+        },
+        { includeLogs: true }
+      );
       wizardState.startFlow("sbc");
       const el = await fixture<DriveSelectionView>(html`
         <drive-selection-view></drive-selection-view>
       `);
       await waitUntil(() => el.shadowRoot!.querySelector(".error-message"));
+      // Unstructured rejections stay readable on screen; only the log is
+      // limited to an allowlisted category
       expect(
-        el.shadowRoot!.querySelector(".error-message")!.textContent
-      ).to.equal(kind === "Error" ? message : "Failed to load drives");
+        el.shadowRoot!.querySelector(".error-message")!.textContent!.trim()
+      ).to.equal(message);
 
       const diagnostics = await getDiagnostics();
       const category =

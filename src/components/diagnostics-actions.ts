@@ -53,18 +53,16 @@ export class DiagnosticsActions extends LitElement {
   @state() private _data?: Diagnostics;
   @state() private _status = "";
 
-  connectedCallback() {
-    super.connectedCallback();
-    void getVersion()
-      .then((version) => {
-        this._version = version;
-      })
-      .catch(() => {});
-  }
-
+  // Load only when opened: this button sits under every error message, and
+  // showing an error should not start native calls of its own
   private async _show() {
     this._open = true;
     this._data = undefined;
+    void getVersion()
+      .then((version) => {
+        this._version ||= version;
+      })
+      .catch(() => {});
     this._status = "Loading diagnostics...";
     try {
       this._data = await getDiagnostics();

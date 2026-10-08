@@ -375,7 +375,11 @@ pub async fn download_utm_image(
     if let Err(error) = Backend.check_utm_status().await {
         return callback.operation.finish(Err(CommandError::from(error)));
     }
-    let board = callback.operation.finish(utm_board())?;
+    // Only a failure finishes the operation here; success waits for the image
+    let board = match utm_board() {
+        Ok(board) => board,
+        Err(error) => return callback.operation.finish(Err(error)),
+    };
     let image = callback
         .operation
         .finish(run_utm_download(&Backend, board, &callback).await)?;
@@ -672,11 +676,12 @@ mod tests {
         app.manage(PendingUtmImages::default());
         let channel = Channel::new(|_| panic!("An unsupported UTM download must not start"));
         let error = download_utm_image(channel, app.state()).await.unwrap_err();
-        assert!(error.contains("Platform not supported"));
+        assert_eq!(error.code, "unsupported_platform");
+        // The log category is the same fixed code the view receives
         let tail = crate::diagnostics::test_log_tail();
         assert!(tail
             .iter()
-            .any(|line| line.contains("rust utm_download preparing utm_error ")));
+            .any(|line| line.contains("rust utm_download preparing unsupported_platform ")));
         assert!(!tail
             .iter()
             .any(|line| line.contains("rust utm_download") && line.contains(" success ")));

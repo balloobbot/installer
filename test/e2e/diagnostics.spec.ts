@@ -70,7 +70,10 @@ async function mockDesktop(page: Page, failingCommand = "") {
           case "get_manifest":
             return MOCK_MANIFEST;
           case "get_haos_release":
+          case "get_utm_haos_release":
             return MOCK_HAOS_RELEASE;
+          case "check_connection":
+            return;
           case "get_system_info":
             return { cpu_cores: 8, memory_mb: 16384 };
           case "check_utm_status":

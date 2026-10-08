@@ -70,19 +70,22 @@ describe("view diagnostic request ownership", () => {
         const request = deferred<never>();
         const events: unknown[] = [];
         let requested = false;
-        mockTauriIpc((command, args) => {
-          if (command === scenario.command) {
-            requested = true;
-            return request.promise;
-          }
-          if (command === "proxmox_get_next_vm_id") return 100;
-          if (command === "log_frontend_event") {
-            events.push(args);
-            return;
-          }
-          if (command === "get_diagnostics") return {};
-          throw new Error(command);
-        });
+        mockTauriIpc(
+          (command, args) => {
+            if (command === scenario.command) {
+              requested = true;
+              return request.promise;
+            }
+            if (command === "proxmox_get_next_vm_id") return 100;
+            if (command === "log_frontend_event") {
+              events.push(args);
+              return;
+            }
+            if (command === "get_diagnostics") return {};
+            throw new Error(command);
+          },
+          { includeLogs: true }
+        );
         wizardState.startFlow(
           scenario.flow === "flash"
             ? "sbc"
