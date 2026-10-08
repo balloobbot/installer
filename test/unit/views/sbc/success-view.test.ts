@@ -8,12 +8,24 @@ import { mockTauriIpc, restoreTauriIpc, settle } from "../../tauri-ipc.js";
 async function renderSuccess(board = "rpi5-64", flow: WizardFlow = "sbc") {
   wizardState.startFlow(flow);
   wizardState.setSelection("deviceName", "Selected device");
-  wizardState.setSelection("deviceConfig", { board, download_url: "" });
-  return fixture<SuccessView>(html`<success-view></success-view>`);
+  wizardState.setSelection("deviceConfig", {
+    board,
+    download_url: "",
+    minimum_storage_bytes: 16_000_000_000,
+    recommended_storage_bytes: 32_000_000_000,
+  });
+  const el = await fixture<SuccessView>(html`<success-view></success-view>`);
+  await el.shadowRoot!.querySelector("install-success")!.updateComplete;
+  return el;
+}
+
+/** The shared success layout renders the guidance in its own shadow root. */
+function content(el: SuccessView) {
+  return el.shadowRoot!.querySelector("install-success")!.shadowRoot!;
 }
 
 function text(el: SuccessView) {
-  return el.shadowRoot!.textContent!.replace(/\s+/g, " ");
+  return content(el).textContent!.replace(/\s+/g, " ");
 }
 
 describe("success-view next steps", () => {
@@ -39,8 +51,7 @@ describe("success-view next steps", () => {
 
   it("offers hostname and IP access without requiring discovery", async () => {
     const el = await renderSuccess();
-    const link =
-      el.shadowRoot!.querySelector<HTMLAnchorElement>(".step-text a")!;
+    const link = content(el).querySelector<HTMLAnchorElement>(".step-text a")!;
     expect(link.href).to.equal("http://homeassistant.local:8123/");
     expect(text(el)).to.contain(
       "IP address in your router or on an attached display"
@@ -129,8 +140,8 @@ describe("success-view next steps", () => {
   ]) {
     it(`links ${board} to a fixed installation guide`, async () => {
       const el = await renderSuccess(board);
-      const link = el.shadowRoot!.querySelector<HTMLAnchorElement>(
-        ".installation-guide a"
+      const link = content(el).querySelector<HTMLAnchorElement>(
+        ".next-steps-footer a"
       )!;
       expect(link.href).to.equal(url);
       expect(link.target).to.equal("_blank");
@@ -145,9 +156,9 @@ describe("success-view next steps", () => {
       calls.push(args);
     });
     const el = await renderSuccess();
-    el.shadowRoot!.querySelector<HTMLAnchorElement>(
-      ".installation-guide a"
-    )!.click();
+    content(el)
+      .querySelector<HTMLAnchorElement>(".next-steps-footer a")!
+      .click();
     await settle();
     expect(calls).to.deep.equal([
       {

@@ -59,13 +59,13 @@ for (const width of [1100, 390]) {
       await expect(success.locator(".next-steps")).toContainText(
         "router or on an attached display"
       );
-      await expect(success.locator(".storage-notice")).toContainText(
+      await expect(success.locator(".notice")).toContainText(
         "Do not format or initialize the written drive."
       );
-      await expect(success.locator(".storage-notice")).toContainText(
+      await expect(success.locator(".notice")).toContainText(
         "Choose Cancel if offered, or Ignore or Eject on macOS."
       );
-      await expect(success.locator(".installation-guide a")).toBeVisible();
+      await expect(success.locator(".next-steps-footer a")).toBeVisible();
       await expect(next(page)).toHaveText("Done");
       await expect(success.locator(".next-steps")).toContainText(
         "If it still does not open after a few minutes"
@@ -99,7 +99,7 @@ for (const width of [1100, 390]) {
             right: bounds.right,
             overflowing: [
               ...element.querySelectorAll(
-                ".step-text, .storage-notice, .installation-guide"
+                ".step-text, .notice, .next-steps-footer"
               ),
             ].some((item) => item.scrollWidth > item.clientWidth + 1),
             overlappingSteps: steps.some(
@@ -115,7 +115,7 @@ for (const width of [1100, 390]) {
 
       for (const [section, target] of [
         ["top", success.locator("h2")],
-        ["next-steps", success.locator(".installation-guide")],
+        ["next-steps", success.locator(".next-steps-footer")],
       ] as const) {
         await target.scrollIntoViewIfNeeded();
         await expect(target).toBeInViewport();

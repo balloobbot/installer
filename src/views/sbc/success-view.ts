@@ -65,28 +65,27 @@ export class SuccessView extends LitElement {
       <install-success
         .subtitle=${"Home Assistant OS has been written to your storage device"}
         .notice=${html`Do not format or initialize the written drive. Choose
-          Cancel if offered, or Ignore or Eject on macOS. Your computer may not
-          recognize its Home Assistant partitions.`}
+        Cancel if offered, or Ignore or Eject on macOS. Your computer may not
+        recognize its Home Assistant partitions.`}
         .steps=${[
-          html`If the drive is still listed on your computer, use your
-            operating system's eject option before disconnecting it.`,
+          html`If the drive is still listed on your computer, use your operating
+          system's eject option before disconnecting it.`,
           isMiniPc
             ? html`Install or reconnect the written drive in your mini PC.
-                Select that drive in the firmware boot order, with UEFI boot
-                enabled and Secure Boot disabled.`
+              Select that drive in the firmware boot order, with UEFI boot
+              enabled and Secure Boot disabled.`
             : supportsDirectUsb
               ? html`If you used a storage adapter, insert the written media
-                  into ${deviceName}. If you flashed the board directly over
-                  USB, disconnect the USB and power cables.
-                  ${board === "odroid-m1s"
-                    ? html`With the board powered off, remove the EMMC2UMS SD
-                        card if you used one.`
-                    : html`With the board powered off, set the boot mode
-                        switch back to MMC as described in the installation
-                        guide below.`}`
+                into ${deviceName}. If you flashed the board directly over USB,
+                disconnect the USB and power cables.
+                ${board === "odroid-m1s"
+                  ? html`With the board powered off, remove the EMMC2UMS SD card
+                    if you used one.`
+                  : html`With the board powered off, set the boot mode switch
+                    back to MMC as described in the installation guide below.`}`
               : html`Insert the written storage into ${deviceName}.`,
           html`Connect an Ethernet cable to the same network as your computer,
-            with internet access. Then connect power to start the device.`,
+          with internet access. Then connect power to start the device.`,
           html`Open
             <a
               href="http://homeassistant.local:8123"
@@ -96,13 +95,13 @@ export class SuccessView extends LitElement {
                 openExternalLink(event, "http://homeassistant.local:8123")}
               >homeassistant.local:8123</a
             >
-            in your browser. If it still does not open after a few minutes,
-            find the device's IP address in your router or on an attached
-            display, then open <code>http://&lt;IP address&gt;:8123</code>.`,
+            in your browser. If it still does not open after a few minutes, find
+            the device's IP address in your router or on an attached display,
+            then open <code>http://&lt;IP address&gt;:8123</code>.`,
           html`The Preparing Home Assistant page downloads the latest Home
-            Assistant. Allow about 20 minutes, depending on your internet
-            connection. Keep power and Ethernet connected until the welcome
-            screen appears.`,
+          Assistant. Allow about 20 minutes, depending on your internet
+          connection. Keep power and Ethernet connected until the welcome screen
+          appears.`,
         ]}
         .footer=${html`<a
           href=${guide}
