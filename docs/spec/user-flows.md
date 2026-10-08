@@ -239,6 +239,15 @@ rejected and require a new login and comparison. Pins are not saved to disk.
 Explicit pin approval replaces issuer, hostname, and expiry validation for that
 specific certificate, while TLS handshake signatures are still verified. Other
 certificate failures use normal validation and are not offered an override.
+For unknown issuers, only ordinary unconstrained supplied CAs support approval:
+the final supplied CA may carry CA/signing usage and noncritical key identifiers,
+but EKU, path-length, name/policy constraints or other extensions are intentionally
+not promoted to a trust anchor. Malformed or duplicate extensions are rejected.
+Install the appropriate CA in the operating system trust store for these chains;
+normal platform-trusted validation remains unchanged. Fingerprint approval is
+not a way to bypass an invalid or unsupported supplied intermediate.
+Self-signed and private-CA leaves sent without an issuer retain their existing
+approval checks; a supplied chain must reach its temporary anchor.
 Server URLs must be bare HTTPS origins without embedded credentials, paths,
 queries, or fragments. API redirects are not followed.
 Proxmox connections are direct and do not use system proxies, so an HTTPS proxy's

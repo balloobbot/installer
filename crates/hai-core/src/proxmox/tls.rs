@@ -242,9 +242,33 @@ fn verify_untrusted_chain(
     let parsed = rustls::server::ParsedCertificate::try_from(cert)?;
     rustls::client::verify_server_name(&parsed, server_name)?;
     if let Some(anchor) = intermediates.last() {
-        // Trust-anchor conversion drops issuer validity and signing restrictions.
+        // Only promote ordinary, unconstrained CAs. Anchor conversion drops
+        // restrictions such as EKU/path length; do not implement a second PKIX
+        // validator here or silently discard unfamiliar extensions.
+        use x509_parser::extensions::ParsedExtension;
+
         let (_, parsed) = x509_parser::parse_x509_certificate(anchor.as_ref())
             .map_err(|_| CertificateError::BadEncoding)?;
+        let extensions = parsed
+            .extensions_map()
+            .map_err(|_| CertificateError::BadEncoding)?;
+        for extension in extensions.values() {
+            let supported = match extension.parsed_extension() {
+                ParsedExtension::BasicConstraints(constraints) => {
+                    constraints.path_len_constraint.is_none()
+                }
+                ParsedExtension::KeyUsage(_) => true,
+                ParsedExtension::SubjectKeyIdentifier(_)
+                | ParsedExtension::AuthorityKeyIdentifier(_) => !extension.critical,
+                _ => false,
+            };
+            if !supported {
+                return Err(rustls::Error::General(
+                    "Supplied CA constraints are unsupported for fingerprint approval. Install the appropriate CA in the operating system trust store."
+                        .into(),
+                ));
+            }
+        }
         let is_ca = parsed
             .basic_constraints()
             .map_err(|_| CertificateError::BadEncoding)?
@@ -276,7 +300,10 @@ fn verify_untrusted_chain(
         // basic constraints and EKU before searching for its issuer. Trust in the
         // missing issuer comes from fingerprint approval, not this probe. The
         // pinned login still verifies the TLS handshake's proof of key possession.
-        Err(rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer)) => {
+        // A supplied chain, however, must actually reach the temporary anchor.
+        Err(rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer))
+            if intermediates.is_empty() =>
+        {
             Ok(ServerCertVerified::assertion())
         }
         result => result,
@@ -782,6 +809,9 @@ mod tests {
                 true,
             );
         }
+        let mut ca = unconstrained_ca();
+        ca.use_authority_key_identifier_extension = true;
+        assert_intermediate_parameters(ca, true);
     }
 
     fn assert_intermediate_signing_usage(
@@ -790,20 +820,76 @@ mod tests {
         allowed: bool,
     ) {
         let mut ca = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        ca.is_ca = is_ca;
+        ca.key_usages = key_usages;
+        assert_intermediate_parameters(ca, allowed);
+    }
+
+    #[test]
+    fn untrusted_final_intermediate_rejects_extended_key_usage() {
+        for usage in [
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+        ] {
+            let mut ca = unconstrained_ca();
+            ca.extended_key_usages = vec![usage];
+            assert_intermediate_parameters(ca, false);
+        }
+    }
+
+    #[test]
+    fn untrusted_final_intermediate_rejects_path_length_and_name_constraints() {
+        let mut ca = unconstrained_ca();
+        ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+        assert_intermediate_parameters(ca, false);
+        let mut ca = unconstrained_ca();
+        ca.name_constraints = Some(rcgen::NameConstraints {
+            permitted_subtrees: vec![rcgen::GeneralSubtree::DnsName("localhost".into())],
+            excluded_subtrees: Vec::new(),
+        });
+        assert_intermediate_parameters(ca, false);
+    }
+
+    #[test]
+    fn untrusted_final_intermediate_rejects_policy_unknown_and_malformed_extensions() {
+        for (oid, value, critical) in [
+            (&[2, 5, 29, 36][..], vec![0x30, 3, 0x80, 1, 0], true),
+            (&[2, 5, 29, 54][..], vec![2, 1, 0], true),
+            (&[1, 2, 3, 4][..], vec![5, 0], true),
+            (&[1, 2, 3, 4][..], vec![5, 0], false),
+            (&[2, 5, 29, 37][..], vec![5, 0], true),
+            // rcgen already emits a subject key identifier for CA certificates.
+            (&[2, 5, 29, 14][..], vec![4, 1, 0], false),
+            (&[2, 5, 29, 35][..], vec![0x30, 3, 0x80, 1, 0], true),
+        ] {
+            let mut ca = unconstrained_ca();
+            let mut extension = rcgen::CustomExtension::from_oid_content(oid, value);
+            extension.set_criticality(critical);
+            ca.custom_extensions.push(extension);
+            assert_intermediate_parameters(ca, false);
+        }
+    }
+
+    fn unconstrained_ca() -> rcgen::CertificateParams {
+        let mut ca = rcgen::CertificateParams::new(Vec::new()).unwrap();
         ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca.distinguished_name
+        ca
+    }
+
+    fn assert_intermediate_parameters(mut ca: rcgen::CertificateParams, allowed: bool) {
+        let mut root = unconstrained_ca();
+        root.distinguished_name
             .push(rcgen::DnType::CommonName, "Fixture root CA");
-        let root = rcgen::Issuer::new(ca.clone(), rcgen::KeyPair::generate().unwrap());
+        let root = rcgen::Issuer::new(root, rcgen::KeyPair::generate().unwrap());
         ca.distinguished_name = rcgen::DistinguishedName::new();
         ca.distinguished_name
             .push(rcgen::DnType::CommonName, "Fixture intermediate");
-        ca.is_ca = is_ca;
-        ca.key_usages = key_usages;
         let key = rcgen::KeyPair::generate().unwrap();
         let intermediate = ca.signed_by(&key, &root).unwrap();
         let issuer = rcgen::Issuer::new(ca, key);
-        let leaf = rcgen::CertificateParams::new(vec!["localhost".into()])
-            .unwrap()
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf = params
             .signed_by(&rcgen::KeyPair::generate().unwrap(), &issuer)
             .unwrap();
         let intermediates = [intermediate.der().clone()];
@@ -811,6 +897,9 @@ mod tests {
         let now = UnixTime::now();
         let result = verify_untrusted_chain(leaf.der(), &intermediates, &name, &[], now);
         assert_eq!(result.is_ok(), allowed, "chain verification: {result:?}");
+        if let Err(rustls::Error::General(message)) = &result {
+            assert_eq!(message, "Supplied CA constraints are unsupported for fingerprint approval. Install the appropriate CA in the operating system trust store.");
+        }
 
         // Force the platform's unknown-issuer result to exercise the fallback,
         // regardless of which error a particular native trust store prioritizes.
@@ -827,6 +916,126 @@ mod tests {
         } else {
             assert!(result.is_err(), "must not offer approval: {result:?}");
         }
+    }
+
+    #[test]
+    fn complete_private_chain_preserves_middle_intermediate_constraints() {
+        for (usage, permitted_name, extra_ca, allowed) in [
+            (
+                rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+                "localhost",
+                false,
+                true,
+            ),
+            (
+                rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+                "localhost",
+                false,
+                false,
+            ),
+            (
+                rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+                "other.example",
+                false,
+                false,
+            ),
+            (
+                rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+                "localhost",
+                true,
+                false,
+            ),
+        ] {
+            let mut params = unconstrained_ca();
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "Complete chain root");
+            let key = rcgen::KeyPair::generate().unwrap();
+            let root = params.self_signed(&key).unwrap();
+            let root_issuer = rcgen::Issuer::new(params, key);
+
+            let mut params = unconstrained_ca();
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "Constrained middle CA");
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+            params.extended_key_usages = vec![usage];
+            params.name_constraints = Some(rcgen::NameConstraints {
+                permitted_subtrees: vec![rcgen::GeneralSubtree::DnsName(permitted_name.into())],
+                excluded_subtrees: Vec::new(),
+            });
+            let key = rcgen::KeyPair::generate().unwrap();
+            let middle = params.signed_by(&key, &root_issuer).unwrap();
+            let middle_issuer = rcgen::Issuer::new(params, key);
+            let lower = extra_ca.then(|| {
+                let mut params = unconstrained_ca();
+                params
+                    .distinguished_name
+                    .push(rcgen::DnType::CommonName, "Extra lower CA");
+                let key = rcgen::KeyPair::generate().unwrap();
+                let cert = params.signed_by(&key, &middle_issuer).unwrap();
+                (cert, rcgen::Issuer::new(params, key))
+            });
+            let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+            params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+            let leaf = params
+                .signed_by(
+                    &rcgen::KeyPair::generate().unwrap(),
+                    lower
+                        .as_ref()
+                        .map(|(_, issuer)| issuer)
+                        .unwrap_or(&middle_issuer),
+                )
+                .unwrap();
+            let mut intermediates = Vec::new();
+            if let Some((cert, _)) = &lower {
+                intermediates.push(cert.der().clone());
+            }
+            intermediates.extend([middle.der().clone(), root.der().clone()]);
+            let name = ServerName::try_from("localhost").unwrap();
+            let now = UnixTime::now();
+            let result = verify_untrusted_chain(leaf.der(), &intermediates, &name, &[], now);
+            assert_eq!(result.is_ok(), allowed, "complete chain: {result:?}");
+            let verifier = ProbeVerifier {
+                normal: Arc::new(UnknownIssuer),
+                result: Mutex::new(None),
+            };
+            assert!(verifier
+                .verify_server_cert(leaf.der(), &intermediates, &name, &[], now)
+                .is_err());
+            let result = verifier.result.lock().unwrap().take().unwrap();
+            if allowed {
+                assert_eq!(result.unwrap(), Some(fingerprint(leaf.der())));
+            } else {
+                assert!(result.is_err(), "must not offer approval: {result:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn untrusted_supplied_chain_must_reach_the_temporary_anchor() {
+        let mut ca = unconstrained_ca();
+        ca.distinguished_name
+            .push(rcgen::DnType::CommonName, "Unrelated anchor");
+        let unrelated = ca
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap();
+        let leaf = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap();
+        let intermediates = [unrelated.der().clone()];
+        let name = ServerName::try_from("localhost").unwrap();
+        let now = UnixTime::now();
+        assert!(verify_untrusted_chain(leaf.der(), &intermediates, &name, &[], now).is_err());
+        let verifier = ProbeVerifier {
+            normal: Arc::new(UnknownIssuer),
+            result: Mutex::new(None),
+        };
+        assert!(verifier
+            .verify_server_cert(leaf.der(), &intermediates, &name, &[], now)
+            .is_err());
+        assert!(verifier.result.lock().unwrap().take().unwrap().is_err());
     }
 
     #[test]
