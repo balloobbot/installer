@@ -60,6 +60,22 @@ pub struct FlashResult {
 // Device Commands
 // =============================================================================
 
+/// Check internet access before starting an installation flow.
+#[tauri::command]
+pub async fn check_connection() -> Result<(), String> {
+    Backend
+        .check_connection()
+        .await
+        .map_err(connection_error_message)
+}
+
+fn connection_error_message(error: hai_core::Error) -> String {
+    match error {
+        hai_core::Error::DownloadFailed(message) => message,
+        error => error.to_string(),
+    }
+}
+
 /// List all block devices
 #[tauri::command]
 pub async fn list_block_devices() -> Result<Vec<BlockDevice>, String> {
@@ -604,6 +620,28 @@ mod tests {
     }
 
     #[test]
+    fn connection_error_message_unwraps_download_errors() {
+        let message =
+            "Cannot reach version.home-assistant.io. Check your internet connection and try again.";
+        let error = hai_core::Error::DownloadFailed(message.to_string());
+        assert_eq!(connection_error_message(error), message);
+    }
+
+    #[test]
+    fn connection_error_message_preserves_other_errors() {
+        assert_eq!(
+            connection_error_message(hai_core::Error::Cancelled),
+            "Operation cancelled"
+        );
+    }
+
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn check_connection_uses_mock_backend() {
+        assert!(check_connection().await.is_ok());
+    }
+
+    #[test]
     fn write_error_message_shows_write_protection_without_a_prefix() {
         let msg = write_error_message(hai_core::Error::WriteProtected);
         assert_eq!(msg, hai_core::Error::WriteProtected.to_string());
@@ -635,6 +673,10 @@ mod tests {
     struct SelectionReleaseBackend;
 
     impl ReleaseSource for SelectionReleaseBackend {
+        async fn check_connection(&self) -> hai_core::Result<()> {
+            unreachable!("release confirmation must not check connectivity")
+        }
+
         async fn get_device_manifest(&self) -> hai_core::Result<DeviceManifest> {
             unreachable!()
         }
@@ -959,6 +1001,10 @@ mod tests {
     }
 
     impl ReleaseSource for PreflightBackend {
+        async fn check_connection(&self) -> hai_core::Result<()> {
+            panic!("must not check connectivity during flashing");
+        }
+
         async fn get_device_manifest(&self) -> hai_core::Result<DeviceManifest> {
             panic!("must not fetch a manifest");
         }
@@ -1059,6 +1105,10 @@ mod mock_tests {
     }
 
     impl ReleaseSource for LifecycleBackend {
+        async fn check_connection(&self) -> hai_core::Result<()> {
+            panic!("must not check connectivity during installation");
+        }
+
         async fn get_device_manifest(&self) -> hai_core::Result<DeviceManifest> {
             BackendMock.get_device_manifest().await
         }
@@ -1370,6 +1420,10 @@ mod mock_tests {
     }
 
     impl ReleaseSource for DigestFailureBackend {
+        async fn check_connection(&self) -> hai_core::Result<()> {
+            panic!("must not check connectivity during installation");
+        }
+
         async fn get_device_manifest(&self) -> hai_core::Result<hai_core::DeviceManifest> {
             unreachable!()
         }
