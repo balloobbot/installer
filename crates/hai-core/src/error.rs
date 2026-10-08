@@ -32,11 +32,22 @@ pub enum Error {
     #[error("Proxmox API error: {0}")]
     ProxmoxApi(String),
 
+    #[error("Proxmox two-factor authentication: {0}")]
+    ProxmoxTwoFactor(String),
+
     #[error("UTM error: {0}")]
     Utm(String),
 
+    #[error("UTM operation outcome is unknown: {0}")]
+    UtmOperationUncertain(String),
+
     #[error("Drive disconnected")]
     DriveDisconnected,
+
+    #[error(
+        "The drive is write-protected. If it's an SD card, slide the lock switch on its side up and try again."
+    )]
+    WriteProtected,
 
     #[error("Platform not supported: {0}")]
     UnsupportedPlatform(String),
@@ -56,11 +67,8 @@ pub enum Error {
     #[error("Verification failed: {0}")]
     VerificationFailed(String),
 
-    /// The drive ran out of space part-way through the write.
-    #[error(
-        "Image is larger than the selected drive: only {written} of {image_size} bytes fit \
-         before the drive reported that it was full"
-    )]
+    /// The image exceeds drive capacity; `written` is zero for preflight failures.
+    #[error("Image is larger than the selected drive: image size is {image_size} bytes")]
     ImageTooLarge { written: u64, image_size: u64 },
 }
 
@@ -167,6 +175,13 @@ mod tests {
     }
 
     #[test]
+    fn test_display_write_protected_says_what_to_do() {
+        let msg = Error::WriteProtected.to_string();
+        assert!(msg.contains("write-protected"), "{msg}");
+        assert!(msg.contains("lock switch"), "{msg}");
+    }
+
+    #[test]
     fn test_display_unsupported_platform() {
         let error = Error::UnsupportedPlatform("Windows XP".to_string());
         let msg = error.to_string();
@@ -210,14 +225,16 @@ mod tests {
 
     #[test]
     fn test_display_image_too_large() {
-        let error = Error::ImageTooLarge {
-            written: 3_000_000_000,
-            image_size: 4_000_000_000,
-        };
-        let msg = error.to_string();
-        assert!(msg.contains("larger than the selected drive"));
-        assert!(msg.contains("3000000000"));
-        assert!(msg.contains("4000000000"));
+        for written in [0, 3_000_000_000] {
+            let error = Error::ImageTooLarge {
+                written,
+                image_size: 4_000_000_000,
+            };
+            assert_eq!(
+                error.to_string(),
+                "Image is larger than the selected drive: image size is 4000000000 bytes"
+            );
+        }
     }
 
     #[test]
