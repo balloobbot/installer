@@ -121,6 +121,7 @@ export class InstallProgress extends LitElement {
       font-size: 0.9375rem;
       margin: 0 0 1.5rem 0;
       max-width: 400px;
+      overflow-wrap: anywhere;
     }
 
     .stages-indicator {
@@ -351,9 +352,7 @@ export class InstallProgress extends LitElement {
           ${renderCasitaSad()}
         </div>
         <h2>Installation failed</h2>
-        <p class="error-message" role="alert" style="overflow-wrap: anywhere;">
-          ${this.error}
-        </p>
+        <p class="error-message" role="alert">${this.error}</p>
         ${renderErrorHelp()}
       `;
     }

@@ -36,8 +36,11 @@ describe("structured IPC errors in views", () => {
         flow === "vm" ? "utm-progress-view" : "proxmox-progress-view"
       ) as HTMLElement & { retry(): void };
       fixtureSync(html`<div>${el}</div>`);
-      await waitUntil(() => !!el.shadowRoot?.querySelector(".error-help"));
-      expect(el.shadowRoot!.textContent).to.contain(
+      // The shared progress layout renders the error and its help
+      const layout = () =>
+        el.shadowRoot?.querySelector("install-progress")?.shadowRoot;
+      await waitUntil(() => !!layout()?.querySelector(".error-help"));
+      expect(layout()!.textContent).to.contain(
         flow === "vm" ? "retained source" : "account permissions"
       );
       el.retry();
@@ -140,6 +143,8 @@ describe("structured IPC errors in views", () => {
       wizardState.setSelection("deviceConfig", {
         board: "rpi5-64",
         download_url: "https://example.test/image",
+        minimum_storage_bytes: 16_000_000_000,
+        recommended_storage_bytes: 32_000_000_000,
       });
       storeDriveSelection(MOCK_BLOCK_DEVICES[0]);
       wizardState.goToStep(

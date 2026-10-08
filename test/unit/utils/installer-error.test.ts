@@ -16,8 +16,9 @@ describe("installer errors", () => {
   it("formats structured capacity details and rejects unsafe retry", () => {
     const result = installerError(
       ipcError("image_too_large", "raw bytes", false, {
-        image_size: 2 ** 32,
-        drive_size: 2 ** 31,
+        // Decimal units, like drive capacities
+        image_size: 4_000_000_000,
+        drive_size: 2_000_000_000,
       })
     );
     expect(result.message).to.equal(

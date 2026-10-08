@@ -313,7 +313,7 @@ describe("utm-progress-view", () => {
     const error = oneEvent(next, "install-error");
     await settle();
     expect(creates).to.equal(1);
-    creation.reject(new Error("Import failed"));
+    creation.reject(ipcError("utm", "Import failed", true));
     await error;
     expect(oldError).to.be.false;
     expect(next.hasError).to.be.true;
@@ -575,7 +575,11 @@ describe("utm-progress-view", () => {
     el.retry();
     await el.updateComplete;
     expect(creations).to.equal(1);
-    expect(el.shadowRoot!.textContent).to.contain("Open UTM to start it");
+    expect(
+      el
+        .shadowRoot!.querySelector("install-progress")!
+        .shadowRoot!.querySelector(".error-message")!.textContent
+    ).to.contain("Open UTM to start it");
   });
 
   it("allows a timed-out readiness check to resume the existing VM", async () => {
@@ -723,7 +727,7 @@ describe("utm-progress-view", () => {
           expect(wizardState.getState().selections.vmId).to.equal(
             "unique-utm-id"
           );
-          if (++starts === 1) throw new Error("Start failed");
+          if (++starts === 1) throw ipcError("utm", "Start failed", true);
           return undefined;
         case "check_ha_ready":
         case "check_ha_updated":

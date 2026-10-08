@@ -12,6 +12,8 @@ import "@home-assistant/webawesome/dist/components/callout/callout.js";
 import type WaInput from "@home-assistant/webawesome/dist/components/input/input.js";
 import "@home-assistant/webawesome/dist/components/input/input.js";
 
+const INVALID_INPUT = "invalid_input";
+
 @customElement("proxmox-connect-view")
 export class ProxmoxConnectView extends LitElement {
   protected readonly _accessibility = new ViewAccessibility(this);
@@ -221,7 +223,13 @@ export class ProxmoxConnectView extends LitElement {
   }
 
   private async _validationError(message: string): Promise<false> {
-    this._error = installerError(message);
+    // A local input problem: no installation help or report link needed
+    this._error = {
+      code: INVALID_INPUT,
+      message,
+      retryable: false,
+      details: {},
+    };
     await this.updateComplete;
     // An identical validation message does not trigger another Lit update.
     if (this.isConnected) {
@@ -358,7 +366,7 @@ export class ProxmoxConnectView extends LitElement {
           <p class="status-description" style="overflow-wrap: anywhere;">
             ${this._error?.message}
           </p>
-          ${renderErrorHelp()}
+          ${this._error?.code === INVALID_INPUT ? "" : renderErrorHelp()}
         </div>
       </div>
     `;

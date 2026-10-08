@@ -138,7 +138,12 @@ describe("app-shell", () => {
     await goToStep(el, "configure");
     await waitUntil(() => shellOf(el).nextDisabled);
     expect(wizardState.getState().selections.proxmoxStorage).to.equal("local");
-    storage.reject({ message: "Temporary failure", session_expired: false });
+    storage.reject({
+      message: "Temporary failure",
+      code: "proxmox_api",
+      retryable: true,
+      details: {},
+    });
     await waitUntil(
       () =>
         !!el
