@@ -56,7 +56,12 @@ describe("success-view next steps", () => {
     expect(text(el)).to.contain("If the drive is still listed");
     expect(text(el)).to.contain("eject option before disconnecting");
     expect(text(el)).not.to.contain("safely ejected");
-    expect(text(el)).to.contain("Cancel any prompt to format or initialize");
+    expect(text(el)).to.contain(
+      "Do not format or initialize the written drive."
+    );
+    expect(text(el)).to.contain(
+      "Choose Cancel if offered, or Ignore or Eject on macOS."
+    );
   });
 
   for (const board of ["odroid-n2", "odroid-m1s"]) {

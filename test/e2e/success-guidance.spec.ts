@@ -60,7 +60,10 @@ for (const width of [1100, 390]) {
         "router or on an attached display"
       );
       await expect(success.locator(".storage-notice")).toContainText(
-        "Cancel any prompt to format or initialize"
+        "Do not format or initialize the written drive."
+      );
+      await expect(success.locator(".storage-notice")).toContainText(
+        "Choose Cancel if offered, or Ignore or Eject on macOS."
       );
       await expect(success.locator(".installation-guide a")).toBeVisible();
       await expect(next(page)).toHaveText("Done");
