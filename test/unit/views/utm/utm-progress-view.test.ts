@@ -43,7 +43,11 @@ describe("utm-progress-view", () => {
     expect(abortSignalOf(el)!.aborted).to.be.false;
 
     await el.updateComplete;
-    expect(el.shadowRoot!.textContent).to.contain("Downloading");
+    expect(
+      el
+        .shadowRoot!.querySelector("install-progress")!
+        .shadowRoot!.querySelector("h2")!.textContent
+    ).to.contain("Downloading");
   });
 
   it("cancels the install pipeline when detached", async () => {
@@ -170,7 +174,9 @@ describe("utm-progress-view", () => {
 
     expect(el.hasError).to.be.true;
     expect(
-      el.shadowRoot!.querySelector(".error-message")!.textContent
+      el
+        .shadowRoot!.querySelector("install-progress")!
+        .shadowRoot!.querySelector(".error-message")!.textContent
     ).to.equal(message);
     expect(wizardState.getState().selections.vmId).to.be.undefined;
   });
@@ -188,9 +194,11 @@ describe("utm-progress-view", () => {
       await oneEvent(el, "install-error");
       await el.updateComplete;
 
-      expect(el.shadowRoot!.textContent).to.contain(
-        "Failed to create virtual machine"
-      );
+      expect(
+        el
+          .shadowRoot!.querySelector("install-progress")!
+          .shadowRoot!.querySelector(".error-message")!.textContent
+      ).to.contain("Failed to create virtual machine");
     });
   }
 
@@ -264,7 +272,11 @@ describe("utm-progress-view", () => {
     await el.updateComplete;
 
     expect(el.hasError).to.be.true;
-    expect(el.shadowRoot!.textContent).to.contain(warning);
+    expect(
+      el
+        .shadowRoot!.querySelector("install-progress")!
+        .shadowRoot!.querySelector(".error-message")!.textContent
+    ).to.contain(warning);
     expect(wizardState.getState().selections.vmId).to.be.undefined;
   });
 
@@ -293,6 +305,10 @@ describe("utm-progress-view", () => {
       "/tmp/attempt-2.qcow2",
     ]);
     await el.updateComplete;
-    expect(el.shadowRoot!.textContent).to.contain("import failed");
+    expect(
+      el
+        .shadowRoot!.querySelector("install-progress")!
+        .shadowRoot!.querySelector(".error-message")!.textContent
+    ).to.contain("import failed");
   });
 });
