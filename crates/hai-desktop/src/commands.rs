@@ -328,13 +328,12 @@ pub async fn download_utm_image(
         .check_utm_status()
         .await
         .map_err(|e| e.to_string())?;
-    let arch = if cfg!(target_arch = "aarch64") {
-        "generic-aarch64"
-    } else {
-        "generic-x86-64"
-    };
+    #[cfg(all(feature = "mock", not(target_os = "macos")))]
+    let arch = hai_core::utm::UtmArchitecture::X86_64;
+    #[cfg(any(not(feature = "mock"), target_os = "macos"))]
+    let arch = hai_core::utm::UtmArchitecture::host().map_err(|e| e.to_string())?;
 
-    let image = run_utm_download(&Backend, arch, &callback).await?;
+    let image = run_utm_download(&Backend, arch.haos_board(), &callback).await?;
     let path = image.path().to_string_lossy().into_owned();
     pending.0.lock().unwrap().insert(path.clone(), image);
     Ok(path)
@@ -492,6 +491,22 @@ pub async fn check_ha_updated(ip_address: String) -> bool {
 // Proxmox Commands
 // =============================================================================
 
+/// Preserve authentication failures so the configure view can offer reconnect.
+#[derive(Debug, serde::Serialize)]
+pub struct ProxmoxLookupError {
+    message: String,
+    session_expired: bool,
+}
+
+impl From<hai_core::Error> for ProxmoxLookupError {
+    fn from(error: hai_core::Error) -> Self {
+        Self {
+            message: error.to_string(),
+            session_expired: matches!(error, hai_core::Error::ProxmoxSessionExpired),
+        }
+    }
+}
+
 /// Connect to a Proxmox VE server
 #[tauri::command]
 pub async fn proxmox_connect(credentials: ProxmoxCredentials) -> Result<ProxmoxSession, String> {
@@ -503,11 +518,10 @@ pub async fn proxmox_connect(credentials: ProxmoxCredentials) -> Result<ProxmoxS
 
 /// List available nodes on Proxmox
 #[tauri::command]
-pub async fn proxmox_list_nodes(session: ProxmoxSession) -> Result<Vec<ProxmoxNode>, String> {
-    Backend
-        .list_nodes(&session)
-        .await
-        .map_err(|e| e.to_string())
+pub async fn proxmox_list_nodes(
+    session: ProxmoxSession,
+) -> Result<Vec<ProxmoxNode>, ProxmoxLookupError> {
+    Backend.list_nodes(&session).await.map_err(Into::into)
 }
 
 /// List available storage on a Proxmox node
@@ -515,20 +529,17 @@ pub async fn proxmox_list_nodes(session: ProxmoxSession) -> Result<Vec<ProxmoxNo
 pub async fn proxmox_list_storage(
     session: ProxmoxSession,
     node: String,
-) -> Result<Vec<ProxmoxStorage>, String> {
+) -> Result<Vec<ProxmoxStorage>, ProxmoxLookupError> {
     Backend
         .list_storage(&session, &node)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(Into::into)
 }
 
 /// Get the next available VM ID on Proxmox
 #[tauri::command]
-pub async fn proxmox_get_next_vm_id(session: ProxmoxSession) -> Result<u32, String> {
-    Backend
-        .get_next_vm_id(&session)
-        .await
-        .map_err(|e| e.to_string())
+pub async fn proxmox_get_next_vm_id(session: ProxmoxSession) -> Result<u32, ProxmoxLookupError> {
+    Backend.get_next_vm_id(&session).await.map_err(Into::into)
 }
 
 /// Create a Home Assistant VM on Proxmox
@@ -552,6 +563,20 @@ pub async fn proxmox_create_vm(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_proxmox_lookup_error_preserves_authentication_failure() {
+        let expired = ProxmoxLookupError::from(hai_core::Error::ProxmoxSessionExpired);
+        let value = tauri::ipc::InvokeError::from(expired).0;
+        assert_eq!(value["session_expired"], true);
+        assert!(value["message"].as_str().unwrap().contains("reconnect"));
+
+        let denied =
+            ProxmoxLookupError::from(hai_core::Error::ProxmoxApi("Access denied".to_string()));
+        let value = tauri::ipc::InvokeError::from(denied).0;
+        assert_eq!(value["session_expired"], false);
+        assert_eq!(value["message"], "Proxmox API error: Access denied");
+    }
 
     #[test]
     fn write_error_message_shows_write_protection_without_a_prefix() {
@@ -1297,7 +1322,7 @@ mod mock_tests {
         .await
         .unwrap_err();
         assert!(error.contains("Checksum mismatch"));
-        for board in ["generic-aarch64", "generic-x86-64"] {
+        for board in ["generic-aarch64", "ova"] {
             let error = run_utm_download(&backend, board, &NoOpProgress)
                 .await
                 .unwrap_err();
@@ -1358,12 +1383,62 @@ mod mock_tests {
     #[tokio::test]
     #[serial] // all share the mock cache directory
     async fn run_utm_download_returns_extracted_image() {
-        let image = run_utm_download(&BackendMock, "generic-aarch64", &NoOpProgress)
+        use hai_core::utm::UtmArchitecture;
+
+        for arch in [UtmArchitecture::Aarch64, UtmArchitecture::X86_64] {
+            let release = BackendMock
+                .get_latest_haos_release_for_board(arch.haos_board())
+                .await
+                .unwrap();
+            let image = release
+                .image_for(arch.haos_board(), ImageFormat::Qcow2)
+                .unwrap();
+            assert!(image
+                .download_url
+                .ends_with(&format!("haos_{}-16.3.qcow2.xz", arch.haos_board())));
+            let image = run_utm_download(&BackendMock, arch.haos_board(), &NoOpProgress)
+                .await
+                .unwrap();
+            let path = image.path();
+            assert!(path.exists());
+            drop(image);
+            assert!(!path.exists());
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(not(target_os = "macos"))]
+    async fn mock_utm_download_command_works_without_native_mac_architecture() {
+        use tauri::Manager;
+
+        // Off macOS the mock command uses the Intel OVA board without Rosetta
+        // detection; run_utm_download_returns_extracted_image covers that board.
+        let app = tauri::test::mock_app();
+        app.manage(PendingUtmImages::default());
+        let path = download_utm_image(Channel::new(|_| Ok(())), app.state())
             .await
             .unwrap();
-        let path = image.path();
-        assert!(path.exists());
-        drop(image);
-        assert!(!path.exists());
+        assert!(std::path::Path::new(&path).exists());
+        assert!(path.ends_with(".qcow2"));
+        assert!(app
+            .state::<PendingUtmImages>()
+            .0
+            .lock()
+            .unwrap()
+            .contains_key(&path));
+        discard_utm_image(path.clone(), app.state());
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn mock_release_preserves_raw_intel_image_without_inventing_qcow2() {
+        let release = BackendMock.get_haos_release("latest").await.unwrap();
+        assert!(release
+            .image_for("generic-x86-64", ImageFormat::Raw)
+            .is_some());
+        assert!(release
+            .image_for("generic-x86-64", ImageFormat::Qcow2)
+            .is_none());
     }
 }
