@@ -207,7 +207,6 @@ where
         .extract_temporary_image(&temporary_image, callback)
         .await
         .map_err(|e| e.to_string())?;
-    temporary_image.cache_archive(&cache_dir, &image.board, &release.version);
 
     // Check image size vs device size
     let image_size = tokio::fs::metadata(&extracted_path)
@@ -365,7 +364,6 @@ where
         .extract_temporary_image(&temporary_image, callback)
         .await
         .map_err(|e| e.to_string())?;
-    temporary_image.cache_archive(&cache_dir, &image.board, &release.version);
 
     callback.on_progress(FlashProgress {
         stage: FlashStage::Complete,
@@ -432,11 +430,11 @@ async fn run_utm_creation<B: UtmBackend>(
             image.path().display()
         );
     }
-    result.map(|result| result.name).map_err(|e| e.to_string())
+    result.map(|result| result.id).map_err(|e| e.to_string())
 }
 
 /// Start a UTM VM
-#[tauri::command]
+#[tauri::command(async)]
 pub fn start_utm_vm(vm_id: String) -> Result<(), String> {
     Backend.start_vm(&vm_id).map_err(|e| e.to_string())
 }
@@ -450,7 +448,7 @@ pub fn resize_utm_vm_disk(vm_id: String, size_gb: u32) -> Result<(), String> {
 }
 
 /// Get the status of a UTM VM
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_utm_vm_status(vm_id: String) -> Result<VmStatusInfo, String> {
     Backend.vm_status(&vm_id).map_err(|e| e.to_string())
 }
@@ -544,6 +542,20 @@ mod tests {
     }
 
     #[test]
+    fn write_error_message_shows_capacity_failure_without_a_prefix() {
+        for written in [0, 3_000_000_000] {
+            let msg = write_error_message(hai_core::Error::ImageTooLarge {
+                written,
+                image_size: 4_000_000_000,
+            });
+            assert_eq!(
+                msg,
+                "Image is larger than the selected drive: image size is 4000000000 bytes"
+            );
+        }
+    }
+
+    #[test]
     fn write_error_message_prefixes_a_plain_io_error() {
         let msg = write_error_message(hai_core::Error::Io(std::io::Error::other("boom")));
         assert!(msg.starts_with("Write failed"), "{msg}");
@@ -606,10 +618,9 @@ mod tests {
     // ===== Additional edge case tests =====
 
     #[test]
-    #[cfg(target_os = "macos")]
-    fn test_start_utm_vm_non_mock_returns_ok() {
+    #[cfg(feature = "mock")]
+    fn test_start_utm_vm_mock_returns_ok() {
         let result = start_utm_vm("test-vm".to_string());
-        // Should return Ok even though not implemented
         assert!(result.is_ok());
     }
 
@@ -639,15 +650,14 @@ mod tests {
         assert!(err.contains("only available on macOS"), "{err}");
     }
 
-    #[cfg(not(feature = "mock"))] // asserts on the real backend's answers
     #[test]
-    #[cfg(target_os = "macos")]
-    fn test_get_utm_vm_status_non_mock_returns_unknown() {
+    #[cfg(feature = "mock")]
+    fn test_get_utm_vm_status_mock_returns_running_vm() {
         let result = get_utm_vm_status("test-vm".to_string());
         assert!(result.is_ok());
         let status = result.unwrap();
-        assert_eq!(status.status, "unknown");
-        assert_eq!(status.ip_address, None);
+        assert_eq!(status.status, "started");
+        assert_eq!(status.ip_address.as_deref(), Some("192.168.1.100"));
     }
 
     // ===== check_ha_ready() Tests =====
@@ -945,19 +955,12 @@ mod mock_tests {
             let path = backend.extracted.lock().unwrap().clone().unwrap();
             assert!(!path.exists(), "{outcome}");
             assert!(!path.parent().unwrap().exists(), "{outcome}");
-            assert_eq!(
-                backend
-                    .cache
-                    .path()
-                    .join("haos_rpi5-64-16.3.img.xz")
-                    .exists(),
-                outcome != "extract"
-            );
+            assert_eq!(std::fs::read_dir(backend.cache.path()).unwrap().count(), 0);
         }
     }
 
     #[tokio::test]
-    async fn utm_download_publishes_only_completed_archives() {
+    async fn utm_download_keeps_images_private_until_owner_releases_them() {
         for outcome in ["success", "extract"] {
             let backend = LifecycleBackend {
                 cache: tempfile::tempdir().unwrap(),
@@ -967,17 +970,14 @@ mod mock_tests {
             };
             let result = run_utm_download(&backend, "generic-aarch64", &NoOpProgress).await;
             assert_eq!(result.is_ok(), outcome == "success");
-            assert_eq!(
-                backend
-                    .cache
-                    .path()
-                    .join("haos_generic-aarch64-16.3.qcow2.xz")
-                    .exists(),
-                outcome == "success"
-            );
+            if let Ok(image) = &result {
+                assert!(image.path().exists());
+                assert!(image.archive_path().exists());
+            }
             drop(result);
             let path = backend.extracted.lock().unwrap().clone().unwrap();
             assert!(!path.exists());
+            assert_eq!(std::fs::read_dir(backend.cache.path()).unwrap().count(), 0);
         }
     }
 
@@ -1026,11 +1026,13 @@ mod mock_tests {
                     std::fs::remove_file(&marker).unwrap();
                     std::fs::create_dir(marker).unwrap();
                     Ok(hai_core::UtmVmResult {
+                        id: "stable-utm-id".into(),
                         name: config.name.clone(),
                         path: None,
                     })
                 }
                 "success" => Ok(hai_core::UtmVmResult {
+                    id: "stable-utm-id".into(),
                     name: config.name.clone(),
                     path: None,
                 }),
@@ -1109,6 +1111,10 @@ mod mock_tests {
                     matches!(outcome, "success" | "release-failure"),
                     "{outcome}"
                 );
+                if let Ok(id) = &result {
+                    assert_eq!(id, "stable-utm-id");
+                    assert_ne!(id, &config.name);
+                }
                 if matches!(outcome, "timeout" | "transport") {
                     let error = result.as_ref().unwrap_err();
                     assert!(error.contains(&format!(

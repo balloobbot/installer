@@ -257,6 +257,9 @@ pub struct ProxmoxCredentials {
     pub username: String,
     /// Password
     pub password: String,
+    /// Optional time-based one-time password from an authenticator app.
+    #[serde(default)]
+    pub totp: Option<String>,
 }
 
 /// Proxmox session (authentication result)
@@ -358,6 +361,8 @@ pub struct UtmVmConfig {
 /// UTM VM creation result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UtmVmResult {
+    /// UTM's unique identifier, used for subsequent status and start commands
+    pub id: String,
     /// The created VM name
     pub name: String,
     /// Path to the VM bundle
@@ -967,11 +972,13 @@ mod tests {
     #[test]
     fn test_utm_vm_result_roundtrip_full() {
         let result = UtmVmResult {
+            id: "unique-vm-id".to_string(),
             name: "Home Assistant".to_string(),
             path: Some("/Users/test/VMs/HA.utm".to_string()),
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: UtmVmResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, "unique-vm-id");
         assert_eq!(parsed.name, "Home Assistant");
         assert_eq!(parsed.path, Some("/Users/test/VMs/HA.utm".to_string()));
     }
@@ -979,11 +986,13 @@ mod tests {
     #[test]
     fn test_utm_vm_result_without_path() {
         let result = UtmVmResult {
+            id: "unique-vm-id".to_string(),
             name: "Home Assistant".to_string(),
             path: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: UtmVmResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, "unique-vm-id");
         assert_eq!(parsed.name, "Home Assistant");
         assert!(parsed.path.is_none());
     }
