@@ -641,6 +641,7 @@ mod tests {
 
     #[cfg(feature = "mock")]
     #[tokio::test]
+    #[serial_test::serial]
     async fn utm_download_logs_success_only_after_download_completes() {
         use tauri::Manager;
 
