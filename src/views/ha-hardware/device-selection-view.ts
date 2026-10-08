@@ -1,4 +1,8 @@
 import { LitElement, html, css } from "lit";
+import {
+  ViewAccessibility,
+  reducedMotionStyles,
+} from "../../utils/view-accessibility.js";
 import { customElement, state } from "lit/decorators.js";
 import { getManifest, type Device } from "../../api/index.js";
 import { wizardState } from "../../state/wizard-state.js";
@@ -8,7 +12,9 @@ import "../../components/device-card.js";
 
 @customElement("ha-hardware-device-selection-view")
 export class HaHardwareDeviceSelectionView extends LitElement {
+  protected readonly _accessibility = new ViewAccessibility(this);
   static styles = css`
+    ${reducedMotionStyles}
     :host {
       display: flex;
       flex-direction: column;
@@ -130,13 +136,25 @@ export class HaHardwareDeviceSelectionView extends LitElement {
   private async _loadDevices() {
     this._loading = true;
     this._error = null;
+    if (wizardState.getState().selections.deviceCatalogReady) {
+      wizardState.setSelection("deviceCatalogReady", false);
+    }
 
     try {
       const manifest = await getManifest();
+      if (!this.isConnected) return;
       // Filter to only show Home Assistant Hardware devices
       this._devices = manifest.devices.filter(
         (device) => device.category === "home_assistant_hardware"
       );
+      if (
+        !this._devices.some((device) => device.id === this._selectedDeviceId)
+      ) {
+        this._selectedDeviceId = null;
+        wizardState.setSelection("device", undefined);
+        wizardState.setSelection("deviceConfig", undefined);
+      }
+      wizardState.setSelection("deviceCatalogReady", true);
     } catch (err) {
       this._error =
         err instanceof Error ? err.message : "Failed to load devices";
@@ -159,7 +177,7 @@ export class HaHardwareDeviceSelectionView extends LitElement {
       return html`
         <div class="error">
           <span class="error-icon">⚠️</span>
-          <p class="error-message">${this._error}</p>
+          <p class="error-message" role="alert">${this._error}</p>
           <wa-button
             variant="brand"
             appearance="outlined"

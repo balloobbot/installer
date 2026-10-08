@@ -1,4 +1,4 @@
-import type { HaosConfig, ProxmoxSession } from "../api/types.js";
+import type { HaosConfig, ProxmoxSession, UtmVmConfig } from "../api/types.js";
 import type { InstallationPath } from "../views/path-selection-view.js";
 
 export type WizardFlow = InstallationPath;
@@ -18,6 +18,8 @@ export interface WizardStep {
  */
 export interface WizardSelections {
   device?: string;
+  /** The current device picker has successfully refreshed board availability. */
+  deviceCatalogReady?: boolean;
   /** HAOS image of the selected device; its board picks the image to flash. */
   deviceConfig?: HaosConfig;
   /** Device id of the selected drive; also the path sent to the backend. */
@@ -39,6 +41,10 @@ export interface WizardSelections {
 
   /** UTM install progress, so a retry resumes instead of starting over. */
   vmId?: string;
+  /** Native creation outlives its view; reentry must await the same result. */
+  utmCreation?: { config: UtmVmConfig; result: Promise<string> };
+  /** A completed VM with superseded settings must not be silently recreated. */
+  utmSupersededVmId?: string;
   /** Set once the disk of the VM in `vmId` has been resized. */
   utmDiskResized?: boolean;
 
@@ -51,7 +57,12 @@ export interface WizardSelections {
   /** Proxmox target picked in the "Configure VM" step. */
   proxmoxNode?: string;
   proxmoxStorage?: string;
+  proxmoxBridge?: string;
+  /** The selected bridge was verified for the current node and session. */
+  proxmoxBridgeReady?: boolean;
   proxmoxVmId?: number;
+  /** Node and storage selections were verified by the current configure view. */
+  proxmoxConfigureReady?: boolean;
 
   [key: string]: unknown;
 }
@@ -150,6 +161,7 @@ class WizardStateStore {
       this.state = {
         ...this.state,
         currentStepIndex: this.state.currentStepIndex + 1,
+        selections: { ...this.state.selections, deviceCatalogReady: false },
       };
       this.notify();
     }
@@ -160,6 +172,7 @@ class WizardStateStore {
       this.state = {
         ...this.state,
         currentStepIndex: this.state.currentStepIndex - 1,
+        selections: { ...this.state.selections, deviceCatalogReady: false },
       };
       this.notify();
     }
@@ -170,6 +183,10 @@ class WizardStateStore {
       this.state = {
         ...this.state,
         currentStepIndex: index,
+        selections:
+          index === this.state.currentStepIndex
+            ? this.state.selections
+            : { ...this.state.selections, deviceCatalogReady: false },
       };
       this.notify();
     }

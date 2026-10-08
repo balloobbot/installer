@@ -1,13 +1,23 @@
 import { LitElement, html, css } from "lit";
+import {
+  ViewAccessibility,
+  reducedMotionStyles,
+} from "../../utils/view-accessibility.js";
 import { customElement, state } from "lit/decorators.js";
 import { wizardState, type WizardState } from "../../state/wizard-state.js";
 import {
   proxmoxListNodes,
   proxmoxListStorage,
+  proxmoxListBridges,
   proxmoxGetNextVmId,
   formatBytes,
 } from "../../api/commands.js";
-import type { ProxmoxNode, ProxmoxStorage } from "../../api/types.js";
+import type {
+  ProxmoxBridge,
+  ProxmoxNode,
+  ProxmoxStorage,
+} from "../../api/types.js";
+import "@home-assistant/webawesome/dist/components/button/button.js";
 import {
   DEFAULT_CPU_CORES,
   DEFAULT_DISK_SIZE_GB,
@@ -18,7 +28,9 @@ import {
 
 @customElement("proxmox-configure-view")
 export class ProxmoxConfigureView extends LitElement {
+  protected readonly _accessibility = new ViewAccessibility(this);
   static styles = css`
+    ${reducedMotionStyles}
     :host {
       display: flex;
       flex-direction: column;
@@ -283,6 +295,9 @@ export class ProxmoxConfigureView extends LitElement {
   private _error: string | null = null;
 
   @state()
+  private _sessionExpired = false;
+
+  @state()
   private _selectedNode = "";
 
   @state()
@@ -313,6 +328,10 @@ export class ProxmoxConfigureView extends LitElement {
 
   /** Bumped per storage lookup, so only the latest one applies its result */
   private _storageLookup = 0;
+  @state() private _bridges: ProxmoxBridge[] = [];
+  @state() private _selectedBridge = "";
+  /** Node whose bridge lookup last completed, so an empty list is real. */
+  @state() private _bridgesNode = "";
 
   connectedCallback() {
     super.connectedCallback();
@@ -320,6 +339,7 @@ export class ProxmoxConfigureView extends LitElement {
       this._wizardState = state;
     });
     this._restoreSelections();
+    wizardState.setSelection("proxmoxBridgeReady", false);
     void this._loadNodes();
   }
 
@@ -332,6 +352,7 @@ export class ProxmoxConfigureView extends LitElement {
     const selections = this._wizardState.selections;
     this._selectedNode = selections.proxmoxNode ?? "";
     this._selectedStorage = selections.proxmoxStorage ?? "";
+    this._selectedBridge = selections.proxmoxBridge ?? "";
     this._vmName = selections.vmName ?? DEFAULT_PROXMOX_VM_NAME;
     this._cpuCores = selections.cpuCores ?? DEFAULT_CPU_CORES;
     this._memoryMb = selections.memoryMb ?? DEFAULT_MEMORY_MB;
@@ -349,23 +370,46 @@ export class ProxmoxConfigureView extends LitElement {
   }
 
   private async _loadNodes() {
+    this._loadingNodes = true;
+    this._error = null;
+    this._sessionExpired = false;
+    // Preserve choices across reconnects, but block Next until revalidated.
+    wizardState.setSelection("proxmoxConfigureReady", false);
     const session = this._wizardState.selections.proxmoxSession;
+    const isCurrentSession = () =>
+      this._wizardState.selections.proxmoxSession === session;
 
     if (!session) {
-      this._error = "No Proxmox session available";
+      this._setError({
+        message: "Connect to Proxmox to continue.",
+        session_expired: true,
+      });
       this._loadingNodes = false;
       return;
     }
 
+    this._loadingNodes = true;
     try {
-      const [nodes, nextVmId] = await Promise.all([
+      const results = await Promise.allSettled([
         proxmoxListNodes(session),
         proxmoxGetNextVmId(session),
       ]);
 
       // The user may have left this step while the lookups were in flight;
       // saving now would write over what the next step reads
-      if (!this.isConnected) return;
+      if (!this.isConnected || !isCurrentSession()) return;
+
+      // An expired session must take precedence over an ordinary failure
+      // from the other lookup, regardless of which one finishes first.
+      const failures = results.filter((result) => result.status === "rejected");
+      if (failures.length) {
+        const expired = failures.find(
+          (result) => result.reason?.session_expired === true
+        );
+        throw (expired ?? failures[0]).reason;
+      }
+      const nodes = (results[0] as PromiseFulfilledResult<ProxmoxNode[]>).value;
+      const nextVmId = (results[1] as PromiseFulfilledResult<number>).value;
 
       this._nodes = nodes.filter((n) => n.status === "online");
 
@@ -373,6 +417,7 @@ export class ProxmoxConfigureView extends LitElement {
       // user has already been shown and may have changed
       if (!this._vmIdChosen) {
         this._vmId = nextVmId;
+        this._vmIdChosen = true;
       }
 
       // Keep a restored node as long as it is still online
@@ -381,25 +426,23 @@ export class ProxmoxConfigureView extends LitElement {
       );
       if (!nodeStillOnline) {
         this._selectedNode = this._nodes[0]?.name ?? "";
+        this._selectedBridge = "";
+        this._bridges = [];
       }
 
       if (this._selectedNode) {
         await this._loadStorage();
         // The storage lookup is another chance to have left this step
-        if (!this.isConnected) return;
+        if (!this.isConnected || !isCurrentSession()) return;
       }
 
       this._saveSelections();
     } catch (error) {
-      // Tauri invoke errors are strings, not Error objects
-      this._error =
-        typeof error === "string"
-          ? error
-          : error instanceof Error
-            ? error.message
-            : "Failed to load Proxmox nodes";
+      if (!this.isConnected || !isCurrentSession()) return;
+      this._setError(error);
     } finally {
       this._loadingNodes = false;
+      if (this.isConnected && isCurrentSession()) this._saveSelections();
     }
   }
 
@@ -415,54 +458,159 @@ export class ProxmoxConfigureView extends LitElement {
     // for the same node; only the latest one may update the storage
     const lookup = ++this._storageLookup;
     const isLatest = () => lookup === this._storageLookup;
-    const isStale = () => !this.isConnected || !isLatest();
+    const isCurrentSession = () =>
+      this._wizardState.selections.proxmoxSession === session;
 
     this._loadingStorage = true;
+    // A new lookup replaces the previous one's error; an expired session
+    // never gets here, since it clears the session first
+    this._error = null;
+    this._sessionExpired = false;
+    wizardState.setSelection("proxmoxConfigureReady", false);
+    wizardState.setSelection("proxmoxBridgeReady", false);
     try {
-      const storages = await proxmoxListStorage(session, node);
+      const [storageResult, bridgeResult] = await Promise.allSettled([
+        proxmoxListStorage(session, node),
+        proxmoxListBridges(session, node),
+      ]);
 
-      if (isStale()) return;
+      if (!this.isConnected || !isCurrentSession()) return;
 
-      // Filter to only show storage that supports VM images
-      this._storages = storages.filter(
-        (s) => s.active && s.content.includes("images")
+      // An expired session must take precedence over an ordinary failure
+      // from the other lookup, regardless of which one finishes first.
+      const failures = [storageResult, bridgeResult].filter(
+        (result): result is PromiseRejectedResult =>
+          result.status === "rejected"
       );
-
-      // Keep the selected storage if this node still offers it, otherwise
-      // fall back to the first one available
-      const storageStillAvailable = this._storages.some(
-        (s) => s.name === this._selectedStorage
+      const expired = failures.find(
+        (result) => result.reason?.session_expired === true
       );
-      if (!storageStillAvailable) {
-        this._selectedStorage = this._storages[0]?.name ?? "";
+      if (!isLatest()) {
+        // Session expiry applies to every node, even from a superseded
+        // lookup; the catch below handles it. Other failures belong to the
+        // old selection.
+        if (expired) throw expired.reason;
+        return;
       }
+
+      // Preserve usable storage even when network discovery fails, and the
+      // other way around. A failed list keeps its choice for retry/reconnect;
+      // readiness keeps it from being used until a lookup verifies it again.
+      if (storageResult.status === "fulfilled") {
+        // Filter to only show storage that supports VM images
+        this._storages = storageResult.value.filter(
+          (s) => s.active && s.content.includes("images")
+        );
+
+        // Keep the selected storage if this node still offers it, otherwise
+        // fall back to the first one available
+        const storageStillAvailable = this._storages.some(
+          (s) => s.name === this._selectedStorage
+        );
+        if (!storageStillAvailable) {
+          this._selectedStorage = this._storages[0]?.name ?? "";
+        }
+      } else {
+        this._storages = [];
+      }
+
+      if (bridgeResult.status === "fulfilled") {
+        this._bridges = bridgeResult.value;
+        this._bridgesNode = node;
+        if (
+          !this._bridges.some((bridge) => bridge.name === this._selectedBridge)
+        ) {
+          this._selectedBridge =
+            this._bridges.find((bridge) => bridge.name === "vmbr0")?.name ??
+            this._bridges[0]?.name ??
+            "";
+        }
+      } else {
+        this._bridges = [];
+      }
+
+      if (failures.length) throw (expired ?? failures[0]).reason;
 
       this._saveSelections();
     } catch (error) {
-      if (isStale()) return;
-      // Nothing this node offers could be checked, so neither a restored
-      // storage nor one from a previous node may stay selected: an empty one
-      // keeps the step from continuing
-      this._storages = [];
-      this._selectedStorage = "";
+      if (!this.isConnected || !isCurrentSession()) return;
+      if (!isLatest()) {
+        // Session expiry applies to every node, even if this lookup was
+        // superseded. Ordinary failures still belong to the old selection.
+        if (
+          typeof error === "object" &&
+          error !== null &&
+          "session_expired" in error &&
+          error.session_expired === true
+        ) {
+          this._setError(error);
+        }
+        return;
+      }
+      // The lists were already updated above; keep the choices for
+      // retry/reconnect while readiness prevents using them.
       this._saveSelections();
-      // Show storage error to user
-      this._error =
-        typeof error === "string"
-          ? error
-          : error instanceof Error
-            ? error.message
-            : "Failed to load storage";
+      this._setError(error);
     } finally {
       // A newer lookup is still running and owns the loading state
-      if (isLatest()) this._loadingStorage = false;
+      if (isLatest()) {
+        this._loadingStorage = false;
+        if (this.isConnected && isCurrentSession()) this._saveSelections();
+      }
     }
+  }
+
+  private _setError(error: unknown) {
+    this._sessionExpired =
+      typeof error === "object" &&
+      error !== null &&
+      "session_expired" in error &&
+      error.session_expired === true;
+    this._error =
+      typeof error === "string"
+        ? error
+        : typeof error === "object" &&
+            error !== null &&
+            "message" in error &&
+            typeof error.message === "string"
+          ? error.message
+          : "Failed to load Proxmox configuration";
+    if (this._sessionExpired) {
+      wizardState.setSelection("proxmoxSession", undefined);
+      wizardState.setSelection("proxmoxConnected", false);
+    }
+    wizardState.setSelection("proxmoxConfigureReady", false);
+  }
+
+  private _retry() {
+    if (this._loadingNodes || this._loadingStorage) return;
+    void this._loadNodes();
+  }
+
+  private _reconnect() {
+    wizardState.goToStep(0);
   }
 
   private _saveSelections() {
     wizardState.setSelection("proxmoxNode", this._selectedNode);
     wizardState.setSelection("proxmoxStorage", this._selectedStorage);
-    wizardState.setSelection("proxmoxVmId", this._vmId);
+    wizardState.setSelection("proxmoxBridge", this._selectedBridge);
+    wizardState.setSelection(
+      "proxmoxBridgeReady",
+      !this._loadingNodes &&
+        !this._loadingStorage &&
+        !this._error &&
+        this._bridges.some((bridge) => bridge.name === this._selectedBridge)
+    );
+    wizardState.setSelection(
+      "proxmoxConfigureReady",
+      !this._loadingNodes && !this._loadingStorage && !this._error
+    );
+    // A failed initial lookup must not turn the fallback ID into a choice
+    // that suppresses the next-free-ID suggestion after reconnecting.
+    if (this._vmIdChosen) {
+      wizardState.setSelection("proxmoxVmId", this._vmId);
+    }
     wizardState.setSelection("vmName", this._vmName);
     wizardState.setSelection("cpuCores", this._cpuCores);
     wizardState.setSelection("memoryMb", this._memoryMb);
@@ -473,7 +621,16 @@ export class ProxmoxConfigureView extends LitElement {
     const select = e.target as HTMLSelectElement;
     this._selectedNode = select.value;
     this._selectedStorage = "";
+    this._selectedBridge = "";
+    this._bridges = [];
+    this._bridgesNode = "";
+    this._saveSelections();
     await this._loadStorage();
+  }
+
+  private _onBridgeChange(e: Event) {
+    this._selectedBridge = (e.target as HTMLSelectElement).value;
+    this._saveSelections();
   }
 
   private _onStorageChange(e: Event) {
@@ -657,7 +814,14 @@ export class ProxmoxConfigureView extends LitElement {
         <h2>Configure virtual machine</h2>
         <p class="subtitle">Configure your Home Assistant VM on Proxmox</p>
         <div class="config-card">
-          <p class="error-text">${this._error}</p>
+          <p class="error-text" role="alert">${this._error}</p>
+          <wa-button
+            variant="brand"
+            @click=${this._sessionExpired ? this._reconnect : this._retry}
+            ?disabled=${this._loadingNodes || this._loadingStorage}
+          >
+            ${this._sessionExpired ? "Reconnect" : "Try again"}
+          </wa-button>
         </div>
       `;
     }
@@ -758,6 +922,57 @@ export class ProxmoxConfigureView extends LitElement {
             <p class="setting-description">
               Storage location for the VM disk image
             </p>
+          </div>
+        </div>
+
+        <div class="setting-row">
+          <div class="setting-icon">${this._renderServerIcon()}</div>
+          <div class="setting-content">
+            <label class="setting-label" for="network-bridge"
+              >Network bridge</label
+            >
+            ${this._loadingStorage || this._loadingNodes
+              ? html`<span class="loading-text"
+                  >Loading network bridges...</span
+                >`
+              : html`
+                  <select
+                    id="network-bridge"
+                    class="select-dropdown"
+                    @change=${this._onBridgeChange}
+                    ?disabled=${this._bridges.length === 0}
+                  >
+                    ${this._bridges.map(
+                      (bridge) =>
+                        html` <option
+                          value=${bridge.name}
+                          ?selected=${bridge.name === this._selectedBridge}
+                        >
+                          ${bridge.name}${bridge.network_type === "vnet"
+                            ? " (SDN VNet)"
+                            : ""}${bridge.comments
+                            ? ` - ${bridge.comments.trim()}`
+                            : ""}
+                        </option>`
+                    )}
+                  </select>
+                  ${this._bridges.length === 0 &&
+                  this._bridgesNode === this._selectedNode &&
+                  !this._error
+                    ? // A lookup error already offers its own retry above
+                      html`<p class="error-text" role="alert">
+                          ${this._selectedNode
+                            ? "No network bridges available on this node."
+                            : "No online Proxmox nodes found."}
+                        </p>
+                        <wa-button
+                          @click=${this._selectedNode
+                            ? this._loadStorage
+                            : this._loadNodes}
+                          >Try again</wa-button
+                        >`
+                    : ""}
+                `}
           </div>
         </div>
 

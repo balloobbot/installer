@@ -1,16 +1,23 @@
 import { LitElement, html, css } from "lit";
+import {
+  ViewAccessibility,
+  reducedMotionStyles,
+} from "../utils/view-accessibility.js";
 import { customElement, state } from "lit/decorators.js";
 import { openExternalLink } from "../utils/external-url.js";
 import "@home-assistant/webawesome/dist/components/button/button.js";
+import "../components/casita-mascot.js";
 
 @customElement("welcome-view")
 export class WelcomeView extends LitElement {
+  protected readonly _accessibility = new ViewAccessibility(this);
   @state()
   private _logoClickCount = 0;
 
   private _clickResetTimer?: number;
 
   static styles = css`
+    ${reducedMotionStyles}
     :host {
       display: flex;
       flex-direction: column;
@@ -20,6 +27,26 @@ export class WelcomeView extends LitElement {
       padding: 2rem;
       text-align: center;
       position: relative;
+    }
+
+    @media (max-height: 700px) {
+      :host {
+        box-sizing: border-box;
+        min-height: 0;
+        overflow-y: auto;
+        justify-content: flex-start;
+        padding-bottom: 6rem;
+      }
+
+      :host > * {
+        flex-shrink: 0;
+      }
+    }
+
+    casita-mascot {
+      width: 96px;
+      height: 96px;
+      margin-bottom: 1.5rem;
     }
 
     @keyframes soft-pulse {
@@ -35,7 +62,9 @@ export class WelcomeView extends LitElement {
     }
 
     .logo-container {
-      margin-bottom: 2rem;
+      margin: 0 0 2rem;
+      font-size: inherit;
+      line-height: 1;
     }
 
     .logo {
@@ -89,6 +118,13 @@ export class WelcomeView extends LitElement {
       text-decoration: none;
     }
 
+    @media (max-height: 700px) {
+      .ohf-link {
+        position: static;
+        margin-top: 2rem;
+      }
+    }
+
     .ohf-logo {
       width: 180px;
       opacity: 0.7;
@@ -115,7 +151,7 @@ export class WelcomeView extends LitElement {
 
   render() {
     return html`
-      <div class="logo-container" @click=${this._onLogoClick}>
+      <h1 class="logo-container" @click=${this._onLogoClick}>
         <img
           class="logo logo-light"
           src="/assets/home-assistant-logo-light.svg"
@@ -126,7 +162,9 @@ export class WelcomeView extends LitElement {
           src="/assets/home-assistant-logo-dark.svg"
           alt="Home Assistant"
         />
-      </div>
+      </h1>
+
+      <casita-mascot mood="winking"></casita-mascot>
 
       <div class="welcome-text">
         <p>

@@ -3,7 +3,7 @@ import { test, expect, type Page } from "@playwright/test";
 test.describe("Proxmox Installation Flow", () => {
   test.beforeEach(async ({ page }) => {
     // Use mock mode to avoid actual Proxmox connections
-    await page.goto("/?mock=true");
+    await page.goto("/");
     await page.locator("welcome-view").locator("wa-button").click();
     await expect(page.locator("path-selection-view")).toBeVisible();
     // Select Proxmox Server option
@@ -413,7 +413,7 @@ test.describe("Proxmox Installation Flow", () => {
     await navigateToProxmoxStep5(page);
 
     const successView = page.locator("proxmox-success-view");
-    await expect(successView.locator(".casita-mascot")).toBeVisible();
+    await expect(successView.locator("casita-mascot")).toBeVisible();
   });
 
   test("step 5: shows VM access information", async ({ page }) => {

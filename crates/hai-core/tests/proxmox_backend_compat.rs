@@ -1,6 +1,6 @@
 use hai_core::{
-    Error, ProgressCallback, ProxmoxBackend, ProxmoxCredentials, ProxmoxNode, ProxmoxSession,
-    ProxmoxStorage, ProxmoxVmConfig, ProxmoxVmResult, Result,
+    Error, ProgressCallback, ProxmoxBackend, ProxmoxBridge, ProxmoxCredentials, ProxmoxNode,
+    ProxmoxSession, ProxmoxStorage, ProxmoxVmConfig, ProxmoxVmResult, Result,
 };
 
 // An external backend implementing only the original required methods still compiles.
@@ -16,6 +16,10 @@ impl ProxmoxBackend for ExistingBackend {
     }
 
     async fn list_storage(&self, _: &ProxmoxSession, _: &str) -> Result<Vec<ProxmoxStorage>> {
+        unreachable!()
+    }
+
+    async fn list_bridges(&self, _: &ProxmoxSession, _: &str) -> Result<Vec<ProxmoxBridge>> {
         unreachable!()
     }
 

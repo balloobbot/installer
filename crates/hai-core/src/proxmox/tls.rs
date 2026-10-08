@@ -581,6 +581,7 @@ mod tests {
                 server_url: self.url.clone(),
                 username: "fixture@pam".into(),
                 password: "fixture-password".into(),
+                totp: None,
                 certificate_sha256: approved.then(|| fingerprint(&self.cert)),
             }
         }
@@ -1198,6 +1199,7 @@ mod tests {
         let config = crate::types::ProxmoxVmConfig {
             node: "pve".into(),
             storage: "local".into(),
+            bridge: "vmbr0".into(),
             vm_id: 100,
             name: "fixture".into(),
             cpu_cores: 2,
@@ -1216,7 +1218,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains(CERTIFICATE_CHANGED), "{error}");
-        assert!(!source_unused);
+        // The bridge check fails before the create request is sent.
+        assert!(source_unused);
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), b"fake fixture image").unwrap();
         let error = super::super::upload_image_to_proxmox(

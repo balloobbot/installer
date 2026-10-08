@@ -4,6 +4,7 @@ import "./fab-button.js";
 
 // Import views
 import "../views/welcome-view.js";
+import "../views/connection-check-view.js";
 import "../views/path-selection-view.js";
 import "../views/other-options-view.js";
 import "../views/sbc/device-selection-view.js";
@@ -42,6 +43,7 @@ export type ViewName =
   | "welcome"
   | "path-selection"
   | "other-options"
+  | "connection-check"
   | "wizard";
 
 // mdi:toolbox-outline
@@ -90,6 +92,7 @@ export class AppShell extends LitElement {
   private _verifyingDrive = false;
 
   private _unsubscribe?: () => void;
+  private _pendingFlow?: WizardFlow;
 
   connectedCallback() {
     super.connectedCallback();
@@ -125,6 +128,11 @@ export class AppShell extends LitElement {
 
   private _renderView() {
     switch (this._currentView) {
+      case "connection-check":
+        return html`<connection-check-view
+          @connection-ready=${this._onConnectionReady}
+          @connection-back=${this._onConnectionBack}
+        ></connection-check-view>`;
       case "welcome":
         return html`<welcome-view
           @navigate=${this._onNavigate}
@@ -224,7 +232,7 @@ export class AppShell extends LitElement {
     // Check if required selections are made for current step
     if (flow === "sbc") {
       if (stepId === "device") {
-        return !selections.device;
+        return !selections.deviceCatalogReady || !selections.device;
       }
       if (stepId === "drive") {
         return !selections.drive;
@@ -233,7 +241,7 @@ export class AppShell extends LitElement {
 
     if (flow === "minipc") {
       if (stepId === "architecture") {
-        return !selections.device;
+        return !selections.deviceCatalogReady || !selections.device;
       }
       if (stepId === "drive") {
         return !selections.drive;
@@ -250,7 +258,13 @@ export class AppShell extends LitElement {
     // Proxmox flow
     if (flow === "proxmox") {
       if (stepId === "configure") {
-        return !selections.proxmoxNode || !selections.proxmoxStorage;
+        return (
+          !selections.proxmoxConfigureReady ||
+          !selections.proxmoxNode ||
+          !selections.proxmoxStorage ||
+          !selections.proxmoxBridge ||
+          !selections.proxmoxBridgeReady
+        );
       }
     }
 
@@ -376,8 +390,25 @@ export class AppShell extends LitElement {
 
   private _onSelectPath(e: CustomEvent<{ path: WizardFlow }>) {
     this._resetErrorState();
-    wizardState.startFlow(e.detail.path);
+    if (e.detail.path === "ha-hardware") {
+      wizardState.startFlow(e.detail.path);
+      this._currentView = "wizard";
+      return;
+    }
+    this._pendingFlow = e.detail.path;
+    this._currentView = "connection-check";
+  }
+
+  private _onConnectionReady() {
+    if (this._currentView !== "connection-check" || !this._pendingFlow) return;
+    wizardState.startFlow(this._pendingFlow);
+    this._pendingFlow = undefined;
     this._currentView = "wizard";
+  }
+
+  private _onConnectionBack() {
+    this._pendingFlow = undefined;
+    this._currentView = "path-selection";
   }
 
   private _onWizardCancel() {
@@ -495,7 +526,11 @@ export class AppShell extends LitElement {
     if (selection) {
       this._verifyingDrive = true;
       try {
-        found = !!findDrive(await listBlockDevices(), selection);
+        found = !!findDrive(
+          await listBlockDevices(),
+          selection,
+          started.selections.deviceConfig
+        );
       } catch {
         // The scan failed, so the device cannot be confirmed. Treat that the
         // same as a device that is gone.
@@ -533,7 +568,32 @@ export class AppShell extends LitElement {
   }
 
   private async _onDialogConfirm() {
+    if (!this._showConfirmDialog) return;
+    const confirmed = this._wizardState;
+    const dialog = this.shadowRoot?.querySelector("confirm-dialog");
+    if (!dialog) return;
+    const closed = new Promise<void>((resolve) => {
+      const onHide = (event: Event) => {
+        if (
+          event.composedPath()[0] !==
+          dialog.shadowRoot?.querySelector("wa-dialog")
+        )
+          return;
+        dialog.removeEventListener("wa-after-hide", onHide);
+        resolve();
+      };
+      dialog.addEventListener("wa-after-hide", onHide);
+    });
     this._showConfirmDialog = false;
+    // The rest of the document is inert until the modal finishes closing.
+    await closed;
+    if (
+      !this.isConnected ||
+      this._wizardState.selections !== confirmed.selections ||
+      this._wizardState.currentFlow !== confirmed.currentFlow ||
+      this._wizardState.currentStepIndex !== confirmed.currentStepIndex
+    )
+      return;
     // The dialog can sit open for any length of time and the next step starts
     // writing immediately, so check the device one last time.
     if (!(await this._verifySelectedDrive())) {
