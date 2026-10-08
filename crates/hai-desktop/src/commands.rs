@@ -645,6 +645,8 @@ mod tests {
     async fn utm_download_logs_success_only_after_download_completes() {
         use tauri::Manager;
 
+        // The tail is shared, so an earlier UTM test may have left its own success line
+        crate::diagnostics::clear_test_log_tail();
         let app = tauri::test::mock_app();
         app.manage(PendingUtmImages::default());
         let channel = Channel::new(|_| {

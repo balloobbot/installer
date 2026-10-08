@@ -281,6 +281,11 @@ pub(crate) fn test_log_tail() -> Vec<String> {
     TAIL.lock().unwrap().iter().cloned().collect()
 }
 
+#[cfg(all(test, feature = "mock"))]
+pub(crate) fn clear_test_log_tail() {
+    TAIL.lock().unwrap().clear();
+}
+
 #[tauri::command]
 pub fn open_logs_folder(app: tauri::AppHandle) -> Result<(), String> {
     let path = app
