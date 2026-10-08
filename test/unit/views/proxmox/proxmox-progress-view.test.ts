@@ -141,7 +141,9 @@ describe("proxmox-progress-view", () => {
     el.addEventListener("install-error", () => errors++);
     await settle();
     expect(
-      el.shadowRoot!.querySelector(".error-message")!.textContent
+      el
+        .shadowRoot!.querySelector("install-progress")!
+        .shadowRoot!.querySelector(".error-message")!.textContent
     ).to.contain("Storage unavailable");
     expect(completed).to.equal(0);
     expect(errors).to.equal(1);

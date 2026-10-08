@@ -77,7 +77,11 @@ describe("progress-view", () => {
     };
     attempts[0].progressChannel.onmessage(progress);
     await settle();
-    expect(el.shadowRoot!.querySelector("progress-bar")!.progress).to.equal(50);
+    expect(
+      el
+        .shadowRoot!.querySelector("install-progress")!
+        .shadowRoot!.querySelector("progress-bar")!.progress
+    ).to.equal(50);
     expect(completed).to.equal(0);
     attempts[0].progressChannel.onmessage({
       ...progress,
@@ -102,7 +106,9 @@ describe("progress-view", () => {
       await settle();
       expect(el.hasError).to.be.true;
       expect(
-        el.shadowRoot!.querySelector(".error-message")!.textContent
+        el
+          .shadowRoot!.querySelector("install-progress")!
+          .shadowRoot!.querySelector(".error-message")!.textContent
       ).to.contain(
         message === "Drive disconnected"
           ? "Please reconnect it and try again"
@@ -115,7 +121,11 @@ describe("progress-view", () => {
       expect(attempts).to.have.length(2);
       expect(attempts[1].request).to.deep.equal(attempts[0].request);
       expect(el.hasError).to.be.false;
-      expect(el.shadowRoot!.querySelector(".error-message")).to.equal(null);
+      expect(
+        el
+          .shadowRoot!.querySelector("install-progress")!
+          .shadowRoot!.querySelector(".error-message")
+      ).to.equal(null);
       attempts[1].progressChannel.onmessage({
         stage: "complete",
         progress: 100,
@@ -143,7 +153,9 @@ describe("progress-view", () => {
     });
     await settle();
     expect(
-      el.shadowRoot!.querySelector(".error-message")!.textContent
+      el
+        .shadowRoot!.querySelector("install-progress")!
+        .shadowRoot!.querySelector(".error-message")!.textContent
     ).to.contain("Verification failed");
     expect(completed).to.be.false;
   });
@@ -188,7 +200,9 @@ describe("progress-view", () => {
       await settle();
       expect(el.hasError).to.be.true;
       expect(
-        el.shadowRoot!.querySelector(".error-message")!.textContent
+        el
+          .shadowRoot!.querySelector("install-progress")!
+          .shadowRoot!.querySelector(".error-message")!.textContent
       ).to.equal("Missing drive or device configuration");
       expect(calls).to.equal(0);
     });
