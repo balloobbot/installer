@@ -1330,15 +1330,8 @@ mod mock_tests {
     async fn mock_utm_download_command_works_without_native_mac_architecture() {
         use tauri::Manager;
 
-        let archive = BackendMock
-            .cache_dir()
-            .unwrap()
-            .join("haos_ova-16.3.qcow2.xz");
-        match std::fs::remove_file(&archive) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => panic!("could not clear mock archive: {error}"),
-        }
+        // Off macOS the mock command uses the Intel OVA board without Rosetta
+        // detection; run_utm_download_returns_extracted_image covers that board.
         let app = tauri::test::mock_app();
         app.manage(PendingUtmImages::default());
         let path = download_utm_image(Channel::new(|_| Ok(())), app.state())
@@ -1346,10 +1339,6 @@ mod mock_tests {
             .unwrap();
         assert!(std::path::Path::new(&path).exists());
         assert!(path.ends_with(".qcow2"));
-        assert!(
-            archive.exists(),
-            "command must download the Intel OVA image"
-        );
         assert!(app
             .state::<PendingUtmImages>()
             .0
