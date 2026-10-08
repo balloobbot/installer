@@ -5582,6 +5582,7 @@ mod tests {
                 server_url: server.url(),
                 ticket: "test-ticket".into(),
                 csrf_token: "test-csrf".into(),
+                certificate_sha256: None,
             };
             // Linux can open a directory as a file, but reading it fails.
             let temp_dir = tempfile::tempdir().unwrap();
