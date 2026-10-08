@@ -136,6 +136,8 @@ export interface HaosImage {
   download_url: string;
   /** File size in bytes */
   size: number;
+  /** GitHub digest of the compressed asset; required for installation. */
+  digest?: string | null;
 }
 
 // ============================================================================
@@ -192,6 +194,8 @@ export interface ProxmoxCredentials {
   username: string;
   /** Password */
   password: string;
+  /** Optional time-based one-time password from an authenticator app */
+  totp?: string;
 }
 
 /** Proxmox session (authentication result) */

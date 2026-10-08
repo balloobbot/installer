@@ -13,7 +13,8 @@
 //! 5. Wait for upload task to complete
 //! 6. Create VM with UEFI/OVMF, EFI disk, and import-from to import the disk
 //! 7. Wait for VM creation task to complete
-//! 8. Start VM and wait for IP via QEMU guest agent
+//! 8. Resize the imported disk to the selected size and wait for completion
+//! 9. Start VM and wait for IP via QEMU guest agent
 //!
 //! References:
 //! - https://forum.proxmox.com/threads/api-equivalent-of-qm-importdisk.157457/
@@ -30,6 +31,19 @@ use std::collections::HashSet;
 /// Minimum required Proxmox VE version for disk image import via API.
 /// Version 8.4.1 added support for uploading qcow2/raw/img/vmdk files with content=import.
 const MIN_PROXMOX_VERSION: (u32, u32, u32) = (8, 4, 1);
+
+/// Minimum size of the HAOS OVA disk, matching the configure view.
+const MIN_DISK_SIZE_GB: u32 = 32;
+
+fn validate_disk_size(disk_size_gb: u32) -> Result<()> {
+    if disk_size_gb < MIN_DISK_SIZE_GB {
+        return Err(Error::ProxmoxApi(format!(
+            "The HAOS disk must be at least {} GiB. Proxmox cannot shrink the imported disk.",
+            MIN_DISK_SIZE_GB
+        )));
+    }
+    Ok(())
+}
 
 /// How often to send progress updates (every N bytes)
 const PROGRESS_UPDATE_INTERVAL: u64 = 10 * 1024 * 1024; // 10 MB
@@ -64,6 +78,104 @@ fn version_meets_minimum(version: (u32, u32, u32), minimum: (u32, u32, u32)) -> 
         || (version.0 == minimum.0 && version.1 == minimum.1 && version.2 >= minimum.2)
 }
 
+fn needs_second_factor(data: &serde_json::Value) -> bool {
+    let flagged = data.get("NeedTFA").is_some_and(|value| {
+        !matches!(
+            value,
+            serde_json::Value::Null | serde_json::Value::Bool(false)
+        ) && value != &serde_json::json!(0)
+    });
+    flagged
+        || data["ticket"]
+            .as_str()
+            .is_some_and(|ticket| ticket.starts_with("PVE:!"))
+}
+
+async fn complete_second_factor(
+    client: &reqwest::Client,
+    auth_url: &str,
+    credentials: &ProxmoxCredentials,
+    data: serde_json::Value,
+) -> Result<serde_json::Value> {
+    if !needs_second_factor(&data) {
+        return Ok(data);
+    }
+
+    // PVE embeds URL-encoded JSON in the signed ticket, as used by its web UI.
+    let ticket = data["ticket"].as_str().unwrap_or_default();
+    let challenge = ticket
+        .strip_prefix("PVE:!tfa!")
+        .and_then(|rest| rest.split(':').next())
+        .and_then(|encoded| urlencoding::decode(encoded).ok())
+        .and_then(|decoded| serde_json::from_str::<serde_json::Value>(&decoded).ok());
+    if challenge.as_ref().and_then(|value| value["totp"].as_bool()) != Some(true) {
+        return Err(Error::ProxmoxTwoFactor(
+            "This account requires a second factor, but Proxmox did not offer TOTP. \
+             This installer supports authenticator app (TOTP) codes only; \
+             WebAuthn, security keys, Yubico OTP, and recovery codes are not supported."
+                .to_string(),
+        ));
+    }
+
+    let code = credentials.totp.as_deref().unwrap_or_default().trim();
+    if code.is_empty() {
+        return Err(Error::ProxmoxTwoFactor(
+            "This account requires an authenticator app code. Enter the current code and try again."
+                .to_string(),
+        ));
+    }
+    if !(2..=16).contains(&code.len()) || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(Error::ProxmoxTwoFactor(
+            "Enter a valid numeric authenticator app code.".to_string(),
+        ));
+    }
+
+    let password = format!("totp:{code}");
+    let response = client
+        .post(auth_url)
+        .form(&[
+            ("username", credentials.username.as_str()),
+            ("password", password.as_str()),
+            ("tfa-challenge", ticket),
+        ])
+        .send()
+        .await
+        .map_err(|_| {
+            Error::ProxmoxTwoFactor(
+                "Could not complete the second-factor request. Check your connection and try again."
+                    .to_string(),
+            )
+        })?;
+    if !response.status().is_success() {
+        if response.status().as_u16() != 401 {
+            return Err(Error::ProxmoxTwoFactor(format!(
+                "Proxmox returned HTTP {} while completing the second-factor login. \
+                 Check the server and try again.",
+                response.status()
+            )));
+        }
+        return Err(Error::ProxmoxTwoFactor(
+            "Proxmox rejected the second-factor login. Check your current authenticator app code \
+             and try again. If it still fails, check the account in Proxmox."
+                .to_string(),
+        ));
+    }
+
+    let response: serde_json::Value = response.json().await.map_err(|_| {
+        Error::ProxmoxTwoFactor("Invalid second-factor response from Proxmox.".to_string())
+    })?;
+    let data = response.get("data").ok_or_else(|| {
+        Error::ProxmoxTwoFactor("Missing second-factor response from Proxmox.".to_string())
+    })?;
+    if needs_second_factor(data) {
+        return Err(Error::ProxmoxTwoFactor(
+            "The second-factor login is incomplete. Enter a current authenticator app code and try again."
+                .to_string(),
+        ));
+    }
+    Ok(data.clone())
+}
+
 /// Authenticate with a Proxmox server and verify version requirements.
 ///
 /// This function also verifies the Proxmox version is at least 8.4.1,
@@ -88,6 +200,7 @@ async fn authenticate(credentials: &ProxmoxCredentials) -> Result<ProxmoxSession
         .form(&[
             ("username", credentials.username.as_str()),
             ("password", credentials.password.as_str()),
+            ("new-format", "1"),
         ])
         .send()
         .await
@@ -133,6 +246,7 @@ async fn authenticate(credentials: &ProxmoxCredentials) -> Result<ProxmoxSession
     let data = json.get("data").ok_or_else(|| {
         Error::ProxmoxApi("Invalid response from server: missing 'data' field".to_string())
     })?;
+    let data = complete_second_factor(&client, &auth_url, credentials, data.clone()).await?;
 
     let ticket = data
         .get("ticket")
@@ -737,6 +851,16 @@ async fn wait_for_task(
     upid: &str,
     timeout_secs: u64,
 ) -> Result<()> {
+    wait_for_task_completion(session, node, upid, timeout_secs, &mut false).await
+}
+
+async fn wait_for_task_completion(
+    session: &ProxmoxSession,
+    node: &str,
+    upid: &str,
+    timeout_secs: u64,
+    stopped: &mut bool,
+) -> Result<()> {
     let url = format!(
         "{}/api2/json/nodes/{}/tasks/{}/status",
         session.server_url.trim_end_matches('/'),
@@ -787,6 +911,7 @@ async fn wait_for_task(
         let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("");
 
         if status == "stopped" {
+            *stopped = true;
             // Task is complete, check if it succeeded
             let exitstatus = data
                 .get("exitstatus")
@@ -971,13 +1096,19 @@ async fn upload_image_to_proxmox<P: ProgressCallback>(
 /// Create a VM with the disk imported during creation.
 ///
 /// Uses the `import-from` parameter on scsi0 to import the uploaded
-/// disk image during VM creation.
+/// disk image during VM creation, then grows it to the selected size.
 async fn create_vm_with_disk(
     session: &ProxmoxSession,
     config: &ProxmoxVmConfig,
     image_filename: &str,
     storage_name: &str,
+    source_unused: &mut bool,
 ) -> Result<()> {
+    if let Err(error) = validate_disk_size(config.disk_size_gb) {
+        *source_unused = true;
+        return Err(error);
+    }
+
     let url = format!(
         "{}/api2/json/nodes/{}/qemu",
         session.server_url.trim_end_matches('/'),
@@ -1024,6 +1155,9 @@ async fn create_vm_with_disk(
     let response_text = response.text().await.unwrap_or_default();
 
     if !status.is_success() {
+        // A client rejection cannot have started an import. Server errors or
+        // a timeout can hide a task which is still running, so retain those.
+        *source_unused = status.is_client_error() && status != reqwest::StatusCode::REQUEST_TIMEOUT;
         return Err(Error::ProxmoxApi(format!(
             "Failed to create VM ({}): {}",
             status, response_text
@@ -1035,12 +1169,134 @@ async fn create_vm_with_disk(
         .map_err(|e| Error::ProxmoxApi(format!("Failed to parse VM creation response: {}", e)))?;
 
     // VM creation returns a task UPID since it involves disk import
-    if let Some(upid) = json.get("data").and_then(|v| v.as_str()) {
-        // Wait for the VM creation task to complete
-        wait_for_task(session, &config.node, upid, 600).await?;
+    let upid = json
+        .get("data")
+        .and_then(|v| v.as_str())
+        .filter(|upid| !upid.is_empty())
+        .ok_or_else(|| Error::ProxmoxApi("VM creation response missing task UPID".to_string()))?;
+    // Deleting the source is only safe after confirmed import completion.
+    wait_for_task_completion(session, &config.node, upid, 600, source_unused).await?;
+
+    resize_vm_disk(session, config).await.map_err(|error| {
+        let message = match error {
+            Error::ProxmoxApi(message) => message,
+            other => other.to_string(),
+        };
+        Error::ProxmoxApi(format!(
+            "VM {} was created but its disk could not be resized: {}",
+            config.vm_id, message
+        ))
+    })
+}
+
+/// Apply an absolute size, including the minimum, so Proxmox checks the actual
+/// imported volume and rejects shrinking if a future HAOS image is larger.
+async fn resize_vm_disk(session: &ProxmoxSession, config: &ProxmoxVmConfig) -> Result<()> {
+    let url = format!(
+        "{}/api2/json/nodes/{}/qemu/{}/resize",
+        session.server_url.trim_end_matches('/'),
+        config.node,
+        config.vm_id
+    );
+    let client = create_client(60)?;
+    let response = client
+        .put(&url)
+        .header("Cookie", format!("PVEAuthCookie={}", session.ticket))
+        .header("CSRFPreventionToken", &session.csrf_token)
+        .form(&[
+            ("disk", "scsi0".to_string()),
+            ("size", format!("{}G", config.disk_size_gb)),
+        ])
+        .send()
+        .await
+        .map_err(|e| Error::ProxmoxApi(format!("Failed to resize VM disk: {}", e)))?;
+
+    let status = response.status();
+    let response_text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(Error::ProxmoxApi(format!(
+            "Failed to resize VM disk ({}): {}",
+            status, response_text
+        )));
     }
 
+    let json: serde_json::Value = serde_json::from_str(&response_text)
+        .map_err(|e| Error::ProxmoxApi(format!("Failed to parse disk resize response: {}", e)))?;
+    let upid = json
+        .get("data")
+        .and_then(|v| v.as_str())
+        .filter(|upid| !upid.is_empty())
+        .ok_or_else(|| Error::ProxmoxApi("Disk resize response missing task UPID".to_string()))?;
+
+    wait_for_task(session, &config.node, upid, 600).await
+}
+
+async fn delete_import_image(
+    session: &ProxmoxSession,
+    node: &str,
+    storage: &str,
+    filename: &str,
+) -> Result<()> {
+    let volume = format!("{storage}:import/{filename}");
+    let url = format!(
+        "{}/api2/json/nodes/{}/storage/{}/content/{}",
+        session.server_url.trim_end_matches('/'),
+        urlencoding::encode(node),
+        urlencoding::encode(storage),
+        urlencoding::encode(&volume)
+    );
+    let response = create_client(60)?
+        .delete(url)
+        .header("Cookie", format!("PVEAuthCookie={}", session.ticket))
+        .header("CSRFPreventionToken", &session.csrf_token)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Err(Error::ProxmoxApi(format!(
+            "Could not delete import volume {volume}: HTTP {}",
+            response.status()
+        )));
+    }
+    let json: serde_json::Value = response.json().await?;
+    let upid = json
+        .get("data")
+        .and_then(|value| value.as_str())
+        .filter(|upid| !upid.is_empty())
+        .ok_or_else(|| {
+            Error::ProxmoxApi("Import deletion response missing task UPID".to_string())
+        })?;
+    wait_for_task(session, node, upid, 120).await?;
     Ok(())
+}
+
+async fn import_and_cleanup_image(
+    session: &ProxmoxSession,
+    config: &ProxmoxVmConfig,
+    image_filename: &str,
+    storage_name: &str,
+) -> Result<()> {
+    let mut source_unused = false;
+    let result = create_vm_with_disk(
+        session,
+        config,
+        image_filename,
+        storage_name,
+        &mut source_unused,
+    )
+    .await;
+    // The request was rejected or the import task has stopped. Cleanup is
+    // best effort and must never replace the original installation result.
+    if source_unused {
+        if let Err(error) =
+            delete_import_image(session, &config.node, storage_name, image_filename).await
+        {
+            eprintln!(
+                "Temporary import cleanup for VM {} failed: {error}",
+                config.vm_id
+            );
+        }
+    }
+    result
 }
 
 /// Start a VM.
@@ -1211,11 +1467,14 @@ async fn wait_for_vm_ip(session: &ProxmoxSession, node: &str, vm_id: u32) -> Opt
 }
 
 /// Create a Home Assistant VM on Proxmox
-async fn create_vm<P: ProgressCallback>(
+async fn create_vm<B: ReleaseSource, P: ProgressCallback>(
+    backend: &B,
     session: &ProxmoxSession,
     config: &ProxmoxVmConfig,
     progress_callback: &P,
 ) -> Result<ProxmoxVmResult> {
+    validate_disk_size(config.disk_size_gb)?;
+
     // Step 1: Get HAOS release info
     progress_callback.on_progress(FlashProgress {
         stage: FlashStage::Downloading,
@@ -1225,18 +1484,8 @@ async fn create_vm<P: ProgressCallback>(
         message: "Fetching release info...".to_string(),
     });
 
-    // Get the stable version info
-    let stable_version = crate::download::get_stable_version().await?;
-
-    // Get the OVA version for Proxmox (generic x86-64 virtualization)
-    let haos_version = stable_version
-        .hassos
-        .get("ova")
-        .ok_or_else(|| Error::ProxmoxApi("No HAOS version found for OVA".to_string()))?;
-
-    // Look up the OVA image in the release to get its download URL.
-    // Use the OVA's own version rather than "latest", which may differ.
-    let release: HaosRelease = Backend.get_haos_release(haos_version).await?;
+    let release: HaosRelease = backend.get_latest_haos_release_for_board("ova").await?;
+    let haos_version = &release.version;
     let image: &HaosImage = release
         .image_for("ova", ImageFormat::Qcow2)
         .ok_or_else(|| {
@@ -1255,12 +1504,14 @@ async fn create_vm<P: ProgressCallback>(
         message: "Downloading HAOS image...".to_string(),
     });
 
-    let cache_dir = crate::download::get_cache_dir()?;
-    let compressed_filename = format!("haos_ova-{}.qcow2.xz", haos_version);
-    let compressed_path = cache_dir.join(&compressed_filename);
+    let cache_dir = backend.cache_dir()?;
+    let temporary_image =
+        crate::download::TemporaryImage::new(&cache_dir, crate::ImageFormat::Qcow2)?;
+    let compressed_path = temporary_image.archive_path();
 
     // Download the image
-    crate::download::download_image(&image.download_url, &compressed_path, progress_callback)
+    backend
+        .download_image(image, &compressed_path, progress_callback)
         .await?;
 
     // Step 3: Extract the compressed image
@@ -1272,10 +1523,11 @@ async fn create_vm<P: ProgressCallback>(
         message: "Extracting image...".to_string(),
     });
 
-    let extracted_filename = format!("haos_ova-{}.qcow2", haos_version);
-    let extracted_path = cache_dir.join(&extracted_filename);
+    let extracted_path = temporary_image.path();
 
-    crate::download::extract_xz(&compressed_path, &extracted_path, progress_callback).await?;
+    backend
+        .extract_temporary_image(&temporary_image, progress_callback)
+        .await?;
 
     let storage_name = recheck_before_upload(session, config, &extracted_path).await?;
 
@@ -1288,8 +1540,9 @@ async fn create_vm<P: ProgressCallback>(
         &storage_name,
     )
     .await?;
+    drop(temporary_image);
 
-    // Step 5: Create the VM with disk import
+    // Step 5: Create the VM with disk import and apply the selected size
     progress_callback.on_progress(FlashProgress {
         stage: FlashStage::Verifying,
         progress: 0,
@@ -1298,7 +1551,7 @@ async fn create_vm<P: ProgressCallback>(
         message: "Creating virtual machine...".to_string(),
     });
 
-    create_vm_with_disk(session, config, &image_filename, &storage_name).await?;
+    import_and_cleanup_image(session, config, &image_filename, &storage_name).await?;
 
     // Step 6: Start the VM if requested
     if config.auto_start {
@@ -1396,7 +1649,7 @@ impl ProxmoxBackend for Backend {
         config: &ProxmoxVmConfig,
         progress_callback: &P,
     ) -> Result<ProxmoxVmResult> {
-        create_vm(session, config, progress_callback).await
+        create_vm(self, session, config, progress_callback).await
     }
 }
 
@@ -1803,6 +2056,7 @@ mod tests {
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
@@ -1815,6 +2069,170 @@ mod tests {
 
             auth_mock.assert_async().await;
             version_mock.assert_async().await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn test_authenticate_two_factor() {
+            let challenge = format!(
+                "PVE:!tfa!{}:12345678::signature",
+                urlencoding::encode(r#"{"totp":true,"recovery":[1,2]}"#)
+            );
+            let unsupported = format!(
+                "PVE:!tfa!{}:12345678::signature",
+                urlencoding::encode(r#"{"webauthn":{},"recovery":[1]}"#)
+            );
+            let complete = serde_json::json!({
+                "ticket": "PVE:root@pam:12345678::complete",
+                "CSRFPreventionToken": "final-csrf",
+            });
+            let partial = serde_json::json!({"ticket": challenge, "NeedTFA": 1});
+
+            for (initial, code, second_status, second_data, error) in [
+                (
+                    partial.clone(),
+                    None,
+                    200,
+                    complete.clone(),
+                    Some("requires an authenticator"),
+                ),
+                (
+                    partial.clone(),
+                    Some("abc123"),
+                    200,
+                    complete.clone(),
+                    Some("valid numeric"),
+                ),
+                (partial.clone(), Some("123456"), 200, complete.clone(), None),
+                (
+                    serde_json::json!({"ticket": challenge}),
+                    Some("123456"),
+                    200,
+                    complete.clone(),
+                    None,
+                ),
+                (
+                    serde_json::json!({"NeedTFA": true}),
+                    None,
+                    200,
+                    complete.clone(),
+                    Some("did not offer TOTP"),
+                ),
+                (
+                    serde_json::json!({"NeedTFA": 1, "ticket": unsupported}),
+                    Some("123456"),
+                    200,
+                    complete.clone(),
+                    Some("not supported"),
+                ),
+                (
+                    serde_json::json!({"ticket": "PVE:!tfa!malformed:time::sig"}),
+                    Some("123456"),
+                    200,
+                    complete.clone(),
+                    Some("did not offer TOTP"),
+                ),
+                (
+                    partial.clone(),
+                    Some("123456"),
+                    401,
+                    serde_json::Value::Null,
+                    Some("rejected"),
+                ),
+                (
+                    partial.clone(),
+                    Some("123456"),
+                    503,
+                    serde_json::Value::Null,
+                    Some("HTTP 503"),
+                ),
+                (
+                    partial.clone(),
+                    Some("123456"),
+                    200,
+                    partial.clone(),
+                    Some("incomplete"),
+                ),
+                (
+                    partial.clone(),
+                    Some("123456"),
+                    200,
+                    serde_json::json!({"ticket": challenge}),
+                    Some("incomplete"),
+                ),
+                (
+                    serde_json::json!({"NeedTFA": 1, "ticket": "PVE:root@pam:time::partial", "CSRFPreventionToken": "partial-csrf"}),
+                    None,
+                    200,
+                    complete.clone(),
+                    Some("did not offer TOTP"),
+                ),
+            ] {
+                let mut server = Server::new_async().await;
+                let first = server
+                    .mock("POST", "/api2/json/access/ticket")
+                    .match_body(mockito::Matcher::AllOf(vec![
+                        mockito::Matcher::UrlEncoded("username".into(), "root@pam".into()),
+                        mockito::Matcher::UrlEncoded("password".into(), "password".into()),
+                        mockito::Matcher::UrlEncoded("new-format".into(), "1".into()),
+                    ]))
+                    .with_header("content-type", "application/json")
+                    .with_body(serde_json::json!({"data": initial}).to_string())
+                    .create_async()
+                    .await;
+                let sends_code = initial["ticket"] == challenge && code == Some("123456");
+                let second = server
+                    .mock("POST", "/api2/json/access/ticket")
+                    .match_header("cookie", mockito::Matcher::Missing)
+                    .match_body(mockito::Matcher::AllOf(vec![
+                        mockito::Matcher::UrlEncoded("username".into(), "root@pam".into()),
+                        mockito::Matcher::UrlEncoded("password".into(), "totp:123456".into()),
+                        mockito::Matcher::UrlEncoded("tfa-challenge".into(), challenge.clone()),
+                    ]))
+                    .with_status(second_status)
+                    .with_header("content-type", "application/json")
+                    .with_body(serde_json::json!({"data": second_data}).to_string())
+                    .expect(usize::from(sends_code))
+                    .create_async()
+                    .await;
+                let version = server
+                    .mock("GET", "/api2/json/version")
+                    .match_header("cookie", "PVEAuthCookie=PVE:root@pam:12345678::complete")
+                    .with_header("content-type", "application/json")
+                    .with_body(r#"{"data":{"version":"8.4.1"}}"#)
+                    .expect(usize::from(error.is_none()))
+                    .create_async()
+                    .await;
+                // Catch any attempt to send the partial ticket to the version API.
+                let partial_version = server
+                    .mock("GET", "/api2/json/version")
+                    .match_header("cookie", format!("PVEAuthCookie={challenge}").as_str())
+                    .expect(0)
+                    .create_async()
+                    .await;
+                let credentials = ProxmoxCredentials {
+                    server_url: server.url(),
+                    username: "root@pam".into(),
+                    password: "password".into(),
+                    totp: code.map(str::to_string),
+                };
+                let result = authenticate(&credentials).await;
+                if let Some(expected) = error {
+                    let err = result.unwrap_err();
+                    assert!(matches!(err, Error::ProxmoxTwoFactor(_)), "{err}");
+                    assert!(err.to_string().contains(expected), "{err}");
+                    assert!(!err.to_string().contains("signature"));
+                    assert!(!err.to_string().contains("123456"));
+                } else {
+                    let session = result.unwrap();
+                    assert_eq!(session.ticket, complete["ticket"]);
+                    assert_eq!(session.csrf_token, "final-csrf");
+                }
+                first.assert_async().await;
+                second.assert_async().await;
+                version.assert_async().await;
+                partial_version.assert_async().await;
+            }
         }
 
         #[tokio::test]
@@ -1834,6 +2252,7 @@ mod tests {
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "wrong-password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
@@ -1865,6 +2284,7 @@ mod tests {
                 server_url: server.url(),
                 username: "user@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
@@ -1921,6 +2341,7 @@ mod tests {
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
@@ -2393,8 +2814,72 @@ mod tests {
 
         #[tokio::test]
         #[serial]
-        async fn test_pre_install_checks_pass_on_healthy_server() {
+        async fn test_create_vm_digest_failure_after_healthy_preflight() {
             let mut server = Server::new_async().await;
+
+            struct ImageSource {
+                cache: tempfile::TempDir,
+                url: String,
+            }
+            impl ReleaseSource for ImageSource {
+                async fn get_device_manifest(&self) -> Result<crate::DeviceManifest> {
+                    unreachable!()
+                }
+                async fn get_haos_release(&self, _: &str) -> Result<HaosRelease> {
+                    unreachable!("must use OVA's board-specific release")
+                }
+                async fn get_latest_haos_release_for_board(
+                    &self,
+                    board: &str,
+                ) -> Result<HaosRelease> {
+                    assert_eq!(board, "ova");
+                    Ok(HaosRelease {
+                        version: "18.2".into(),
+                        images: vec![HaosImage {
+                            board: "ova".into(),
+                            format: ImageFormat::Qcow2,
+                            download_url: self.url.clone(),
+                            size: 8,
+                            digest: Some(format!("sha256:{}", "0".repeat(64))),
+                        }],
+                    })
+                }
+                async fn download_image<P: ProgressCallback>(
+                    &self,
+                    image: &HaosImage,
+                    dest: &std::path::Path,
+                    callback: &P,
+                ) -> Result<()> {
+                    assert_eq!(image.board, "ova");
+                    assert_eq!(image.format, ImageFormat::Qcow2);
+                    Backend.download_image(image, dest, callback).await
+                }
+                async fn extract_xz<P: ProgressCallback>(
+                    &self,
+                    _: &std::path::Path,
+                    _: &std::path::Path,
+                    _: &P,
+                ) -> Result<()> {
+                    panic!("unverified image reached extraction")
+                }
+                fn cache_dir(&self) -> Result<std::path::PathBuf> {
+                    Ok(self.cache.path().to_path_buf())
+                }
+            }
+            let backend = ImageSource {
+                cache: tempfile::tempdir().unwrap(),
+                url: format!("{}/image.xz", server.url()),
+            };
+            let asset_mock = server
+                .mock("GET", "/image.xz")
+                .with_body("tampered")
+                .create_async()
+                .await;
+            let no_upload = server
+                .mock("POST", Matcher::Any)
+                .expect(0)
+                .create_async()
+                .await;
 
             let nodes_mock = server
                 .mock("GET", "/api2/json/nodes")
@@ -2460,8 +2945,20 @@ mod tests {
                 auto_start: true,
             };
 
-            let result = pre_install_checks(&test_session(&server), &config, 400_000_000).await;
-            assert!(result.is_ok(), "unexpected error: {:?}", result.err());
+            let result = create_vm(
+                &backend,
+                &test_session(&server),
+                &config,
+                &crate::NoOpProgress,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(Error::ChecksumMismatch { .. })),
+                "unexpected result: {result:?}"
+            );
+            assert_eq!(std::fs::read_dir(backend.cache.path()).unwrap().count(), 0);
+            asset_mock.assert_async().await;
+            no_upload.assert_async().await;
 
             nodes_mock.assert_async().await;
             for mock in permission_mocks {
@@ -2638,6 +3135,7 @@ mod tests {
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
@@ -2676,6 +3174,7 @@ mod tests {
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
@@ -3031,7 +3530,14 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn test_create_vm_with_disk_success() {
+            for disk_size_gb in [32, 64, 128, 256, 512] {
+                check_create_vm_with_disk_size(disk_size_gb).await;
+            }
+        }
+
+        async fn check_create_vm_with_disk_size(disk_size_gb: u32) {
             let mut server = Server::new_async().await;
+            let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
             let vm_create_mock = server
                 .mock("POST", "/api2/json/nodes/pve/qemu")
@@ -3056,6 +3562,7 @@ mod tests {
                 .await;
 
             // Mock task completion
+            let create_requests = requests.clone();
             let task_mock = server
                 .mock(
                     "GET",
@@ -3063,15 +3570,38 @@ mod tests {
                 )
                 .with_status(200)
                 .with_header("content-type", "application/json")
-                .with_body(
-                    r#"{
-                        "data": {
-                            "status": "stopped",
-                            "exitstatus": "OK"
-                        }
-                    }"#,
-                )
+                .with_body_from_request(move |_| {
+                    create_requests.lock().unwrap().push("import complete");
+                    r#"{"data":{"status":"stopped","exitstatus":"OK"}}"#.into()
+                })
                 .expect_at_least(1)
+                .create_async()
+                .await;
+
+            let resize_requests = requests.clone();
+            let resize_mock = server
+                .mock("PUT", "/api2/json/nodes/pve/qemu/100/resize")
+                .match_header("Cookie", "PVEAuthCookie=test-ticket")
+                .match_header("CSRFPreventionToken", "test-csrf")
+                .match_body(Matcher::AllOf(vec![
+                    Matcher::UrlEncoded("disk".into(), "scsi0".into()),
+                    Matcher::UrlEncoded("size".into(), format!("{}G", disk_size_gb)),
+                ]))
+                .with_header("content-type", "application/json")
+                .with_body_from_request(move |_| {
+                    resize_requests.lock().unwrap().push("resize requested");
+                    r#"{"data":"resize-task"}"#.into()
+                })
+                .create_async()
+                .await;
+            let resize_task_requests = requests.clone();
+            let resize_task_mock = server
+                .mock("GET", "/api2/json/nodes/pve/tasks/resize-task/status")
+                .with_header("content-type", "application/json")
+                .with_body_from_request(move |_| {
+                    resize_task_requests.lock().unwrap().push("resize complete");
+                    r#"{"data":{"status":"stopped","exitstatus":"OK"}}"#.into()
+                })
                 .create_async()
                 .await;
 
@@ -3088,16 +3618,192 @@ mod tests {
                 storage: "local-lvm".to_string(),
                 cpu_cores: 2,
                 memory_mb: 2048,
-                disk_size_gb: 32,
+                disk_size_gb,
                 auto_start: false,
             };
 
-            let result =
-                create_vm_with_disk(&session, &config, "test-image.qcow2", "local-import").await;
+            let result = create_vm_with_disk(
+                &session,
+                &config,
+                "test-image.qcow2",
+                "local-import",
+                &mut false,
+            )
+            .await;
             assert!(result.is_ok());
 
             vm_create_mock.assert_async().await;
             task_mock.assert_async().await;
+            resize_mock.assert_async().await;
+            resize_task_mock.assert_async().await;
+            assert_eq!(
+                *requests.lock().unwrap(),
+                ["import complete", "resize requested", "resize complete"]
+            );
+        }
+
+        fn disk_test_config(disk_size_gb: u32) -> ProxmoxVmConfig {
+            ProxmoxVmConfig {
+                vm_id: 100,
+                name: "test-vm".into(),
+                node: "pve".into(),
+                storage: "local-lvm".into(),
+                cpu_cores: 2,
+                memory_mb: 2048,
+                disk_size_gb,
+                auto_start: true,
+            }
+        }
+
+        #[tokio::test]
+        async fn test_disk_minimum_rejected_before_download_or_creation() {
+            let session = ProxmoxSession {
+                server_url: "http://127.0.0.1:1".into(),
+                ticket: "test-ticket".into(),
+                csrf_token: "test-csrf".into(),
+            };
+            for size in [0, 1, 31] {
+                let config = disk_test_config(size);
+                let error = create_vm(&Backend, &session, &config, &crate::NoOpProgress)
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("at least 32 GiB"));
+                let mut source_unused = false;
+                let error = create_vm_with_disk(
+                    &session,
+                    &config,
+                    "haos.qcow2",
+                    "local",
+                    &mut source_unused,
+                )
+                .await
+                .unwrap_err();
+                assert!(error.to_string().contains("cannot shrink"));
+                assert!(source_unused);
+            }
+        }
+
+        #[tokio::test]
+        async fn test_disk_resize_failures_propagate_from_creation() {
+            for (status, body, task_status, expected_error) in [
+                (500, "Insufficient storage", None, "Insufficient storage"),
+                (403, "Permission denied", None, "Permission denied"),
+                (200, "invalid json", None, "parse disk resize response"),
+                (200, r#"{"data":null}"#, None, "missing task UPID"),
+                (200, r#"{"data":""}"#, None, "missing task UPID"),
+                (200, r#"{"data":12}"#, None, "missing task UPID"),
+                (
+                    200,
+                    r#"{"data":"resize-task"}"#,
+                    Some("shrinking disks is not supported"),
+                    "shrinking disks is not supported",
+                ),
+            ] {
+                let mut server = Server::new_async().await;
+                let create_mock = server
+                    .mock("POST", "/api2/json/nodes/pve/qemu")
+                    .with_header("content-type", "application/json")
+                    .with_body(r#"{"data":"create-task"}"#)
+                    .create_async()
+                    .await;
+                let create_task = server
+                    .mock("GET", "/api2/json/nodes/pve/tasks/create-task/status")
+                    .with_header("content-type", "application/json")
+                    .with_body(r#"{"data":{"status":"stopped","exitstatus":"OK"}}"#)
+                    .create_async()
+                    .await;
+                let resize_mock = server
+                    .mock("PUT", "/api2/json/nodes/pve/qemu/100/resize")
+                    .with_status(status)
+                    .with_body(body)
+                    .create_async()
+                    .await;
+                let resize_task = server
+                    .mock("GET", "/api2/json/nodes/pve/tasks/resize-task/status")
+                    .with_header("content-type", "application/json")
+                    .with_body(
+                        serde_json::json!({
+                            "data": {"status": "stopped", "exitstatus": task_status}
+                        })
+                        .to_string(),
+                    )
+                    .expect(usize::from(task_status.is_some()))
+                    .create_async()
+                    .await;
+                let session = ProxmoxSession {
+                    server_url: server.url(),
+                    ticket: "test-ticket".into(),
+                    csrf_token: "test-csrf".into(),
+                };
+                let delete = server
+                    .mock(
+                        "DELETE",
+                        "/api2/json/nodes/pve/storage/local/content/local%3Aimport%2Fhaos.qcow2",
+                    )
+                    .with_status(500)
+                    .create_async()
+                    .await;
+                let error = import_and_cleanup_image(
+                    &session,
+                    &disk_test_config(32),
+                    "haos.qcow2",
+                    "local",
+                )
+                .await
+                .unwrap_err();
+                assert!(error.to_string().contains(expected_error), "{error}");
+                assert!(error
+                    .to_string()
+                    .contains("VM 100 was created but its disk could not be resized"));
+                assert_eq!(error.to_string().matches("Proxmox API error:").count(), 1);
+                create_mock.assert_async().await;
+                create_task.assert_async().await;
+                resize_mock.assert_async().await;
+                resize_task.assert_async().await;
+                delete.assert_async().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn test_disk_resize_requires_successful_import() {
+            for body in [r#"{"data":null}"#, r#"{"data":"create-task"}"#] {
+                let mut server = Server::new_async().await;
+                let create_mock = server
+                    .mock("POST", "/api2/json/nodes/pve/qemu")
+                    .with_header("content-type", "application/json")
+                    .with_body(body)
+                    .create_async()
+                    .await;
+                let create_task = server
+                    .mock("GET", "/api2/json/nodes/pve/tasks/create-task/status")
+                    .with_header("content-type", "application/json")
+                    .with_body(r#"{"data":{"status":"stopped","exitstatus":"import failed"}}"#)
+                    .expect(usize::from(body.contains("create-task")))
+                    .create_async()
+                    .await;
+                let resize_mock = server
+                    .mock("PUT", "/api2/json/nodes/pve/qemu/100/resize")
+                    .expect(0)
+                    .create_async()
+                    .await;
+                let session = ProxmoxSession {
+                    server_url: server.url(),
+                    ticket: "test-ticket".into(),
+                    csrf_token: "test-csrf".into(),
+                };
+                assert!(create_vm_with_disk(
+                    &session,
+                    &disk_test_config(64),
+                    "haos.qcow2",
+                    "local",
+                    &mut false,
+                )
+                .await
+                .is_err());
+                create_mock.assert_async().await;
+                create_task.assert_async().await;
+                resize_mock.assert_async().await;
+            }
         }
 
         #[tokio::test]
@@ -3129,10 +3835,185 @@ mod tests {
                 auto_start: false,
             };
 
-            let result = create_vm_with_disk(&session, &config, "test-image.qcow2", "local").await;
+            let result =
+                create_vm_with_disk(&session, &config, "test-image.qcow2", "local", &mut false)
+                    .await;
             assert!(result.is_err());
 
             vm_create_mock.assert_async().await;
+        }
+
+        #[tokio::test]
+        async fn delete_import_image_requires_a_task_upid() {
+            for response in ["{}", r#"{"data":null}"#, r#"{"data":""}"#, r#"{"data":42}"#] {
+                let mut server = Server::new_async().await;
+                let delete = server
+                    .mock("DELETE", "/api2/json/nodes/pve/storage/local-import/content/local-import%3Aimport%2Fhai-image-unique.qcow2")
+                    .with_body(response)
+                    .create_async()
+                    .await;
+                let task = server
+                    .mock("GET", Matcher::Any)
+                    .expect(0)
+                    .create_async()
+                    .await;
+                let session = ProxmoxSession {
+                    server_url: server.url(),
+                    ticket: "test-ticket".into(),
+                    csrf_token: "test-csrf".into(),
+                };
+                let error =
+                    delete_import_image(&session, "pve", "local-import", "hai-image-unique.qcow2")
+                        .await
+                        .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("Import deletion response missing task UPID"));
+                delete.assert_async().await;
+                task.assert_async().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn import_cleanup_waits_for_completion_and_preserves_install_result() {
+            use std::sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc,
+            };
+            for cleanup_status in [200, 403, 500] {
+                let mut server = Server::new_async().await;
+                let completed = Arc::new(AtomicBool::new(false));
+                let task_completed = completed.clone();
+                let create = server
+                    .mock("POST", "/api2/json/nodes/pve/qemu")
+                    .with_body(r#"{"data":"import-task"}"#)
+                    .create_async()
+                    .await;
+                let task = server
+                    .mock("GET", "/api2/json/nodes/pve/tasks/import-task/status")
+                    .with_chunked_body(move |writer| {
+                        task_completed.store(true, Ordering::SeqCst);
+                        writer.write_all(br#"{"data":{"status":"stopped","exitstatus":"OK"}}"#)
+                    })
+                    .create_async()
+                    .await;
+                let resize = server
+                    .mock("PUT", "/api2/json/nodes/pve/qemu/100/resize")
+                    .with_body(r#"{"data":"resize-task"}"#)
+                    .create_async()
+                    .await;
+                let resize_task = server
+                    .mock("GET", "/api2/json/nodes/pve/tasks/resize-task/status")
+                    .with_body(r#"{"data":{"status":"stopped","exitstatus":"OK"}}"#)
+                    .create_async()
+                    .await;
+                let delete = server.mock("DELETE", "/api2/json/nodes/pve/storage/local-import/content/local-import%3Aimport%2Fhai-image-unique.qcow2")
+                    .match_header("cookie", "PVEAuthCookie=test-ticket")
+                    .match_header("CSRFPreventionToken", "test-csrf")
+                    .with_status(cleanup_status)
+                    .with_chunked_body(move |writer| {
+                        assert!(completed.load(Ordering::SeqCst), "deleted before import completion");
+                        writer.write_all(br#"{"data":"delete-task"}"#)
+                    }).create_async().await;
+                let cleanup_task = server
+                    .mock("GET", "/api2/json/nodes/pve/tasks/delete-task/status")
+                    .with_body(r#"{"data":{"status":"stopped","exitstatus":"OK"}}"#)
+                    .expect(if cleanup_status == 200 { 1 } else { 0 })
+                    .create_async()
+                    .await;
+                let session = ProxmoxSession {
+                    server_url: server.url(),
+                    ticket: "test-ticket".into(),
+                    csrf_token: "test-csrf".into(),
+                };
+                let config = ProxmoxVmConfig {
+                    vm_id: 100,
+                    name: "test-vm".into(),
+                    node: "pve".into(),
+                    storage: "local-lvm".into(),
+                    cpu_cores: 2,
+                    memory_mb: 2048,
+                    disk_size_gb: 32,
+                    auto_start: false,
+                };
+                import_and_cleanup_image(
+                    &session,
+                    &config,
+                    "hai-image-unique.qcow2",
+                    "local-import",
+                )
+                .await
+                .unwrap();
+                create.assert_async().await;
+                task.assert_async().await;
+                resize.assert_async().await;
+                resize_task.assert_async().await;
+                delete.assert_async().await;
+                cleanup_task.assert_async().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn failed_import_cleanup_requires_a_known_terminal_outcome() {
+            for (create_status, response, task_status, task_body, deletes) in [
+                (200, r#"{"data":null}"#, 200, "{}", 0),
+                (200, r#"{"data":""}"#, 200, "{}", 0),
+                (200, r#"{"data":"import-task"}"#, 503, "unavailable", 0),
+                (403, "denied", 200, "{}", 1),
+                (500, "unknown", 200, "{}", 0),
+                (408, "timeout", 200, "{}", 0),
+                (
+                    200,
+                    r#"{"data":"import-task"}"#,
+                    200,
+                    r#"{"data":{"status":"stopped","exitstatus":"disk full"}}"#,
+                    1,
+                ),
+            ] {
+                let mut server = Server::new_async().await;
+                server
+                    .mock("POST", "/api2/json/nodes/pve/qemu")
+                    .with_status(create_status)
+                    .with_body(response)
+                    .create_async()
+                    .await;
+                server
+                    .mock("GET", "/api2/json/nodes/pve/tasks/import-task/status")
+                    .with_status(task_status)
+                    .with_body(task_body)
+                    .create_async()
+                    .await;
+                let delete = server
+                    .mock("DELETE", Matcher::Any)
+                    .with_status(500)
+                    .expect(deletes)
+                    .create_async()
+                    .await;
+                let session = ProxmoxSession {
+                    server_url: server.url(),
+                    ticket: "test-ticket".into(),
+                    csrf_token: "test-csrf".into(),
+                };
+                let config = ProxmoxVmConfig {
+                    vm_id: 100,
+                    name: "test-vm".into(),
+                    node: "pve".into(),
+                    storage: "local-lvm".into(),
+                    cpu_cores: 2,
+                    memory_mb: 2048,
+                    disk_size_gb: 32,
+                    auto_start: false,
+                };
+                assert!(import_and_cleanup_image(
+                    &session,
+                    &config,
+                    "hai-image-unique.qcow2",
+                    "local-import"
+                )
+                .await
+                .is_err());
+                delete.assert_async().await;
+            }
         }
 
         #[tokio::test]
@@ -3390,6 +4271,7 @@ mod tests {
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
@@ -3421,6 +4303,7 @@ mod tests {
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
@@ -3466,6 +4349,7 @@ mod tests {
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
@@ -3514,6 +4398,7 @@ mod tests {
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
@@ -3569,6 +4454,7 @@ mod tests {
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
@@ -3600,6 +4486,7 @@ mod tests {
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
