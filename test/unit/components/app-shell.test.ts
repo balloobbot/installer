@@ -19,7 +19,6 @@ interface WizardShell extends HTMLElement {
   nextLabel: string;
   nextDisabled: boolean;
   hideFooter: boolean;
-  nextDisabled: boolean;
 }
 
 interface ErrorFlags {

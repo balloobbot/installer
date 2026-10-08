@@ -23,6 +23,8 @@ describe("confirmation release selection", () => {
       wizardState.setSelection("deviceConfig", {
         board,
         download_url: "unused",
+        minimum_storage_bytes: 16_000_000_000,
+        recommended_storage_bytes: 32_000_000_000,
       });
       mockTauriIpc((command, args) => {
         expect(command).to.equal("get_haos_release");
@@ -72,6 +74,8 @@ describe("confirmation release selection", () => {
     wizardState.setSelection("deviceConfig", {
       board: "rpi5-64",
       download_url: "unused",
+      minimum_storage_bytes: 16_000_000_000,
+      recommended_storage_bytes: 32_000_000_000,
     });
     mockTauriIpc(() => Promise.reject("Release lookup failed"));
     const view = await fixture(html`<confirmation-view></confirmation-view>`);
