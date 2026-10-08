@@ -394,6 +394,7 @@ fn write_to_device(
                 Error::ImageTooLarge {
                     written: device_size.map_or(bytes_written, |size| size.min(total_size)),
                     image_size: total_size,
+                    drive_size: device_size,
                 }
             } else {
                 map_device_io_error(e, device_path)
@@ -1096,6 +1097,7 @@ mod tests {
             Err(Error::ImageTooLarge {
                 written,
                 image_size,
+                ..
             }) => {
                 assert_eq!(written, RamDisk::SIZE);
                 assert_eq!(image_size, image_bytes);

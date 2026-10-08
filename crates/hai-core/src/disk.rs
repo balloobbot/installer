@@ -21,6 +21,10 @@ mod imp;
 #[path = "disk/windows/mod.rs"]
 mod imp;
 
+#[cfg(any(target_os = "windows", test))]
+#[path = "disk/windows/elevation.rs"]
+mod windows_elevation;
+
 // Pure logic behind the macOS write path, compiled under `test` on every
 // platform so the Linux-only backend test job covers it without shipping it
 // in non-macOS builds.
@@ -31,6 +35,10 @@ mod macos_logic;
 #[cfg(any(target_os = "macos", test))]
 #[path = "disk/macos/safety.rs"]
 mod macos_safety;
+
+#[cfg(any(target_os = "windows", test))]
+#[path = "disk/windows/transfer.rs"]
+mod windows_transfer;
 
 #[cfg(all(test, not(target_os = "macos")))]
 #[allow(dead_code)]
@@ -138,7 +146,7 @@ fn is_write_protected(io_err: &std::io::Error) -> bool {
 /// Map an I/O error from reading or writing the device onto an [`Error`]:
 /// a disconnect and write protection get their own errors, so the user is
 /// told what to do about them.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 fn device_io_error(io_err: std::io::Error) -> Error {
     if is_drive_disconnected(&io_err) {
         Error::DriveDisconnected
@@ -146,6 +154,32 @@ fn device_io_error(io_err: std::io::Error) -> Error {
         Error::WriteProtected
     } else {
         Error::Io(io_err)
+    }
+}
+
+/// Check known capacity before any destructive disk operation.
+pub fn ensure_image_fits(image_size: u64, drive_size: u64) -> Result<()> {
+    if image_size > drive_size {
+        return Err(Error::ImageTooLarge {
+            written: 0,
+            image_size,
+            drive_size: Some(drive_size),
+        });
+    }
+    Ok(())
+}
+
+// Also compiled in tests, which cover the Windows transfer on every platform
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+fn device_write_error(error: std::io::Error, written: u64, image_size: u64) -> Error {
+    if error.kind() == std::io::ErrorKind::StorageFull {
+        Error::ImageTooLarge {
+            written,
+            image_size,
+            drive_size: None,
+        }
+    } else {
+        device_io_error(error)
     }
 }
 
@@ -197,6 +231,14 @@ async fn write_image<P: ProgressCallback>(
 }
 
 impl DeviceBackend for Backend {
+    fn check_write_privileges(&self) -> Result<()> {
+        #[cfg(target_os = "windows")]
+        return windows_elevation::check_write_privileges();
+
+        #[cfg(not(target_os = "windows"))]
+        Ok(())
+    }
+
     async fn list_devices(&self) -> Result<Vec<BlockDevice>> {
         list_devices().await
     }
@@ -216,6 +258,49 @@ impl DeviceBackend for Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capacity_check_rejects_only_oversized_images() {
+        ensure_image_fits(1024, 1024).unwrap();
+        ensure_image_fits(512, 1024).unwrap();
+        assert!(matches!(
+            ensure_image_fits(2048, 1024),
+            Err(Error::ImageTooLarge {
+                written: 0,
+                image_size: 2048,
+                drive_size: Some(1024)
+            })
+        ));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn full_disk_write_retains_progress_and_size() {
+        #[cfg(target_os = "linux")]
+        let codes = [28, 28]; // ENOSPC
+        #[cfg(target_os = "windows")]
+        let codes = [39, 112]; // ERROR_HANDLE_DISK_FULL, ERROR_DISK_FULL
+        for code in codes {
+            assert!(matches!(
+                device_write_error(std::io::Error::from_raw_os_error(code), 10, 20),
+                Error::ImageTooLarge {
+                    written: 10,
+                    image_size: 20,
+                    drive_size: None
+                }
+            ));
+        }
+        assert!(matches!(
+            device_write_error(std::io::Error::other("unknown"), 10, 20),
+            Error::Io(_)
+        ));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn write_privileges_are_authorized_later_off_windows() {
+        Backend.check_write_privileges().unwrap();
+    }
 
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]

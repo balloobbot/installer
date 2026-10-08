@@ -1,4 +1,11 @@
+import {
+  installerError,
+  renderErrorHelp,
+  type InstallerError,
+} from "../../utils/installer-error.js";
 import { LitElement, html, css } from "lit";
+import { ViewAccessibility } from "../../utils/view-accessibility.js";
+import { InstallDiagnostics } from "../../utils/diagnostics.js";
 import { customElement, state } from "lit/decorators.js";
 import { proxmoxConnect } from "../../api/commands.js";
 import { wizardState } from "../../state/wizard-state.js";
@@ -6,8 +13,11 @@ import "@home-assistant/webawesome/dist/components/callout/callout.js";
 import type WaInput from "@home-assistant/webawesome/dist/components/input/input.js";
 import "@home-assistant/webawesome/dist/components/input/input.js";
 
+const INVALID_INPUT = "invalid_input";
+
 @customElement("proxmox-connect-view")
 export class ProxmoxConnectView extends LitElement {
+  protected readonly _accessibility = new ViewAccessibility(this);
   static styles = css`
     :host {
       display: flex;
@@ -72,7 +82,7 @@ export class ProxmoxConnectView extends LitElement {
       align-items: center;
       justify-content: center;
       flex-shrink: 0;
-      background-color: #f44336;
+      background-color: var(--ha-error-fill, #b30532);
     }
 
     .status-icon svg {
@@ -94,7 +104,7 @@ export class ProxmoxConnectView extends LitElement {
 
     .status-description {
       font-size: 0.8125rem;
-      color: var(--ha-secondary-text-color, #727272);
+      color: var(--ha-error-color, #b30532);
       margin: 0.25rem 0 0 0;
     }
   `;
@@ -109,19 +119,39 @@ export class ProxmoxConnectView extends LitElement {
   private _password = "";
 
   @state()
+  private _totp = "";
+
+  @state()
   private _connecting = false;
 
   @state()
   private _connected = false;
 
   @state()
-  private _error: string | null = null;
+  private _error: InstallerError | null = null;
+
+  connectedCallback() {
+    super.connectedCallback();
+
+    // Coming back from a later step: show who we're connected as, and keep
+    // the session so Next doesn't ask for the password again.
+    const { proxmoxSession, proxmoxUsername, proxmoxConnected } =
+      wizardState.getState().selections;
+    if (proxmoxSession) {
+      this._serverUrl = proxmoxSession.server_url;
+      this._username = proxmoxUsername ?? this._username;
+      this._connected = proxmoxConnected === true;
+    }
+  }
 
   /** Connect to Proxmox server. Returns true if successful. */
   async connect(): Promise<boolean> {
+    if (this._connected) {
+      return true;
+    }
+
     if (!this._serverUrl || !this._username || !this._password) {
-      this._error = "Please fill in all fields";
-      return false;
+      return this._validationError("Please fill in all fields");
     }
 
     // Validate URL format - must be HTTPS for security
@@ -129,46 +159,44 @@ export class ProxmoxConnectView extends LitElement {
     try {
       const parsed = new URL(url);
       if (parsed.protocol !== "https:") {
-        this._error =
-          "URL must use HTTPS (for example, https://192.168.1.100:8006)";
-        return false;
+        return this._validationError(
+          "URL must use HTTPS (for example, https://192.168.1.100:8006)"
+        );
       }
     } catch {
-      this._error =
-        "Enter a valid URL (for example, https://192.168.1.100:8006)";
-      return false;
+      return this._validationError(
+        "Enter a valid URL (for example, https://192.168.1.100:8006)"
+      );
     }
 
     this._connecting = true;
     this._error = null;
+    const diagnostics = new InstallDiagnostics("proxmox");
+    diagnostics.advance("connecting");
 
     try {
       const session = await proxmoxConnect({
         server_url: url,
         username: this._username,
         password: this._password,
+        totp: this._totp.trim() || undefined,
       });
 
       this._connected = true;
+      diagnostics.advance("complete");
 
       // Store session in wizard state
       wizardState.setSelection("proxmoxSession", session);
+      wizardState.setSelection("proxmoxUsername", this._username);
       wizardState.setSelection("proxmoxConnected", true);
       return true;
     } catch (error) {
-      // Tauri invoke errors can be strings, Error objects, or other types
-      if (typeof error === "string") {
-        this._error = error;
-      } else if (error instanceof Error) {
-        this._error = error.message;
-      } else if (error && typeof error === "object" && "message" in error) {
-        this._error = String((error as { message: unknown }).message);
-      } else {
-        this._error = String(error) || "Failed to connect to Proxmox";
-      }
+      if (this.isConnected) diagnostics.fail(error);
+      this._error = installerError(error, "Failed to connect to Proxmox");
       wizardState.setSelection("proxmoxConnected", false);
       return false;
     } finally {
+      this._totp = "";
       this._connecting = false;
     }
   }
@@ -199,9 +227,30 @@ export class ProxmoxConnectView extends LitElement {
     this._resetConnection();
   }
 
+  private async _validationError(message: string): Promise<false> {
+    // A local input problem: no installation help or report link needed
+    this._error = {
+      code: INVALID_INPUT,
+      message,
+      retryable: false,
+      details: {},
+    };
+    await this.updateComplete;
+    // An identical validation message does not trigger another Lit update.
+    if (this.isConnected) {
+      this.renderRoot.querySelector<HTMLElement>('[role="alert"]')?.focus();
+    }
+    return false;
+  }
+
   private _onPasswordChange(e: Event) {
     const input = e.target as WaInput;
     this._password = input.value ?? "";
+    this._resetConnection();
+  }
+
+  private _onTotpChange(e: Event) {
+    this._totp = (e.target as WaInput).value ?? "";
     this._resetConnection();
   }
 
@@ -223,10 +272,13 @@ export class ProxmoxConnectView extends LitElement {
       e.key === "Enter" &&
       fromTextField &&
       !e.isComposing &&
-      !this._connecting &&
-      !this._connected
+      !this._connecting
     ) {
-      void this.connect();
+      // Same path as the Next button, so the app shell's connecting guard
+      // applies and a successful login moves on to the next step.
+      this.dispatchEvent(
+        new CustomEvent("wizard-next", { bubbles: true, composed: true })
+      );
     }
   }
 
@@ -283,6 +335,18 @@ export class ProxmoxConnectView extends LitElement {
           ?disabled=${this._connecting}
         ></wa-input>
 
+        <wa-input
+          type="text"
+          input-id="totp"
+          label="Authenticator app code (optional)"
+          autocomplete="one-time-code"
+          inputmode="numeric"
+          .value=${this._totp}
+          @input=${this._onTotpChange}
+          @keydown=${this._onKeyDown}
+          ?disabled=${this._connecting}
+        ></wa-input>
+
         <wa-callout variant="neutral" appearance="plain" size="s">
           Proxmox uses a self-signed certificate by default, so the installer
           accepts the server's certificate without checking it. The connection
@@ -294,7 +358,7 @@ export class ProxmoxConnectView extends LitElement {
 
   private _renderError() {
     return html`
-      <div class="status-row">
+      <div class="status-row" role="alert">
         <div class="status-icon">
           <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
             <path
@@ -304,7 +368,10 @@ export class ProxmoxConnectView extends LitElement {
         </div>
         <div class="status-text">
           <p class="status-title">Connection failed</p>
-          <p class="status-description">${this._error}</p>
+          <p class="status-description" style="overflow-wrap: anywhere;">
+            ${this._error?.message}
+          </p>
+          ${this._error?.code === INVALID_INPUT ? "" : renderErrorHelp()}
         </div>
       </div>
     `;

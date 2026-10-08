@@ -1,4 +1,5 @@
 import { LitElement, html, css } from "lit";
+import { ViewAccessibility } from "../utils/view-accessibility.js";
 import { customElement } from "lit/decorators.js";
 
 import "@home-assistant/webawesome/dist/components/button/button.js";
@@ -14,6 +15,7 @@ export type InstallationPath =
 
 @customElement("path-selection-view")
 export class PathSelectionView extends LitElement {
+  protected readonly _accessibility = new ViewAccessibility(this);
   static styles = css`
     :host {
       display: flex;
@@ -86,13 +88,6 @@ export class PathSelectionView extends LitElement {
         <p class="subtitle">Select how you want to run Home Assistant</p>
 
         <div class="options-grid">
-          <option-card
-            title="Home Assistant hardware"
-            description="Home Assistant Green, Yellow, or Blue by Nabu Casa"
-            icon="ha-hardware"
-            @click=${() => this._onSelectPath("ha-hardware")}
-          ></option-card>
-
           <option-card
             title="Raspberry Pi & other boards"
             description="Single board computers like Raspberry Pi, ODROID, and more"

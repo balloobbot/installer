@@ -1,4 +1,6 @@
 import { LitElement, html, css } from "lit";
+import { ViewAccessibility } from "../../utils/view-accessibility.js";
+import { logFrontendError } from "../../utils/diagnostics.js";
 import { customElement, state } from "lit/decorators.js";
 import { wizardState, type WizardState } from "../../state/wizard-state.js";
 import {
@@ -14,6 +16,7 @@ import { getHaosRelease } from "../../api/commands.js";
 
 @customElement("proxmox-confirm-view")
 export class ProxmoxConfirmView extends LitElement {
+  protected readonly _accessibility = new ViewAccessibility(this);
   static styles = css`
     :host {
       display: flex;
@@ -148,10 +151,10 @@ export class ProxmoxConfirmView extends LitElement {
 
   private async _loadInfo() {
     try {
-      const release = await getHaosRelease();
+      const release = await getHaosRelease(undefined, "ova");
       this._haosVersion = release.version;
     } catch (error) {
-      console.error("Failed to load info:", error);
+      logFrontendError(error);
       this._haosVersion = "Unknown";
     }
   }
@@ -185,6 +188,9 @@ export class ProxmoxConfirmView extends LitElement {
             <p class="summary-label">Proxmox server</p>
             <p class="summary-value">Node: ${node}</p>
             <p class="summary-detail">Storage: ${storage}</p>
+            <p class="summary-detail">
+              Network bridge: ${selections.proxmoxBridge}
+            </p>
           </div>
         </div>
 
