@@ -239,9 +239,20 @@ fn verify_untrusted_chain(
     let parsed = rustls::server::ParsedCertificate::try_from(cert)?;
     rustls::client::verify_server_name(&parsed, server_name)?;
     if let Some(anchor) = intermediates.last() {
-        // WebPKI drops validity when converting a certificate to a trust anchor.
+        // Trust-anchor conversion drops issuer validity and signing restrictions.
         let (_, parsed) = x509_parser::parse_x509_certificate(anchor.as_ref())
             .map_err(|_| CertificateError::BadEncoding)?;
+        let is_ca = parsed
+            .basic_constraints()
+            .map_err(|_| CertificateError::BadEncoding)?
+            .is_some_and(|constraints| constraints.value.ca);
+        let forbids_signing = parsed
+            .key_usage()
+            .map_err(|_| CertificateError::BadEncoding)?
+            .is_some_and(|usage| !usage.value.key_cert_sign());
+        if !is_ca || forbids_signing {
+            return Err(CertificateError::InvalidPurpose.into());
+        }
         let validity = parsed.validity();
         let now = i128::from(now.as_secs());
         if now < i128::from(validity.not_before.timestamp()) {
@@ -732,6 +743,78 @@ mod tests {
                     assert!(result.is_err(), "{result:?}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn untrusted_final_intermediate_must_be_ca() {
+        for is_ca in [rcgen::IsCa::ExplicitNoCa, rcgen::IsCa::NoCa] {
+            assert_intermediate_signing_usage(is_ca, Vec::new(), false);
+        }
+    }
+
+    #[test]
+    fn untrusted_final_intermediate_must_allow_certificate_signing() {
+        assert_intermediate_signing_usage(
+            rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained),
+            vec![rcgen::KeyUsagePurpose::DigitalSignature],
+            false,
+        );
+    }
+
+    #[test]
+    fn untrusted_final_intermediate_accepts_ca_signing_usage() {
+        for usages in [Vec::new(), vec![rcgen::KeyUsagePurpose::KeyCertSign]] {
+            assert_intermediate_signing_usage(
+                rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained),
+                usages,
+                true,
+            );
+        }
+    }
+
+    fn assert_intermediate_signing_usage(
+        is_ca: rcgen::IsCa,
+        key_usages: Vec<rcgen::KeyUsagePurpose>,
+        allowed: bool,
+    ) {
+        let mut ca = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca.distinguished_name
+            .push(rcgen::DnType::CommonName, "Fixture root CA");
+        let root = rcgen::Issuer::new(ca.clone(), rcgen::KeyPair::generate().unwrap());
+        ca.distinguished_name = rcgen::DistinguishedName::new();
+        ca.distinguished_name
+            .push(rcgen::DnType::CommonName, "Fixture intermediate");
+        ca.is_ca = is_ca;
+        ca.key_usages = key_usages;
+        let key = rcgen::KeyPair::generate().unwrap();
+        let intermediate = ca.signed_by(&key, &root).unwrap();
+        let issuer = rcgen::Issuer::new(ca, key);
+        let leaf = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .signed_by(&rcgen::KeyPair::generate().unwrap(), &issuer)
+            .unwrap();
+        let intermediates = [intermediate.der().clone()];
+        let name = ServerName::try_from("localhost").unwrap();
+        let now = UnixTime::now();
+        let result = verify_untrusted_chain(leaf.der(), &intermediates, &name, &[], now);
+        assert_eq!(result.is_ok(), allowed, "chain verification: {result:?}");
+
+        // Force the platform's unknown-issuer result to exercise the fallback,
+        // regardless of which error a particular native trust store prioritizes.
+        let verifier = ProbeVerifier {
+            normal: Arc::new(UnknownIssuer),
+            result: Mutex::new(None),
+        };
+        assert!(verifier
+            .verify_server_cert(leaf.der(), &intermediates, &name, &[], now)
+            .is_err());
+        let result = verifier.result.lock().unwrap().take().unwrap();
+        if allowed {
+            assert_eq!(result.unwrap(), Some(fingerprint(leaf.der())));
+        } else {
+            assert!(result.is_err(), "must not offer approval: {result:?}");
         }
     }
 
