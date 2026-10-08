@@ -675,19 +675,8 @@ async fn enable_storage_import(
         )));
     }
 
-    // PVE versions return either null or an object for this synchronous update.
-    let json: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| request_error(e, "Failed to parse storage update response"))?;
-    if !json
-        .get("data")
-        .is_some_and(|data| data.is_null() || data.is_object())
-    {
-        return Err(Error::ProxmoxApi(
-            "Invalid storage update response".to_string(),
-        ));
-    }
+    // This synchronous endpoint writes configuration before returning success.
+    // Its unused response body must not erase attribution of an accepted change.
     Ok(true)
 }
 
@@ -3238,9 +3227,13 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn test_enable_storage_import_preserves_config_and_guards_update() {
+            let mut outcomes = Vec::new();
             for (status, body) in [
                 (200, r#"{"data":null}"#),
                 (200, r#"{"data":{"storage":"local","type":"dir"}}"#),
+                (200, ""),
+                (200, "not JSON"),
+                (200, r#"{"data":"unexpected shape"}"#),
                 (500, r#"{"message":"detected modified configuration"}"#),
                 (403, r#"{"message":"permission check failed"}"#),
                 (401, r#"{"message":"ticket expired"}"#),
@@ -3266,16 +3259,10 @@ mod tests {
                     .match_body("content=images%2Ciso%2Cbackup%2Csnippets%2Cimport&digest=0123456789abcdef0123456789abcdef01234567")
                     .with_status(status).with_body(body).expect(1).create_async().await;
                 let result = enable_storage_import(&test_session(&server), "pve", "local").await;
-                if status == 200 && body.contains("\"data\"") {
-                    assert!(result.unwrap());
-                } else if status == 200 {
-                    assert!(result
-                        .unwrap_err()
-                        .to_string()
-                        .contains("Invalid storage update response"));
-                } else if status == 401 {
+                outcomes.push((status, body, result.as_ref().is_ok_and(|changed| *changed)));
+                if status == 401 {
                     assert!(matches!(result.unwrap_err(), Error::ProxmoxSessionExpired));
-                } else {
+                } else if status != 200 {
                     assert!(result.unwrap_err().to_string().contains("Refresh storage"));
                 }
                 config.assert_async().await;
@@ -3283,6 +3270,12 @@ mod tests {
                 permission.assert_async().await;
                 update.assert_async().await;
             }
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|(status, _, changed)| *changed == (*status == 200)),
+                "unexpected mutation attribution: {outcomes:?}"
+            );
         }
 
         #[tokio::test]
