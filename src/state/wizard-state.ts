@@ -18,6 +18,8 @@ export interface WizardStep {
  */
 export interface WizardSelections {
   device?: string;
+  /** The current device picker has successfully refreshed board availability. */
+  deviceCatalogReady?: boolean;
   /** HAOS image of the selected device; its board picks the image to flash. */
   deviceConfig?: HaosConfig;
   /** Device id of the selected drive; also the path sent to the backend. */
@@ -56,6 +58,8 @@ export interface WizardSelections {
   proxmoxNode?: string;
   proxmoxStorage?: string;
   proxmoxVmId?: number;
+  /** Node and storage selections were verified by the current configure view. */
+  proxmoxConfigureReady?: boolean;
 
   [key: string]: unknown;
 }
@@ -154,6 +158,7 @@ class WizardStateStore {
       this.state = {
         ...this.state,
         currentStepIndex: this.state.currentStepIndex + 1,
+        selections: { ...this.state.selections, deviceCatalogReady: false },
       };
       this.notify();
     }
@@ -164,6 +169,7 @@ class WizardStateStore {
       this.state = {
         ...this.state,
         currentStepIndex: this.state.currentStepIndex - 1,
+        selections: { ...this.state.selections, deviceCatalogReady: false },
       };
       this.notify();
     }
@@ -174,6 +180,10 @@ class WizardStateStore {
       this.state = {
         ...this.state,
         currentStepIndex: index,
+        selections:
+          index === this.state.currentStepIndex
+            ? this.state.selections
+            : { ...this.state.selections, deviceCatalogReady: false },
       };
       this.notify();
     }

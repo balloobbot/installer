@@ -12,9 +12,11 @@ use crate::{Backend, ProgressCallback, ReleaseSource};
 use directories::ProjectDirs;
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex;
 
 /// Files owned by one installation attempt, never paths supplied by a caller.
 /// Clones keep background extraction alive until its file handles are closed.
@@ -289,6 +291,14 @@ fn check_space(path: &Path, required: u64, available: u64) -> Result<()> {
     Ok(())
 }
 
+const METADATA_TIMEOUT: Duration = Duration::from_secs(15);
+const CONNECTION_FAILURE_MESSAGE: &str =
+    "Cannot reach version.home-assistant.io. Check your internet connection and try again.";
+const GITHUB_CONNECTION_FAILURE_MESSAGE: &str =
+    "Cannot reach GitHub release information. Check your internet connection and try again.";
+static RELEASE_CACHE: LazyLock<Mutex<HashMap<String, HaosRelease>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// How often to send progress updates (every N bytes)
 const PROGRESS_UPDATE_INTERVAL: u64 = 10 * 1024 * 1024; // 10 MB
 
@@ -305,9 +315,25 @@ pub(crate) fn get_cache_dir() -> Result<PathBuf> {
 
 /// Fetch the device manifest
 async fn get_device_manifest() -> Result<DeviceManifest> {
-    // For now, return the manifest bundled with the installer
-    // TODO: Implement actual network fetch
-    Ok(crate::manifest::bundled_manifest())
+    get_device_manifest_from_url(VERSION_URL).await
+}
+
+async fn get_device_manifest_from_url(url: &str) -> Result<DeviceManifest> {
+    get_device_manifest_with_timeout(url, std::time::Duration::from_secs(30)).await
+}
+
+async fn get_device_manifest_with_timeout(
+    url: &str,
+    deadline: std::time::Duration,
+) -> Result<DeviceManifest> {
+    let stable = tokio::time::timeout(deadline, get_stable_version_from_url(url))
+        .await
+        .map_err(|_| Error::DownloadFailed("Timed out fetching device availability".into()))??;
+    let mut manifest = crate::manifest::bundled_manifest();
+    manifest
+        .devices
+        .retain(|device| stable.hassos.contains_key(&device.haos.board));
+    Ok(manifest)
 }
 
 /// Fetch the stable version info from Home Assistant (internal version with custom URL)
@@ -316,8 +342,10 @@ async fn get_stable_version_from_url(url: &str) -> Result<StableVersionInfo> {
     let response = client
         .get(url)
         .header("User-Agent", USER_AGENT)
+        .timeout(METADATA_TIMEOUT)
         .send()
-        .await?;
+        .await
+        .map_err(|error| metadata_request_error(error, CONNECTION_FAILURE_MESSAGE))?;
 
     if !response.status().is_success() {
         return Err(Error::DownloadFailed(format!(
@@ -326,13 +354,50 @@ async fn get_stable_version_from_url(url: &str) -> Result<StableVersionInfo> {
         )));
     }
 
-    let version_info: StableVersionInfo = response.json().await?;
+    let version_info: StableVersionInfo = response
+        .json()
+        .await
+        .map_err(|error| metadata_request_error(error, CONNECTION_FAILURE_MESSAGE))?;
     Ok(version_info)
+}
+
+fn metadata_request_error(error: reqwest::Error, message: &str) -> Error {
+    if error.is_timeout() || error.is_connect() {
+        Error::DownloadFailed(message.to_string())
+    } else {
+        error.into()
+    }
 }
 
 /// Fetch the stable version info from Home Assistant
 pub(crate) async fn get_stable_version() -> Result<StableVersionInfo> {
     get_stable_version_from_url(VERSION_URL).await
+}
+
+async fn check_connection_from_url(url: &str, timeout: Duration) -> Result<()> {
+    let response = reqwest::Client::new()
+        .get(url)
+        .header("User-Agent", USER_AGENT)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|_| Error::DownloadFailed(CONNECTION_FAILURE_MESSAGE.to_string()))?;
+    if !response.status().is_success() {
+        return Err(Error::DownloadFailed(format!(
+            "The Home Assistant version service is unavailable (HTTP {}). Try again later.",
+            response.status()
+        )));
+    }
+    response.json::<StableVersionInfo>().await.map_err(|error| {
+        if error.is_timeout() {
+            return Error::DownloadFailed(CONNECTION_FAILURE_MESSAGE.to_string());
+        }
+        Error::DownloadFailed(
+            "The Home Assistant version service returned an incomplete or invalid response. Check for a network sign-in page and try again."
+                .to_string(),
+        )
+    })?;
+    Ok(())
 }
 
 /// Get the latest stable HAOS version from the version API
@@ -386,10 +451,43 @@ async fn fetch_release_from_api(api_base_url: &str, version: &str) -> Result<Hao
         .get(format!("{}/tags/{}", api_base_url, version))
         .header("User-Agent", USER_AGENT)
         .header("Accept", "application/vnd.github.v3+json")
+        .timeout(METADATA_TIMEOUT)
         .send()
-        .await?;
+        .await
+        .map_err(|error| metadata_request_error(error, GITHUB_CONNECTION_FAILURE_MESSAGE))?;
 
     if !response.status().is_success() {
+        let status = response.status();
+        if status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        {
+            let headers = response.headers().clone();
+            let message = response.json::<serde_json::Value>().await.ok();
+            let rate_limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || headers
+                    .get("x-ratelimit-remaining")
+                    .is_some_and(|v| v == "0")
+                || headers.contains_key("retry-after")
+                || message
+                    .as_ref()
+                    .and_then(|v| v["message"].as_str())
+                    .is_some_and(|v| v.to_ascii_lowercase().contains("rate limit"));
+            if rate_limited {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let seconds = rate_limit_wait(&headers, now);
+                let minutes = seconds.div_ceil(60).max(1);
+                let unit = if minutes == 1 { "minute" } else { "minutes" };
+                return Err(Error::DownloadFailed(format!(
+                    "GitHub's request limit has been reached for this network. Wait at least {minutes} {unit}, then try again."
+                )));
+            }
+            return Err(Error::DownloadFailed(format!(
+                "GitHub refused access to release {version} (HTTP {status}). Try again later or check your network's access to GitHub."
+            )));
+        }
         return Err(Error::DownloadFailed(format!(
             "Failed to fetch release {}: HTTP {}",
             version,
@@ -397,13 +495,45 @@ async fn fetch_release_from_api(api_base_url: &str, version: &str) -> Result<Hao
         )));
     }
 
-    let release: GitHubRelease = response.json().await?;
+    let release: GitHubRelease = response
+        .json()
+        .await
+        .map_err(|error| metadata_request_error(error, GITHUB_CONNECTION_FAILURE_MESSAGE))?;
     parse_github_release(release)
+}
+
+fn rate_limit_wait(headers: &reqwest::header::HeaderMap, now: u64) -> u64 {
+    let number = |name: &str| headers.get(name)?.to_str().ok()?.parse::<u64>().ok();
+    let retry_after = number("retry-after").unwrap_or(0);
+    let reset = if headers
+        .get("x-ratelimit-remaining")
+        .is_some_and(|v| v == "0")
+    {
+        number("x-ratelimit-reset").unwrap_or(0).saturating_sub(now)
+    } else {
+        0
+    };
+    retry_after.max(reset).max(60)
+}
+
+async fn fetch_cached_release(
+    cache: &Mutex<HashMap<String, HaosRelease>>,
+    api_base_url: &str,
+    version: &str,
+) -> Result<HaosRelease> {
+    // Serialize misses so concurrent installations do not spend multiple API requests.
+    let mut cache = cache.lock().await;
+    if let Some(release) = cache.get(version) {
+        return Ok(release.clone());
+    }
+    let release = fetch_release_from_api(api_base_url, version).await?;
+    cache.insert(version.to_string(), release.clone());
+    Ok(release)
 }
 
 /// Fetch a specific HAOS release by version
 async fn fetch_release(version: &str) -> Result<HaosRelease> {
-    fetch_release_from_api(HAOS_RELEASES_API, version).await
+    fetch_cached_release(&RELEASE_CACHE, HAOS_RELEASES_API, version).await
 }
 
 /// Fetch HAOS release info for a specific version (or "latest")
@@ -480,7 +610,7 @@ pub fn parse_board_from_filename(filename: &str, version: &str) -> Result<String
 
 /// Require the SHA-256 digest supplied by GitHub's release metadata over HTTPS.
 /// Missing/unknown digests must never downgrade an installation to an XZ-only check.
-fn expected_sha256(image: &HaosImage) -> Result<[u8; 32]> {
+pub(crate) fn expected_sha256(image: &HaosImage) -> Result<[u8; 32]> {
     let digest = image.digest.as_deref().ok_or_else(|| {
         Error::VerificationFailed(
             "GitHub did not provide a SHA-256 digest for this image; installation stopped. Try again later.".to_string(),
@@ -635,10 +765,45 @@ fn read_xz(decoder: &mut impl std::io::Read, buffer: &mut [u8]) -> Result<usize>
     })
 }
 
+/// Reports extraction progress from the compressed bytes the decoder consumed.
+///
+/// Both passes of `extract_archive` read the whole archive, so each one fills
+/// half of the bar. The byte counter stays within the archive size, and 100%
+/// is left to the caller for when the output is synced and in place.
+struct ExtractionProgress<'a> {
+    sender: &'a std::sync::mpsc::Sender<FlashProgress>,
+    archive_size: u64,
+    last_percent: u8,
+}
+
+impl ExtractionProgress<'_> {
+    fn report(&mut self, pass: u64, consumed: u64) {
+        if self.archive_size == 0 {
+            return;
+        }
+
+        let consumed = consumed.min(self.archive_size);
+        let bytes_processed = (pass * self.archive_size + consumed) / 2;
+        let percent = ((bytes_processed as f64 / self.archive_size as f64 * 100.0) as u8).min(99);
+        if percent == self.last_percent {
+            return;
+        }
+
+        self.last_percent = percent;
+        let _ = self.sender.send(FlashProgress {
+            stage: FlashStage::Extracting,
+            progress: percent,
+            bytes_processed,
+            total_bytes: self.archive_size,
+            message: "Extracting image...".to_string(),
+        });
+    }
+}
+
 fn extract_archive(
     archive: &Path,
     destination: &Path,
-    progress: &std::sync::mpsc::Sender<u64>,
+    progress: &std::sync::mpsc::Sender<FlashProgress>,
     mut available_space: impl FnMut(&Path) -> std::io::Result<u64>,
     max_extracted_size: u64,
 ) -> Result<u64> {
@@ -648,6 +813,11 @@ fn extract_archive(
     })?;
     let available = available_space(directory)?;
     let mut input = std::fs::File::open(archive)?;
+    let mut progress = ExtractionProgress {
+        sender: progress,
+        archive_size: input.metadata()?.len(),
+        last_percent: 0,
+    };
     let mut buffer = [0; 64 * 1024];
     let mut expected_size = 0;
     {
@@ -660,6 +830,7 @@ fn extract_archive(
                 break;
             }
             expected_size += count as u64;
+            progress.report(0, decoder.total_in());
             check_space(directory, expected_size, available)?;
             if expected_size > max_extracted_size {
                 return Err(Error::ExtractionFailed(
@@ -673,7 +844,6 @@ fn extract_archive(
     let mut decoder = xz_decoder(&mut input)?;
     let mut output = tempfile::NamedTempFile::new_in(directory)?;
     let mut extracted = 0;
-    let mut last_progress = 0;
     loop {
         let count = read_xz(&mut decoder, &mut buffer)?;
         if count == 0 {
@@ -686,10 +856,7 @@ fn extract_archive(
             ));
         }
         output.write_all(&buffer[..count])?;
-        if extracted - last_progress >= PROGRESS_UPDATE_INTERVAL {
-            let _ = progress.send(extracted);
-            last_progress = extracted;
-        }
+        progress.report(1, decoder.total_in());
     }
     if extracted != expected_size {
         return Err(Error::ExtractionFailed(
@@ -728,17 +895,19 @@ async fn extract_xz_owned<P: ProgressCallback>(
 ) -> Result<()> {
     use std::sync::mpsc;
 
-    // Keep progress indeterminate during the bounded validation/size scan.
+    // Progress is measured against the compressed archive, which is the only
+    // size known up front. An empty or unreadable size keeps it indeterminate.
+    let archive_size = std::fs::metadata(archive_path).map_or(0, |metadata| metadata.len());
     progress_callback.on_progress(FlashProgress {
         stage: FlashStage::Extracting,
         progress: 0,
         bytes_processed: 0,
-        total_bytes: 0,
+        total_bytes: archive_size,
         message: "Extracting image...".to_string(),
     });
 
     // Create channel for progress updates
-    let (progress_tx, progress_rx) = mpsc::channel::<u64>();
+    let (progress_tx, progress_rx) = mpsc::channel();
 
     let archive_path_clone = archive_path.to_path_buf();
     let dest_path_clone = dest_path.to_path_buf();
@@ -762,16 +931,7 @@ async fn extract_xz_owned<P: ProgressCallback>(
     // Forward progress updates while waiting for extraction to complete
     loop {
         match progress_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(bytes_extracted) => {
-                // Use 0 for total_bytes to signal indeterminate progress
-                progress_callback.on_progress(FlashProgress {
-                    stage: FlashStage::Extracting,
-                    progress: 0, // Indeterminate
-                    bytes_processed: bytes_extracted,
-                    total_bytes: 0,
-                    message: "Extracting image...".to_string(),
-                });
-            }
+            Ok(progress) => progress_callback.on_progress(progress),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if extract_handle.is_finished() {
                     break;
@@ -783,15 +943,15 @@ async fn extract_xz_owned<P: ProgressCallback>(
         }
     }
 
-    let final_size = extract_handle
+    extract_handle
         .await
         .map_err(|e| Error::ExtractionFailed(e.to_string()))??;
 
     progress_callback.on_progress(FlashProgress {
         stage: FlashStage::Extracting,
         progress: 100,
-        bytes_processed: final_size,
-        total_bytes: final_size,
+        bytes_processed: archive_size,
+        total_bytes: archive_size,
         message: "Extraction complete".to_string(),
     });
 
@@ -799,6 +959,10 @@ async fn extract_xz_owned<P: ProgressCallback>(
 }
 
 impl ReleaseSource for Backend {
+    async fn check_connection(&self) -> Result<()> {
+        check_connection_from_url(VERSION_URL, METADATA_TIMEOUT).await
+    }
+
     async fn get_device_manifest(&self) -> Result<DeviceManifest> {
         get_device_manifest().await
     }
@@ -1070,7 +1234,8 @@ mod tests {
                 .to_string();
                 assert!(error.contains("need 10 bytes, but only 9 bytes"));
                 assert!(readings.next().is_none(), "every space guard must run");
-                assert!(rx.try_recv().is_err());
+                // The measuring pass fills at most half the bar; writing never started.
+                assert!(rx.try_iter().all(|progress| progress.progress <= 50));
                 assert_eq!(std::fs::read(&archive).unwrap(), data);
                 if existing_destination {
                     assert_eq!(std::fs::read(&destination).unwrap(), b"previous image");
@@ -1434,6 +1599,265 @@ mod tests {
     use crate::types::GitHubAsset;
     use serial_test::serial;
 
+    #[tokio::test]
+    async fn connection_check_reports_service_and_invalid_responses() {
+        let mut server = mockito::Server::new_async().await;
+        for (status, body, expected) in [
+            (503, "", "service is unavailable (HTTP 503"),
+            (200, "<html>Sign in</html>", "invalid response"),
+            (200, r#"{"hassos":{"rpi5-64":"18.3"}}"#, ""),
+        ] {
+            let mock = server
+                .mock("GET", "/stable.json")
+                .with_status(status)
+                .with_body(body)
+                .create_async()
+                .await;
+            let result = check_connection_from_url(
+                &format!("{}/stable.json", server.url()),
+                METADATA_TIMEOUT,
+            )
+            .await;
+            if expected.is_empty() {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(expected), "{error}");
+                assert!(!error.contains("No internet connection"));
+            }
+            mock.assert_async().await;
+            mock.remove_async().await;
+        }
+    }
+
+    async fn stalled_metadata_server(send_headers: bool) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/secret-not-for-display",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 1024];
+            let _ = socket.read(&mut buffer).await;
+            if send_headers {
+                socket.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{"
+                ).await.unwrap();
+            }
+            tokio::time::sleep(METADATA_TIMEOUT * 2).await;
+        });
+        (url, server)
+    }
+
+    #[tokio::test]
+    async fn connection_check_times_out_without_leaking_request_details() {
+        for send_headers in [false, true] {
+            let (url, server) = stalled_metadata_server(send_headers).await;
+            let result = check_connection_from_url(&url, Duration::from_millis(250))
+                .await
+                .unwrap_err()
+                .to_string();
+            server.abort();
+            let _ = server.await;
+            assert!(
+                result.contains("Check your internet connection"),
+                "headers sent: {send_headers}, {result}"
+            );
+            assert!(!result.contains("invalid response"));
+            assert!(!result.contains("secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_timeouts_do_not_leak_request_details() {
+        let mut checks = Vec::new();
+        for github in [false, true] {
+            for send_headers in [false, true] {
+                checks.push(tokio::spawn(async move {
+                    let (url, server) = stalled_metadata_server(send_headers).await;
+                    let error = if github {
+                        fetch_release_from_api(&url, "18.3").await.unwrap_err()
+                    } else {
+                        get_stable_version_from_url(&url).await.unwrap_err()
+                    };
+                    server.abort();
+                    let _ = server.await;
+                    let expected = if github {
+                        GITHUB_CONNECTION_FAILURE_MESSAGE
+                    } else {
+                        CONNECTION_FAILURE_MESSAGE
+                    };
+                    assert!(
+                        matches!(&error, Error::DownloadFailed(message) if message == expected)
+                    );
+                    assert!(!error.to_string().contains("secret"));
+                    assert!(!error.to_string().contains("127.0.0.1"));
+                }));
+            }
+        }
+        for check in checks {
+            check.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_connect_failures_are_safe_but_parse_errors_are_unchanged() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/secret", listener.local_addr().unwrap());
+        drop(listener);
+        for github in [false, true] {
+            let error = if github {
+                fetch_release_from_api(&url, "18.3").await.unwrap_err()
+            } else {
+                get_stable_version_from_url(&url).await.unwrap_err()
+            };
+            let expected = if github {
+                GITHUB_CONNECTION_FAILURE_MESSAGE
+            } else {
+                CONNECTION_FAILURE_MESSAGE
+            };
+            assert!(matches!(&error, Error::DownloadFailed(message) if message == expected));
+            assert!(!error.to_string().contains("secret"));
+
+            let mut server = mockito::Server::new_async().await;
+            let path = if github { "/tags/18.3" } else { "/" };
+            let response = server
+                .mock("GET", path)
+                .with_body("invalid json")
+                .create_async()
+                .await;
+            let error = if github {
+                fetch_release_from_api(&server.url(), "18.3")
+                    .await
+                    .unwrap_err()
+            } else {
+                get_stable_version_from_url(&server.url())
+                    .await
+                    .unwrap_err()
+            };
+            assert!(matches!(error, Error::Network(error) if error.is_decode()));
+            response.assert_async().await;
+        }
+    }
+
+    #[test]
+    fn rate_limit_timing_uses_longest_applicable_header() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        headers.insert("x-ratelimit-reset", "1120".parse().unwrap());
+        headers.insert("retry-after", "180".parse().unwrap());
+        assert_eq!(rate_limit_wait(&headers, 1000), 180);
+        headers.insert("retry-after", "invalid".parse().unwrap());
+        assert_eq!(rate_limit_wait(&headers, 1000), 120);
+        assert_eq!(rate_limit_wait(&headers, 2000), 60);
+        headers.insert("x-ratelimit-remaining", "42".parse().unwrap());
+        assert_eq!(rate_limit_wait(&headers, 1000), 60);
+        headers.insert("x-ratelimit-reset", "invalid".parse().unwrap());
+        assert_eq!(rate_limit_wait(&headers, 1000), 60);
+    }
+
+    #[tokio::test]
+    async fn release_rate_limits_and_forbidden_are_distinct() {
+        let mut server = mockito::Server::new_async().await;
+        for (status, remaining, body, expected) in [
+            (403, "0", "{}", "request limit"),
+            (429, "10", "not json", "request limit"),
+            (
+                403,
+                "10",
+                r#"{"message":"You have exceeded a secondary rate limit."}"#,
+                "request limit",
+            ),
+            (
+                403,
+                "10",
+                r#"{"message":"secret server detail"}"#,
+                "refused access",
+            ),
+        ] {
+            let mock = server
+                .mock("GET", "/tags/18.3")
+                .with_status(status)
+                .with_header("x-ratelimit-remaining", remaining)
+                .with_body(body)
+                .create_async()
+                .await;
+            let error = fetch_release_from_api(&server.url(), "18.3")
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains("secret server detail"));
+            mock.assert_async().await;
+            mock.remove_async().await;
+        }
+        let mock = server
+            .mock("GET", "/tags/18.3")
+            .with_status(403)
+            .with_header("retry-after", "121")
+            .create_async()
+            .await;
+        let error = fetch_release_from_api(&server.url(), "18.3")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("3 minutes"));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn release_cache_reuses_success_per_version_and_retries_failures() {
+        let mut server = mockito::Server::new_async().await;
+        let cache = Mutex::new(HashMap::new());
+        let failed = server
+            .mock("GET", "/tags/18.3")
+            .with_status(429)
+            .expect(1)
+            .create_async()
+            .await;
+        assert!(fetch_cached_release(&cache, &server.url(), "18.3")
+            .await
+            .is_err());
+        failed.assert_async().await;
+        failed.remove_async().await;
+        for version in ["18.3", "18.4"] {
+            let digest = format!("sha256:{}", "ab".repeat(32));
+            let download_url = format!("https://example.com/haos_rpi5-64-{version}.img.xz");
+            let mock = server
+                .mock("GET", format!("/tags/{version}").as_str())
+                .with_status(200)
+                .with_body(
+                    serde_json::json!({
+                        "tag_name": version,
+                        "assets": [{
+                            "name": format!("haos_rpi5-64-{version}.img.xz"),
+                            "size": 123,
+                            "browser_download_url": download_url,
+                            "digest": digest,
+                        }],
+                    })
+                    .to_string(),
+                )
+                .expect(1)
+                .create_async()
+                .await;
+            let url = server.url();
+            let (first, second) = tokio::join!(
+                fetch_cached_release(&cache, &url, version),
+                fetch_cached_release(&cache, &url, version)
+            );
+            for release in [first.unwrap(), second.unwrap()] {
+                assert_eq!(release.version, version);
+                let image = release.image_for("rpi5-64", ImageFormat::Raw).unwrap();
+                assert_eq!(image.download_url, download_url);
+                assert_eq!(image.digest.as_deref(), Some(digest.as_str()));
+            }
+            mock.assert_async().await;
+        }
+    }
+
     #[test]
     fn temporary_images_are_isolated_and_live_until_last_owner() {
         let cache = tempfile::tempdir().unwrap();
@@ -1607,11 +2031,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_device_manifest_returns_bundled() {
-        let manifest = get_device_manifest().await.unwrap();
+    async fn test_get_device_manifest_filters_runtime_boards_preserving_display_data() {
+        let mut server = mockito::Server::new_async().await;
+        let request = server
+            .mock("GET", "/stable.json")
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"hassos":{"rpi5-64":"18.3","odroid-n2":"18.2","future-board":"18.3"}}"#)
+            .create_async()
+            .await;
+        let manifest = get_device_manifest_from_url(&format!("{}/stable.json", server.url()))
+            .await
+            .unwrap();
         let bundled = crate::manifest::bundled_manifest();
         assert_eq!(manifest.version, bundled.version);
-        assert_eq!(manifest.devices.len(), bundled.devices.len());
+        let expected: Vec<_> = bundled
+            .devices
+            .into_iter()
+            .filter(|device| ["rpi5-64", "odroid-n2"].contains(&device.haos.board.as_str()))
+            .collect();
+        assert_eq!(
+            serde_json::to_value(manifest.devices).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        request.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_device_manifest_empty_runtime_catalog() {
+        let mut server = mockito::Server::new_async().await;
+        let request = server
+            .mock("GET", "/stable.json")
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"hassos":{}}"#)
+            .create_async()
+            .await;
+        let manifest = get_device_manifest_from_url(&format!("{}/stable.json", server.url()))
+            .await
+            .unwrap();
+        assert!(manifest.devices.is_empty());
+        request.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_device_manifest_bounds_stalled_headers_and_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for send_headers in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/stable.json", listener.local_addr().unwrap());
+            let (started, received) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1];
+                stream.read_exact(&mut request).await.unwrap();
+                if send_headers {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{").await.unwrap();
+                }
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+            });
+            let lookup = tokio::spawn(async move {
+                get_device_manifest_with_timeout(&url, std::time::Duration::from_secs(1)).await
+            });
+            let error = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                received.await.unwrap();
+                lookup.await.unwrap().unwrap_err()
+            })
+            .await
+            .expect("catalog request must have a total deadline");
+            server.abort();
+            let _ = server.await;
+            assert!(error
+                .to_string()
+                .contains("Timed out fetching device availability"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_device_manifest_does_not_fall_back_after_fetch_failure() {
+        let mut server = mockito::Server::new_async().await;
+        for (status, body) in [(503, "unavailable"), (200, r#"{"hassos":null}"#)] {
+            let request = server
+                .mock("GET", "/stable.json")
+                .with_status(status)
+                .with_header("content-type", "application/json")
+                .with_body(body)
+                .create_async()
+                .await;
+            assert!(
+                get_device_manifest_from_url(&format!("{}/stable.json", server.url()))
+                    .await
+                    .is_err()
+            );
+            request.assert_async().await;
+        }
     }
 
     #[test]
@@ -1628,12 +2140,9 @@ mod tests {
 
     #[test]
     fn test_parse_board_from_filename_qcow2() {
-        let result = parse_board_from_filename_with_suffix(
-            "haos_generic-x86-64-14.2.qcow2.xz",
-            "14.2",
-            ".qcow2.xz",
-        );
-        assert_eq!(result.unwrap(), "generic-x86-64");
+        let result =
+            parse_board_from_filename_with_suffix("haos_ova-14.2.qcow2.xz", "14.2", ".qcow2.xz");
+        assert_eq!(result.unwrap(), "ova");
 
         let result = parse_board_from_filename_with_suffix(
             "haos_generic-aarch64-14.2.qcow2.xz",
@@ -1670,7 +2179,7 @@ mod tests {
                     browser_download_url: "https://github.com/download/rpi5.img.xz".to_string(),
                 },
                 GitHubAsset {
-                    name: "haos_generic-x86-64-14.2.qcow2.xz".to_string(),
+                    name: "haos_ova-14.2.qcow2.xz".to_string(),
                     digest: None,
                     size: 600_000_000,
                     browser_download_url: "https://github.com/download/x86.qcow2.xz".to_string(),
@@ -1695,11 +2204,7 @@ mod tests {
         assert_eq!(rpi_image.size, 500_000_000);
 
         // Check x86 qcow2 image
-        let x86_image = parsed
-            .images
-            .iter()
-            .find(|i| i.board == "generic-x86-64")
-            .unwrap();
+        let x86_image = parsed.images.iter().find(|i| i.board == "ova").unwrap();
         assert_eq!(x86_image.format, ImageFormat::Qcow2);
         assert_eq!(x86_image.size, 600_000_000);
     }
@@ -1969,56 +2474,117 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_extract_xz_with_progress() {
         use std::io::Write;
-        use std::sync::{Arc, Mutex};
+        use std::sync::Mutex;
 
         struct TestProgressCallback {
-            calls: Arc<Mutex<Vec<FlashProgress>>>,
+            calls: Mutex<Vec<FlashProgress>>,
+            destination: PathBuf,
+            expected: Vec<u8>,
         }
 
         impl crate::ProgressCallback for TestProgressCallback {
             fn on_progress(&self, progress: FlashProgress) {
+                if progress.progress == 100 {
+                    assert_eq!(std::fs::read(&self.destination).unwrap(), self.expected);
+                }
                 self.calls.lock().unwrap().push(progress);
             }
         }
 
-        let cache_dir = get_cache_dir().unwrap();
-        // Create larger content to trigger progress updates (> 10MB)
-        let test_content = vec![0u8; 11 * 1024 * 1024]; // 11MB
-        let extracted_path = cache_dir.join("test_extracted_large.img");
-        let archive_path = cache_dir.join("test_archive_large.img.xz");
+        let mut seed = 1u32;
+        let incompressible: Vec<u8> = (0..256 * 1024)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect();
+        for content in [
+            Vec::new(),
+            b"tiny".to_vec(),
+            vec![0u8; 11 * 1024 * 1024],
+            incompressible,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let archive_path = directory.path().join("image.xz");
+            let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 1);
+            encoder.write_all(&content).unwrap();
+            let archive = encoder.finish().unwrap();
+            std::fs::write(&archive_path, &archive).unwrap();
+            let callback = TestProgressCallback {
+                calls: Mutex::new(Vec::new()),
+                destination: directory.path().join("image.img"),
+                expected: content,
+            };
 
-        // Create XZ compressed file
-        {
-            let file = std::fs::File::create(&archive_path).unwrap();
-            let mut encoder = xz2::write::XzEncoder::new(file, 1); // Use compression level 1 for speed
-            encoder.write_all(&test_content).unwrap();
-            encoder.finish().unwrap();
+            extract_xz(&archive_path, &callback.destination, &callback)
+                .await
+                .unwrap();
+
+            let calls = callback.calls.lock().unwrap();
+            assert_eq!(calls.first().unwrap().progress, 0);
+            assert_eq!(calls.last().unwrap().progress, 100);
+            assert_eq!(calls.last().unwrap().bytes_processed, archive.len() as u64);
+            assert!(calls[..calls.len() - 1].iter().all(|p| p.progress < 100));
+            assert!(calls.iter().all(|p| {
+                p.stage == FlashStage::Extracting
+                    && p.total_bytes == archive.len() as u64
+                    && p.bytes_processed <= p.total_bytes
+            }));
+            assert!(calls.windows(2).all(|pair| {
+                pair[0].progress <= pair[1].progress
+                    && pair[0].bytes_processed <= pair[1].bytes_processed
+            }));
+            if callback.expected.len() > 64 * 1024 {
+                assert!(calls.iter().any(|p| p.progress > 0 && p.progress < 99));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_extract_xz_failure_never_reports_complete() {
+        use std::io::Write;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Progress(Mutex<Vec<FlashProgress>>);
+        impl crate::ProgressCallback for Progress {
+            fn on_progress(&self, progress: FlashProgress) {
+                self.0.lock().unwrap().push(progress);
+            }
         }
 
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let callback = TestProgressCallback {
-            calls: calls.clone(),
-        };
-
-        // Extract with progress tracking
-        let result = extract_xz(&archive_path, &extracted_path, &callback).await;
-        assert!(result.is_ok());
-
-        // Verify we got progress callbacks
-        let progress_calls = calls.lock().unwrap();
-        assert!(!progress_calls.is_empty());
-        assert!(progress_calls.iter().any(|p| p.progress == 0)); // Start
-        assert!(progress_calls.iter().any(|p| p.progress == 100)); // End
-        assert!(progress_calls
-            .iter()
-            .all(|p| p.stage == FlashStage::Extracting));
-
-        // Cleanup
-        std::fs::remove_file(&archive_path).unwrap();
-        std::fs::remove_file(&extracted_path).unwrap();
+        for failure in ["truncated", "empty", "destination"] {
+            let directory = tempfile::tempdir().unwrap();
+            let archive_path = directory.path().join("image.xz");
+            let destination = directory.path().join("image.img");
+            let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 1);
+            encoder.write_all(&vec![0u8; 256 * 1024]).unwrap();
+            let mut archive = encoder.finish().unwrap();
+            if failure == "truncated" {
+                archive.truncate(archive.len() - 16);
+            } else if failure == "empty" {
+                archive.clear();
+            } else {
+                std::fs::create_dir(&destination).unwrap();
+            }
+            std::fs::write(&archive_path, &archive).unwrap();
+            let callback = Progress::default();
+            assert!(extract_xz(&archive_path, &destination, &callback)
+                .await
+                .is_err());
+            assert!(callback.0.lock().unwrap().iter().all(|p| p.progress < 100));
+            if failure != "destination" {
+                assert!(!archive_path.exists());
+                assert!(!destination.exists());
+            } else {
+                assert!(archive_path.exists());
+                assert!(destination.is_dir());
+            }
+        }
     }
 
     #[tokio::test]
@@ -2224,7 +2790,7 @@ mod tests {
                             "digest": "sha256:abc123"
                         },
                         {
-                            "name": "haos_generic-x86-64-14.2.qcow2.xz",
+                            "name": "haos_ova-14.2.qcow2.xz",
                             "size": 600000000,
                             "browser_download_url": "https://github.com/download/x86.qcow2.xz",
                             "digest": "sha256:def456"
@@ -2242,7 +2808,7 @@ mod tests {
             assert_eq!(release.version, "14.2");
             assert_eq!(release.images.len(), 2);
             assert!(release.images.iter().any(|i| i.board == "rpi5-64"));
-            assert!(release.images.iter().any(|i| i.board == "generic-x86-64"));
+            assert!(release.images.iter().any(|i| i.board == "ova"));
 
             mock.assert_async().await;
         }
@@ -2548,7 +3114,7 @@ mod tests {
                     "tag_name": "14.2",
                     "assets": [
                         {
-                            "name": "haos_generic-x86-64-14.2.qcow2.xz",
+                            "name": "haos_ova-14.2.qcow2.xz",
                             "size": 600000000,
                             "browser_download_url": "https://github.com/download/x86.qcow2.xz",
                             "digest": "sha256:qcow2hash"
@@ -2564,7 +3130,7 @@ mod tests {
 
             let release = result.unwrap();
             assert_eq!(release.images.len(), 1);
-            assert_eq!(release.images[0].board, "generic-x86-64");
+            assert_eq!(release.images[0].board, "ova");
             assert!(release.images[0].download_url.contains("qcow2"));
 
             mock.assert_async().await;

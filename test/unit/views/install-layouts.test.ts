@@ -23,6 +23,8 @@ describe("shared install layouts", () => {
       wizardState.setSelection("deviceConfig", {
         board: "rpi5-64",
         download_url: "https://example.test/image.xz",
+        minimum_storage_bytes: 16_000_000_000,
+        recommended_storage_bytes: 32_000_000_000,
       });
       wizardState.setSelection("proxmoxSession", {
         server_url: "https://pve:8006",
@@ -75,11 +77,16 @@ describe("shared install layouts", () => {
           await settle();
           expect(
             layout.shadowRoot!.querySelector("progress-bar")!.indeterminate
-          ).to.equal(flow === "sbc" ? total === 0 : stage === "extracting");
+          ).to.equal(
+            flow === "sbc" ? total === 0 : stage === "extracting" && total === 0
+          );
+          // Extraction is measurable once the compressed archive size is known
           expect(
             layout.shadowRoot!.querySelector(".percentage")?.textContent ?? ""
           ).to.equal(
-            (flow === "sbc" ? total > 0 : stage === "downloading") ? "50%" : ""
+            (flow === "sbc" ? total > 0 : stage === "downloading" || total > 0)
+              ? "50%"
+              : ""
           );
           expect(
             layout.shadowRoot!.querySelectorAll(".stage-dot.complete").length

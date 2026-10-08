@@ -60,6 +60,22 @@ pub struct FlashResult {
 // Device Commands
 // =============================================================================
 
+/// Check internet access before starting an installation flow.
+#[tauri::command]
+pub async fn check_connection() -> Result<(), String> {
+    Backend
+        .check_connection()
+        .await
+        .map_err(connection_error_message)
+}
+
+fn connection_error_message(error: hai_core::Error) -> String {
+    match error {
+        hai_core::Error::DownloadFailed(message) => message,
+        error => error.to_string(),
+    }
+}
+
 /// List all block devices
 #[tauri::command]
 pub async fn list_block_devices() -> Result<Vec<BlockDevice>, String> {
@@ -80,6 +96,7 @@ fn find_flash_target<'a>(
     devices: &'a [BlockDevice],
     device_id: &str,
     expected: &ExpectedDevice,
+    board: &str,
 ) -> Result<&'a BlockDevice, String> {
     let device = devices.iter().find(|d| d.id == device_id).ok_or_else(|| {
         format!(
@@ -100,6 +117,19 @@ fn find_flash_target<'a>(
             "The drive at {} is no longer the one you selected. It may have been \
              swapped for another device; please select your drive again.",
             device_id
+        ));
+    }
+
+    let config = hai_core::manifest::bundled_manifest()
+        .devices
+        .into_iter()
+        .find(|device| device.haos.board == board)
+        .ok_or_else(|| format!("No storage requirements found for board: {}", board))?
+        .haos;
+    if device.size < config.minimum_reported_storage_bytes() {
+        return Err(format!(
+            "The selected drive is too small. At least a {:.0} GB drive is required.",
+            config.minimum_storage_bytes as f64 / 1_000_000_000.0
         ));
     }
 
@@ -219,7 +249,12 @@ where
         .await
         .map_err(|e| format!("Failed to list devices: {}", e))?;
 
-    let device = find_flash_target(&device_list, &request.device_id, &request.expected_device)?;
+    let device = find_flash_target(
+        &device_list,
+        &request.device_id,
+        &request.expected_device,
+        &request.board,
+    )?;
 
     if image_size > device.size {
         return Err(format!(
@@ -265,12 +300,25 @@ where
 
 /// Get the latest HAOS release information
 #[tauri::command]
-pub async fn get_haos_release(version: Option<String>) -> Result<HaosRelease, String> {
-    let ver = version.as_deref().unwrap_or("latest");
-    Backend
-        .get_haos_release(ver)
-        .await
-        .map_err(|e| e.to_string())
+pub async fn get_haos_release(
+    version: Option<String>,
+    board: Option<String>,
+) -> Result<HaosRelease, String> {
+    release_for_selection(&Backend, version.as_deref(), board.as_deref()).await
+}
+
+async fn release_for_selection<B: ReleaseSource>(
+    backend: &B,
+    version: Option<&str>,
+    board: Option<&str>,
+) -> Result<HaosRelease, String> {
+    let release = match (version, board) {
+        (None | Some("latest"), Some(board)) => {
+            backend.get_latest_haos_release_for_board(board).await
+        }
+        (version, _) => backend.get_haos_release(version.unwrap_or("latest")).await,
+    };
+    release.map_err(|e| e.to_string())
 }
 
 /// Get the device manifest
@@ -296,6 +344,23 @@ pub fn get_system_info() -> Result<SystemInfo, String> {
 // UTM Commands (macOS only)
 // =============================================================================
 
+/// HAOS board for UTM, from the Mac's native architecture (also under
+/// Rosetta). The confirmation screen and the download must agree on it.
+fn utm_board() -> Result<&'static str, String> {
+    #[cfg(all(feature = "mock", not(target_os = "macos")))]
+    let arch = hai_core::utm::UtmArchitecture::X86_64;
+    #[cfg(any(not(feature = "mock"), target_os = "macos"))]
+    let arch = hai_core::utm::UtmArchitecture::host().map_err(|e| e.to_string())?;
+
+    Ok(arch.haos_board())
+}
+
+/// Get the release for the same board used by UTM downloads.
+#[tauri::command]
+pub async fn get_utm_haos_release() -> Result<HaosRelease, String> {
+    release_for_selection(&Backend, None, Some(utm_board()?)).await
+}
+
 /// Download the HAOS qcow2 image for UTM
 #[tauri::command]
 pub async fn download_utm_image(
@@ -309,13 +374,7 @@ pub async fn download_utm_image(
         .check_utm_status()
         .await
         .map_err(|e| e.to_string())?;
-    let arch = if cfg!(target_arch = "aarch64") {
-        "generic-aarch64"
-    } else {
-        "generic-x86-64"
-    };
-
-    let image = run_utm_download(&Backend, arch, &callback).await?;
+    let image = run_utm_download(&Backend, utm_board()?, &callback).await?;
     let path = image.path().to_string_lossy().into_owned();
     pending.0.lock().unwrap().insert(path.clone(), image);
     Ok(path)
@@ -473,6 +532,22 @@ pub async fn check_ha_updated(ip_address: String) -> bool {
 // Proxmox Commands
 // =============================================================================
 
+/// Preserve authentication failures so the configure view can offer reconnect.
+#[derive(Debug, serde::Serialize)]
+pub struct ProxmoxLookupError {
+    message: String,
+    session_expired: bool,
+}
+
+impl From<hai_core::Error> for ProxmoxLookupError {
+    fn from(error: hai_core::Error) -> Self {
+        Self {
+            message: error.to_string(),
+            session_expired: matches!(error, hai_core::Error::ProxmoxSessionExpired),
+        }
+    }
+}
+
 /// Connect to a Proxmox VE server
 #[tauri::command]
 pub async fn proxmox_connect(credentials: ProxmoxCredentials) -> Result<ProxmoxSession, String> {
@@ -484,11 +559,10 @@ pub async fn proxmox_connect(credentials: ProxmoxCredentials) -> Result<ProxmoxS
 
 /// List available nodes on Proxmox
 #[tauri::command]
-pub async fn proxmox_list_nodes(session: ProxmoxSession) -> Result<Vec<ProxmoxNode>, String> {
-    Backend
-        .list_nodes(&session)
-        .await
-        .map_err(|e| e.to_string())
+pub async fn proxmox_list_nodes(
+    session: ProxmoxSession,
+) -> Result<Vec<ProxmoxNode>, ProxmoxLookupError> {
+    Backend.list_nodes(&session).await.map_err(Into::into)
 }
 
 /// List available storage on a Proxmox node
@@ -496,20 +570,17 @@ pub async fn proxmox_list_nodes(session: ProxmoxSession) -> Result<Vec<ProxmoxNo
 pub async fn proxmox_list_storage(
     session: ProxmoxSession,
     node: String,
-) -> Result<Vec<ProxmoxStorage>, String> {
+) -> Result<Vec<ProxmoxStorage>, ProxmoxLookupError> {
     Backend
         .list_storage(&session, &node)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(Into::into)
 }
 
 /// Get the next available VM ID on Proxmox
 #[tauri::command]
-pub async fn proxmox_get_next_vm_id(session: ProxmoxSession) -> Result<u32, String> {
-    Backend
-        .get_next_vm_id(&session)
-        .await
-        .map_err(|e| e.to_string())
+pub async fn proxmox_get_next_vm_id(session: ProxmoxSession) -> Result<u32, ProxmoxLookupError> {
+    Backend.get_next_vm_id(&session).await.map_err(Into::into)
 }
 
 /// Create a Home Assistant VM on Proxmox
@@ -533,6 +604,42 @@ pub async fn proxmox_create_vm(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_proxmox_lookup_error_preserves_authentication_failure() {
+        let expired = ProxmoxLookupError::from(hai_core::Error::ProxmoxSessionExpired);
+        let value = tauri::ipc::InvokeError::from(expired).0;
+        assert_eq!(value["session_expired"], true);
+        assert!(value["message"].as_str().unwrap().contains("reconnect"));
+
+        let denied =
+            ProxmoxLookupError::from(hai_core::Error::ProxmoxApi("Access denied".to_string()));
+        let value = tauri::ipc::InvokeError::from(denied).0;
+        assert_eq!(value["session_expired"], false);
+        assert_eq!(value["message"], "Proxmox API error: Access denied");
+    }
+
+    #[test]
+    fn connection_error_message_unwraps_download_errors() {
+        let message =
+            "Cannot reach version.home-assistant.io. Check your internet connection and try again.";
+        let error = hai_core::Error::DownloadFailed(message.to_string());
+        assert_eq!(connection_error_message(error), message);
+    }
+
+    #[test]
+    fn connection_error_message_preserves_other_errors() {
+        assert_eq!(
+            connection_error_message(hai_core::Error::Cancelled),
+            "Operation cancelled"
+        );
+    }
+
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn check_connection_uses_mock_backend() {
+        assert!(check_connection().await.is_ok());
+    }
 
     #[test]
     fn write_error_message_shows_write_protection_without_a_prefix() {
@@ -563,7 +670,103 @@ mod tests {
 
     // ===== Manifest Tests =====
 
+    struct SelectionReleaseBackend;
+
+    impl ReleaseSource for SelectionReleaseBackend {
+        async fn check_connection(&self) -> hai_core::Result<()> {
+            unreachable!("release confirmation must not check connectivity")
+        }
+
+        async fn get_device_manifest(&self) -> hai_core::Result<DeviceManifest> {
+            unreachable!()
+        }
+
+        async fn get_haos_release(&self, version: &str) -> hai_core::Result<HaosRelease> {
+            Ok(HaosRelease {
+                version: format!("explicit:{version}"),
+                images: vec![],
+            })
+        }
+
+        async fn get_latest_haos_release_for_board(
+            &self,
+            board: &str,
+        ) -> hai_core::Result<HaosRelease> {
+            let version = match board {
+                "rpi5-64" => "18.3",
+                "odroid-n2" => "18.2",
+                "ova" => "18.1",
+                "generic-aarch64" | "generic-x86-64" => "18.0",
+                _ => return Err(hai_core::Error::DownloadFailed("Board unavailable".into())),
+            };
+            Ok(HaosRelease {
+                version: version.into(),
+                images: vec![],
+            })
+        }
+
+        async fn download_image<P: ProgressCallback>(
+            &self,
+            _: &hai_core::HaosImage,
+            _: &std::path::Path,
+            _: &P,
+        ) -> hai_core::Result<()> {
+            unreachable!("confirmation must not download")
+        }
+
+        async fn extract_xz<P: ProgressCallback>(
+            &self,
+            _: &std::path::Path,
+            _: &std::path::Path,
+            _: &P,
+        ) -> hai_core::Result<()> {
+            unreachable!("confirmation must not extract")
+        }
+
+        fn cache_dir(&self) -> hai_core::Result<std::path::PathBuf> {
+            unreachable!("confirmation must not create cache files")
+        }
+    }
+
     #[tokio::test]
+    async fn confirmation_release_uses_selected_board_in_staged_rollout() {
+        for (board, expected) in [
+            ("rpi5-64", "18.3"),
+            ("odroid-n2", "18.2"),
+            ("ova", "18.1"),
+            ("generic-aarch64", "18.0"),
+        ] {
+            for version in [None, Some("latest")] {
+                let release = release_for_selection(&SelectionReleaseBackend, version, Some(board))
+                    .await
+                    .unwrap();
+                assert_eq!(release.version, expected);
+            }
+        }
+        let error = release_for_selection(&SelectionReleaseBackend, None, Some("retired-board"))
+            .await
+            .unwrap_err();
+        assert!(error.contains("Board unavailable"));
+    }
+
+    #[tokio::test]
+    async fn confirmation_release_preserves_explicit_versions_and_boardless_calls() {
+        for (version, board, expected) in [
+            (Some("17.0"), Some("rpi5-64"), "explicit:17.0"),
+            (None, None, "explicit:latest"),
+        ] {
+            assert_eq!(
+                release_for_selection(&SelectionReleaseBackend, version, board)
+                    .await
+                    .unwrap()
+                    .version,
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "mock")]
     async fn test_get_manifest_returns_ok() {
         let result = get_manifest().await;
         assert!(result.is_ok());
@@ -572,6 +775,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "mock")]
     async fn test_get_manifest_has_devices() {
         let result = get_manifest().await;
         assert!(result.is_ok());
@@ -581,6 +785,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "mock")]
     async fn test_get_manifest_devices_have_valid_haos_config() {
         let result = get_manifest().await;
         assert!(result.is_ok());
@@ -694,28 +899,29 @@ mod tests {
     #[test]
     fn test_find_flash_target_accepts_removable_device() {
         let devices = [flash_target("/dev/sdb", true)];
-        let device = find_flash_target(&devices, "/dev/sdb", &expected()).unwrap();
+        let device = find_flash_target(&devices, "/dev/sdb", &expected(), "rpi5-64").unwrap();
         assert_eq!(device.id, "/dev/sdb");
     }
 
     #[test]
     fn test_find_flash_target_rejects_unknown_device() {
         let devices = [flash_target("/dev/sdb", true)];
-        let err = find_flash_target(&devices, "/dev/sdz", &expected()).unwrap_err();
+        let err = find_flash_target(&devices, "/dev/sdz", &expected(), "rpi5-64").unwrap_err();
         assert!(err.contains("not found"), "{err}");
     }
 
     #[test]
     fn test_find_flash_target_rejects_non_removable_device() {
         let devices = [flash_target("\\\\.\\PhysicalDrive1", false)];
-        let err = find_flash_target(&devices, "\\\\.\\PhysicalDrive1", &expected()).unwrap_err();
+        let err = find_flash_target(&devices, "\\\\.\\PhysicalDrive1", &expected(), "rpi5-64")
+            .unwrap_err();
         assert!(err.contains("not a removable drive"), "{err}");
     }
 
     #[test]
     fn test_find_flash_target_rejects_empty_device_id() {
         let devices = [flash_target("/dev/sdb", true)];
-        let err = find_flash_target(&devices, "", &expected()).unwrap_err();
+        let err = find_flash_target(&devices, "", &expected(), "rpi5-64").unwrap_err();
         assert!(err.contains("not found"), "{err}");
     }
 
@@ -723,7 +929,7 @@ mod tests {
     fn test_find_flash_target_rejects_different_device_at_same_path() {
         let mut device = flash_target("/dev/sdb", true);
         device.model = Some("Extreme".to_string());
-        let err = find_flash_target(&[device], "/dev/sdb", &expected()).unwrap_err();
+        let err = find_flash_target(&[device], "/dev/sdb", &expected(), "rpi5-64").unwrap_err();
         assert!(err.contains("no longer the one you selected"), "{err}");
     }
 
@@ -731,7 +937,43 @@ mod tests {
     fn test_find_flash_target_rejects_unknown_expected_size() {
         let devices = [flash_target("/dev/sdb", true)];
         let unknown = ExpectedDevice::default();
-        assert!(find_flash_target(&devices, "/dev/sdb", &unknown).is_err());
+        assert!(find_flash_target(&devices, "/dev/sdb", &unknown, "rpi5-64").is_err());
+    }
+
+    #[test]
+    fn test_find_flash_target_enforces_nominal_board_minimum() {
+        for size in [
+            8_000_000_000,
+            15_199_999_999,
+            15_200_000_000,
+            15_600_000_000,
+            15_931_539_456,
+            16_000_000_000,
+        ] {
+            let mut device = flash_target("/dev/sdb", true);
+            device.size = size;
+            let expected = ExpectedDevice {
+                size: Some(size),
+                ..Default::default()
+            };
+            let devices = [device];
+            let result = find_flash_target(&devices, "/dev/sdb", &expected, "rpi5-64");
+            if size < 15_200_000_000 {
+                let error = result.unwrap_err();
+                assert!(error.contains("too small"), "{error}");
+                assert!(error.contains("16 GB"), "{error}");
+            } else {
+                assert!(result.is_ok(), "{size}: {result:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_find_flash_target_rejects_missing_board_requirements() {
+        let devices = [flash_target("/dev/sdb", true)];
+        let error =
+            find_flash_target(&devices, "/dev/sdb", &expected(), "unknown-board").unwrap_err();
+        assert!(error.contains("No storage requirements"), "{error}");
     }
 
     struct PreflightBackend {
@@ -759,6 +1001,10 @@ mod tests {
     }
 
     impl ReleaseSource for PreflightBackend {
+        async fn check_connection(&self) -> hai_core::Result<()> {
+            panic!("must not check connectivity during flashing");
+        }
+
         async fn get_device_manifest(&self) -> hai_core::Result<DeviceManifest> {
             panic!("must not fetch a manifest");
         }
@@ -859,6 +1105,10 @@ mod mock_tests {
     }
 
     impl ReleaseSource for LifecycleBackend {
+        async fn check_connection(&self) -> hai_core::Result<()> {
+            panic!("must not check connectivity during installation");
+        }
+
         async fn get_device_manifest(&self) -> hai_core::Result<DeviceManifest> {
             BackendMock.get_device_manifest().await
         }
@@ -1170,6 +1420,10 @@ mod mock_tests {
     }
 
     impl ReleaseSource for DigestFailureBackend {
+        async fn check_connection(&self) -> hai_core::Result<()> {
+            panic!("must not check connectivity during installation");
+        }
+
         async fn get_device_manifest(&self) -> hai_core::Result<hai_core::DeviceManifest> {
             unreachable!()
         }
@@ -1241,7 +1495,7 @@ mod mock_tests {
         .await
         .unwrap_err();
         assert!(error.contains("Checksum mismatch"));
-        for board in ["generic-aarch64", "generic-x86-64"] {
+        for board in ["generic-aarch64", "ova"] {
             let error = run_utm_download(&backend, board, &NoOpProgress)
                 .await
                 .unwrap_err();
@@ -1302,12 +1556,62 @@ mod mock_tests {
     #[tokio::test]
     #[serial] // all share the mock cache directory
     async fn run_utm_download_returns_extracted_image() {
-        let image = run_utm_download(&BackendMock, "generic-aarch64", &NoOpProgress)
+        use hai_core::utm::UtmArchitecture;
+
+        for arch in [UtmArchitecture::Aarch64, UtmArchitecture::X86_64] {
+            let release = BackendMock
+                .get_latest_haos_release_for_board(arch.haos_board())
+                .await
+                .unwrap();
+            let image = release
+                .image_for(arch.haos_board(), ImageFormat::Qcow2)
+                .unwrap();
+            assert!(image
+                .download_url
+                .ends_with(&format!("haos_{}-16.3.qcow2.xz", arch.haos_board())));
+            let image = run_utm_download(&BackendMock, arch.haos_board(), &NoOpProgress)
+                .await
+                .unwrap();
+            let path = image.path();
+            assert!(path.exists());
+            drop(image);
+            assert!(!path.exists());
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(not(target_os = "macos"))]
+    async fn mock_utm_download_command_works_without_native_mac_architecture() {
+        use tauri::Manager;
+
+        // Off macOS the mock command uses the Intel OVA board without Rosetta
+        // detection; run_utm_download_returns_extracted_image covers that board.
+        let app = tauri::test::mock_app();
+        app.manage(PendingUtmImages::default());
+        let path = download_utm_image(Channel::new(|_| Ok(())), app.state())
             .await
             .unwrap();
-        let path = image.path();
-        assert!(path.exists());
-        drop(image);
-        assert!(!path.exists());
+        assert!(std::path::Path::new(&path).exists());
+        assert!(path.ends_with(".qcow2"));
+        assert!(app
+            .state::<PendingUtmImages>()
+            .0
+            .lock()
+            .unwrap()
+            .contains_key(&path));
+        discard_utm_image(path.clone(), app.state());
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn mock_release_preserves_raw_intel_image_without_inventing_qcow2() {
+        let release = BackendMock.get_haos_release("latest").await.unwrap();
+        assert!(release
+            .image_for("generic-x86-64", ImageFormat::Raw)
+            .is_some());
+        assert!(release
+            .image_for("generic-x86-64", ImageFormat::Qcow2)
+            .is_none());
     }
 }

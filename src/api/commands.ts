@@ -29,6 +29,14 @@ import type {
  */
 const MOCK_ALLOWED = import.meta.env.DEV;
 
+/** Check the Home Assistant version service before starting a flow. */
+export async function checkConnection(): Promise<void> {
+  if (MOCK_ALLOWED && isBrowserOnly()) {
+    return;
+  }
+  return invoke<void>("check_connection");
+}
+
 function isBrowserOnly(): boolean {
   return typeof window !== "undefined" && !("__TAURI__" in window);
 }
@@ -198,27 +206,45 @@ export async function getManifest(): Promise<DeviceManifest> {
 }
 
 /**
- * Format bytes to a human-readable string.
+ * Format bytes using decimal units, matching storage manufacturers.
  */
 export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "Unknown size";
   if (bytes === 0) return "0 B";
 
-  const k = 1024;
+  const k = 1000;
   const sizes = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  const i = Math.max(
+    0,
+    Math.min(sizes.length - 1, Math.floor(Math.log(bytes) / Math.log(k)))
+  );
 
-  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
+  // Do not round a drive just below a capacity threshold up to that threshold.
+  const value = Math.floor((bytes / Math.pow(k, i)) * 10) / 10;
+  return `${value} ${sizes[i]}`;
 }
 
 /**
  * Get HAOS release information.
  * @param version Optional specific version to fetch (defaults to latest stable)
+ * @param board Board whose stable release should be shown
  */
-export async function getHaosRelease(version?: string): Promise<HaosRelease> {
+export async function getHaosRelease(
+  version?: string,
+  board?: string
+): Promise<HaosRelease> {
   if (MOCK_ALLOWED && isBrowserOnly()) {
     return MOCK_HAOS_RELEASE;
   }
-  return invoke<HaosRelease>("get_haos_release", { version });
+  return invoke<HaosRelease>("get_haos_release", { version, board });
+}
+
+/** Get the stable release for the backend's UTM download architecture. */
+export async function getUtmHaosRelease(): Promise<HaosRelease> {
+  if (MOCK_ALLOWED && isBrowserOnly()) {
+    return MOCK_HAOS_RELEASE;
+  }
+  return invoke<HaosRelease>("get_utm_haos_release");
 }
 
 // ============================================================================

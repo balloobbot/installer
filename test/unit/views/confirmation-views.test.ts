@@ -26,7 +26,10 @@ describe("installation confirmation views", () => {
         wizardState.setSelection("deviceConfig", MOCK_MANIFEST.devices[0].haos);
         wizardState.setSelection("vmName", "Test Home Assistant");
         mockTauriIpc((cmd) => {
-          expect(cmd).to.equal("get_haos_release");
+          // UTM asks for the release of the board its download will use
+          expect(cmd).to.equal(
+            flow === "vm" ? "get_utm_haos_release" : "get_haos_release"
+          );
           return failRelease
             ? Promise.reject("Release unavailable")
             : MOCK_HAOS_RELEASE;
