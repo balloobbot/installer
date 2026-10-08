@@ -475,6 +475,15 @@ pub async fn check_ha_updated(ip_address: String) -> bool {
 // Proxmox Commands
 // =============================================================================
 
+/// Inspect server trust without sending credentials or an HTTP request.
+#[tauri::command]
+pub async fn proxmox_certificate_fingerprint(server_url: String) -> Result<Option<String>, String> {
+    Backend
+        .certificate_fingerprint(&server_url)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Connect to a Proxmox VE server
 #[tauri::command]
 pub async fn proxmox_connect(credentials: ProxmoxCredentials) -> Result<ProxmoxSession, String> {
@@ -535,6 +544,48 @@ pub async fn proxmox_create_vm(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_proxmox_certificate_rejects_http() {
+        let result = proxmox_certificate_fingerprint("http://127.0.0.1:1".into()).await;
+        assert!(result.unwrap_err().contains("HTTPS"));
+    }
+
+    #[cfg(not(feature = "mock"))]
+    #[tokio::test]
+    async fn test_proxmox_certificate_policy_applies_to_direct_login_and_session_commands() {
+        let credentials = ProxmoxCredentials {
+            server_url: "http://127.0.0.1:1".into(),
+            username: "fixture".into(),
+            password: "fixture".into(),
+            certificate_sha256: None,
+        };
+        assert!(proxmox_connect(credentials)
+            .await
+            .unwrap_err()
+            .contains("HTTPS"));
+        let session = ProxmoxSession {
+            server_url: "http://127.0.0.1:1".into(),
+            ticket: "fixture".into(),
+            csrf_token: "fixture".into(),
+            certificate_sha256: None,
+        };
+        assert!(proxmox_list_nodes(session)
+            .await
+            .unwrap_err()
+            .contains("HTTPS"));
+    }
+
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn test_proxmox_certificate_mock_does_not_connect() {
+        assert_eq!(
+            proxmox_certificate_fingerprint("https://127.0.0.1:1".into())
+                .await
+                .unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn write_error_message_shows_write_protection_without_a_prefix() {

@@ -188,6 +188,8 @@ export interface UtmVmConfig {
 
 /** Proxmox connection credentials */
 export interface ProxmoxCredentials {
+  /** Explicitly approved leaf certificate fingerprint for this login. */
+  certificate_sha256?: string;
   /** Proxmox server URL (e.g., https://192.168.1.100:8006) */
   server_url: string;
   /** Username (e.g., root@pam) */
@@ -198,6 +200,8 @@ export interface ProxmoxCredentials {
 
 /** Proxmox session (authentication result) */
 export interface ProxmoxSession {
+  /** Enforced for every API request in this session, when explicitly approved. */
+  certificate_sha256?: string;
   /** Server URL for the session */
   server_url: string;
   /** Authentication ticket */

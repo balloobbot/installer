@@ -113,7 +113,13 @@ function createInitialState(): WizardState {
 
 class WizardStateStore {
   private state: WizardState = createInitialState();
+  private _flowGeneration = 0;
   private listeners: Set<WizardStateListener> = new Set();
+
+  /** Identifies a flow across navigation and selection updates. */
+  get flowGeneration(): number {
+    return this._flowGeneration;
+  }
 
   getState(): WizardState {
     return this.state;
@@ -129,6 +135,7 @@ class WizardStateStore {
   }
 
   startFlow(flow: WizardFlow) {
+    this._flowGeneration++;
     this.state = {
       currentFlow: flow,
       currentStepIndex: 0,
@@ -183,6 +190,7 @@ class WizardStateStore {
   }
 
   reset() {
+    this._flowGeneration++;
     this.state = createInitialState();
     this.notify();
   }

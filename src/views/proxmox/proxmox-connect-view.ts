@@ -1,10 +1,16 @@
 import { LitElement, html, css } from "lit";
 import { customElement, state } from "lit/decorators.js";
-import { proxmoxConnect } from "../../api/commands.js";
+import {
+  proxmoxCertificateFingerprint,
+  proxmoxConnect,
+} from "../../api/commands.js";
 import { wizardState } from "../../state/wizard-state.js";
 import "@home-assistant/webawesome/dist/components/callout/callout.js";
 import type WaInput from "@home-assistant/webawesome/dist/components/input/input.js";
 import "@home-assistant/webawesome/dist/components/input/input.js";
+import "@home-assistant/webawesome/dist/components/dialog/dialog.js";
+import "@home-assistant/webawesome/dist/components/button/button.js";
+import "@home-assistant/webawesome/dist/components/checkbox/checkbox.js";
 
 @customElement("proxmox-connect-view")
 export class ProxmoxConnectView extends LitElement {
@@ -52,6 +58,19 @@ export class ProxmoxConnectView extends LitElement {
 
     wa-callout {
       padding: 0;
+    }
+
+    wa-dialog {
+      --width: 34rem;
+    }
+    .certificate-host,
+    .fingerprint {
+      overflow-wrap: anywhere;
+    }
+    .fingerprint {
+      font-family: monospace;
+      font-size: 0.875rem;
+      line-height: 1.6;
     }
 
     .status-row {
@@ -117,6 +136,15 @@ export class ProxmoxConnectView extends LitElement {
   @state()
   private _error: string | null = null;
 
+  @state()
+  private _certificate: { url: string; fingerprint: string } | null = null;
+
+  @state()
+  private _certificateCompared = false;
+
+  private _resolveCertificate?: (confirmed: boolean) => void;
+  private _connectionAttempt = 0;
+
   connectedCallback() {
     super.connectedCallback();
 
@@ -131,12 +159,27 @@ export class ProxmoxConnectView extends LitElement {
     }
   }
 
+  disconnectedCallback() {
+    super.disconnectedCallback();
+    this._connectionAttempt++;
+    this._connecting = false;
+    this._finishCertificate(false);
+  }
+
+  private _finishCertificate(confirmed: boolean) {
+    this._resolveCertificate?.(confirmed && this._certificateCompared);
+    this._resolveCertificate = undefined;
+    this._certificate = null;
+    this._certificateCompared = false;
+  }
+
   /** Connect to Proxmox server. Returns true if successful. */
   async connect(): Promise<boolean> {
     if (this._connected) {
       return true;
     }
 
+    if (this._connecting) return false;
     if (!this._serverUrl || !this._username || !this._password) {
       this._error = "Please fill in all fields";
       return false;
@@ -151,6 +194,17 @@ export class ProxmoxConnectView extends LitElement {
           "URL must use HTTPS (for example, https://192.168.1.100:8006)";
         return false;
       }
+      if (
+        parsed.username ||
+        parsed.password ||
+        parsed.pathname !== "/" ||
+        parsed.search ||
+        parsed.hash
+      ) {
+        this._error =
+          "Use a server URL without credentials, a path, query, or fragment";
+        return false;
+      }
     } catch {
       this._error =
         "Enter a valid URL (for example, https://192.168.1.100:8006)";
@@ -159,13 +213,31 @@ export class ProxmoxConnectView extends LitElement {
 
     this._connecting = true;
     this._error = null;
+    const attempt = ++this._connectionAttempt;
+    const flowGeneration = wizardState.flowGeneration;
+    const isCurrent = () =>
+      this.isConnected &&
+      attempt === this._connectionAttempt &&
+      flowGeneration === wizardState.flowGeneration;
 
     try {
+      const fingerprint = await proxmoxCertificateFingerprint(url);
+      if (!isCurrent()) return false;
+      if (fingerprint) {
+        this._certificateCompared = false;
+        this._certificate = { url, fingerprint };
+        const confirmed = await new Promise<boolean>((resolve) => {
+          this._resolveCertificate = resolve;
+        });
+        if (!confirmed || !isCurrent()) return false;
+      }
       const session = await proxmoxConnect({
         server_url: url,
         username: this._username,
         password: this._password,
+        ...(fingerprint ? { certificate_sha256: fingerprint } : {}),
       });
+      if (!isCurrent()) return false;
 
       this._connected = true;
 
@@ -175,6 +247,7 @@ export class ProxmoxConnectView extends LitElement {
       wizardState.setSelection("proxmoxConnected", true);
       return true;
     } catch (error) {
+      if (!isCurrent()) return false;
       // Tauri invoke errors can be strings, Error objects, or other types
       if (typeof error === "string") {
         this._error = error;
@@ -188,7 +261,7 @@ export class ProxmoxConnectView extends LitElement {
       wizardState.setSelection("proxmoxConnected", false);
       return false;
     } finally {
-      this._connecting = false;
+      if (attempt === this._connectionAttempt) this._connecting = false;
     }
   }
 
@@ -200,7 +273,14 @@ export class ProxmoxConnectView extends LitElement {
     try {
       const url = this._serverUrl.trim();
       const parsed = new URL(url);
-      return parsed.protocol === "https:";
+      return (
+        parsed.protocol === "https:" &&
+        !parsed.username &&
+        !parsed.password &&
+        parsed.pathname === "/" &&
+        !parsed.search &&
+        !parsed.hash
+      );
     } catch {
       return false;
     }
@@ -304,13 +384,50 @@ export class ProxmoxConnectView extends LitElement {
           @keydown=${this._onKeyDown}
           ?disabled=${this._connecting}
         ></wa-input>
-
-        <wa-callout variant="neutral" appearance="plain" size="s">
-          Proxmox uses a self-signed certificate by default, so the installer
-          accepts the server's certificate without checking it. The connection
-          is encrypted, but only connect on a network you trust.
-        </wa-callout>
       </div>
+      <wa-dialog
+        label="Verify Proxmox certificate"
+        .open=${this._certificate !== null}
+        @wa-after-hide=${() => this._finishCertificate(false)}
+      >
+        <p>
+          The certificate for
+          <strong class="certificate-host">${this._certificate?.url}</strong> is
+          not issued by a trusted authority.
+        </p>
+        <p>
+          Compare this SHA-256 fingerprint with the certificate shown in your
+          Proxmox node's <strong>System &gt; Certificates</strong>, using a
+          connection you already trust.
+        </p>
+        <p class="fingerprint">${this._certificate?.fingerprint}</p>
+        <p>
+          If they differ, cancel. Your credentials have not been sent. Approval
+          applies only to this login session.
+        </p>
+        <wa-checkbox
+          .checked=${this._certificateCompared}
+          @change=${(event: Event) => {
+            this._certificateCompared = (
+              event.target as HTMLInputElement
+            ).checked;
+          }}
+          >I compared the fingerprints and they match</wa-checkbox
+        >
+        <wa-button
+          slot="footer"
+          appearance="outlined"
+          @click=${() => this._finishCertificate(false)}
+          >Cancel</wa-button
+        >
+        <wa-button
+          slot="footer"
+          variant="brand"
+          ?disabled=${!this._certificateCompared}
+          @click=${() => this._finishCertificate(true)}
+          >Trust for this session</wa-button
+        >
+      </wa-dialog>
     `;
   }
 

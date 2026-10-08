@@ -31,6 +31,9 @@ futures-util = "0.3"
 # Cryptography
 sha2 = "0.11"
 hex = "0.4"
+rustls = "0.23"
+rustls-platform-verifier = "0.7"
+x509-parser = "0.18"
 
 # Compression
 xz2 = "0.1"
@@ -45,10 +48,14 @@ urlencoding = "2"
 tempfile = "3"
 serial_test = "4"
 mockito = "1"
+rcgen = "0.14"
+tokio-rustls = "0.26"
 
 # macOS specific
 plist = "1"
 security-framework = "3"
+security-framework-sys = "2"
+core-foundation = "0.10"
 rustix = { version = "1", features = ["fs", "net"] }
 
 # Linux specific

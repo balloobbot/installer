@@ -19,6 +19,8 @@
 //! - https://forum.proxmox.com/threads/api-equivalent-of-qm-importdisk.157457/
 //! - https://forum.proxmox.com/threads/guide-install-home-assistant-os-in-a-vm.143251/
 
+pub mod tls;
+
 use crate::error::{Error, Result};
 use crate::types::{
     FlashProgress, FlashStage, HaosImage, HaosRelease, ImageFormat, ProxmoxCredentials,
@@ -35,13 +37,17 @@ const MIN_PROXMOX_VERSION: (u32, u32, u32) = (8, 4, 1);
 const PROGRESS_UPDATE_INTERVAL: u64 = 10 * 1024 * 1024; // 10 MB
 
 /// Create a configured HTTP client for Proxmox API calls.
-/// Accepts self-signed certificates (common for Proxmox installations).
-fn create_client(timeout_secs: u64) -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(timeout_secs))
-        .build()
-        .map_err(|e| Error::ProxmoxApi(format!("Failed to create HTTP client: {}", e)))
+fn create_client(session: &ProxmoxSession, timeout_secs: u64) -> Result<reqwest::Client> {
+    tls::client(
+        &session.server_url,
+        session.certificate_sha256.as_deref(),
+        timeout_secs,
+    )
+}
+
+fn request_error(error: reqwest::Error, context: &str) -> Error {
+    tls::certificate_error(&error)
+        .unwrap_or_else(|| Error::ProxmoxApi(format!("{}: {}", context, error)))
 }
 
 /// Parse a Proxmox version string like "8.4.1" into (major, minor, patch).
@@ -69,16 +75,12 @@ fn version_meets_minimum(version: (u32, u32, u32), minimum: (u32, u32, u32)) -> 
 /// This function also verifies the Proxmox version is at least 8.4.1,
 /// which is required for disk image import via the API.
 async fn authenticate(credentials: &ProxmoxCredentials) -> Result<ProxmoxSession> {
-    // Validate URL format (skip in tests to allow mockito HTTP server)
-    #[cfg(not(test))]
-    if !credentials.server_url.starts_with("https://") {
-        return Err(Error::ProxmoxApi(
-            "Server URL must start with https://".to_string(),
-        ));
-    }
-
     let base_url = credentials.server_url.trim_end_matches('/');
-    let client = create_client(30)?;
+    let client = tls::client(
+        &credentials.server_url,
+        credentials.certificate_sha256.as_deref(),
+        30,
+    )?;
 
     // Step 1: Authenticate
     let auth_url = format!("{}/api2/json/access/ticket", base_url);
@@ -92,7 +94,9 @@ async fn authenticate(credentials: &ProxmoxCredentials) -> Result<ProxmoxSession
         .send()
         .await
         .map_err(|e| {
-            if e.is_timeout() {
+            if let Some(error) = tls::certificate_error(&e) {
+                error
+            } else if e.is_timeout() {
                 Error::ProxmoxApi(
                     "Connection timed out. Please check the server URL and network connectivity."
                         .to_string(),
@@ -160,7 +164,7 @@ async fn authenticate(credentials: &ProxmoxCredentials) -> Result<ProxmoxSession
         .header("Cookie", format!("PVEAuthCookie={}", ticket))
         .send()
         .await
-        .map_err(|e| Error::ProxmoxApi(format!("Failed to get Proxmox version: {}", e)))?;
+        .map_err(|e| request_error(e, "Failed to get Proxmox version"))?;
 
     if !version_response.status().is_success() {
         return Err(Error::ProxmoxApi(format!(
@@ -199,12 +203,13 @@ async fn authenticate(credentials: &ProxmoxCredentials) -> Result<ProxmoxSession
         server_url: credentials.server_url.clone(),
         ticket,
         csrf_token,
+        certificate_sha256: credentials.certificate_sha256.clone(),
     })
 }
 
 /// List available nodes on the Proxmox cluster
 async fn list_nodes(session: &ProxmoxSession) -> Result<Vec<ProxmoxNode>> {
-    let client = create_client(30)?;
+    let client = create_client(session, 30)?;
 
     let url = format!(
         "{}/api2/json/nodes",
@@ -217,7 +222,9 @@ async fn list_nodes(session: &ProxmoxSession) -> Result<Vec<ProxmoxNode>> {
         .send()
         .await
         .map_err(|e| {
-            if e.is_timeout() {
+            if let Some(error) = tls::certificate_error(&e) {
+                error
+            } else if e.is_timeout() {
                 Error::ProxmoxApi(
                     "Connection timed out while listing nodes. Please check network connectivity."
                         .to_string(),
@@ -281,7 +288,7 @@ async fn list_nodes(session: &ProxmoxSession) -> Result<Vec<ProxmoxNode>> {
 
 /// List available storage on a node
 async fn list_storage(session: &ProxmoxSession, node: &str) -> Result<Vec<ProxmoxStorage>> {
-    let client = create_client(30)?;
+    let client = create_client(session, 30)?;
 
     let url = format!(
         "{}/api2/json/nodes/{}/storage",
@@ -294,7 +301,7 @@ async fn list_storage(session: &ProxmoxSession, node: &str) -> Result<Vec<Proxmo
         .header("Cookie", format!("PVEAuthCookie={}", session.ticket))
         .send()
         .await
-        .map_err(|e| Error::ProxmoxApi(format!("Failed to list storage: {}", e)))?;
+        .map_err(|e| request_error(e, "Failed to list storage"))?;
 
     if !response.status().is_success() {
         return Err(Error::ProxmoxApi(format!(
@@ -504,12 +511,12 @@ async fn send_nextid_request(
         url.push_str(&format!("?vmid={}", vm_id));
     }
 
-    create_client(30)?
+    create_client(session, 30)?
         .get(&url)
         .header("Cookie", format!("PVEAuthCookie={}", session.ticket))
         .send()
         .await
-        .map_err(|e| Error::ProxmoxApi(format!("Failed to query VM ID: {}", e)))
+        .map_err(|e| request_error(e, "Failed to query VM ID"))
 }
 
 /// Fail early if the node is missing from the cluster or not online.
@@ -544,7 +551,7 @@ const VM_CREATE_PRIVILEGES: &[&str] = &[
 
 /// Privileges the logged-in user has on `path`, including inherited ones.
 async fn fetch_privileges(session: &ProxmoxSession, path: &str) -> Result<HashSet<String>> {
-    let client = create_client(30)?;
+    let client = create_client(session, 30)?;
 
     let url = format!(
         "{}/api2/json/access/permissions?path={}",
@@ -557,7 +564,7 @@ async fn fetch_privileges(session: &ProxmoxSession, path: &str) -> Result<HashSe
         .header("Cookie", format!("PVEAuthCookie={}", session.ticket))
         .send()
         .await
-        .map_err(|e| Error::ProxmoxApi(format!("Failed to check permissions: {}", e)))?;
+        .map_err(|e| request_error(e, "Failed to check permissions"))?;
 
     if !response.status().is_success() {
         return Err(Error::ProxmoxApi(format!(
@@ -748,7 +755,7 @@ async fn wait_for_task_completion(
         urlencoding::encode(upid)
     );
 
-    let client = create_client(30)?;
+    let client = create_client(session, 30)?;
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(timeout_secs);
 
@@ -765,7 +772,7 @@ async fn wait_for_task_completion(
             .header("Cookie", format!("PVEAuthCookie={}", session.ticket))
             .send()
             .await
-            .map_err(|e| Error::ProxmoxApi(format!("Failed to check task status: {}", e)))?;
+            .map_err(|e| request_error(e, "Failed to check task status"))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -880,7 +887,7 @@ async fn upload_image_to_proxmox<P: ProgressCallback>(
     );
 
     // Create client with longer timeout for large uploads
-    let client = create_client(1800)?; // 30 minutes
+    let client = create_client(session, 1800)?; // 30 minutes
 
     // Create a chunked stream that reports upload progress
     let chunk_size = 256 * 1024; // 256KB chunks
@@ -930,7 +937,7 @@ async fn upload_image_to_proxmox<P: ProgressCallback>(
         .multipart(form)
         .send()
         .await
-        .map_err(|e| Error::ProxmoxApi(format!("Failed to upload image: {}", e)))?;
+        .map_err(|e| request_error(e, "Failed to upload image"))?;
 
     let status = response.status();
     let response_text = response.text().await.unwrap_or_default();
@@ -990,7 +997,7 @@ async fn create_vm_with_disk(
         config.node
     );
 
-    let client = create_client(300)?; // 5 minutes for VM creation with disk import
+    let client = create_client(session, 300)?; // 5 minutes for VM creation with disk import
 
     // Build the disk import specification
     // Format: storage:0,import-from="storage name":import/filename.qcow2
@@ -1024,7 +1031,7 @@ async fn create_vm_with_disk(
         ])
         .send()
         .await
-        .map_err(|e| Error::ProxmoxApi(format!("Failed to create VM: {}", e)))?;
+        .map_err(|e| request_error(e, "Failed to create VM"))?;
 
     let status = response.status();
     let response_text = response.text().await.unwrap_or_default();
@@ -1069,12 +1076,13 @@ async fn delete_import_image(
         urlencoding::encode(storage),
         urlencoding::encode(&volume)
     );
-    let response = create_client(60)?
+    let response = create_client(session, 60)?
         .delete(url)
         .header("Cookie", format!("PVEAuthCookie={}", session.ticket))
         .header("CSRFPreventionToken", &session.csrf_token)
         .send()
-        .await?;
+        .await
+        .map_err(|e| request_error(e, "Could not delete import volume"))?;
     if !response.status().is_success() {
         return Err(Error::ProxmoxApi(format!(
             "Could not delete import volume {volume}: HTTP {}",
@@ -1132,7 +1140,7 @@ async fn start_vm(session: &ProxmoxSession, node: &str, vm_id: u32) -> Result<()
         vm_id
     );
 
-    let client = create_client(60)?;
+    let client = create_client(session, 60)?;
 
     let response = client
         .post(&url)
@@ -1140,7 +1148,7 @@ async fn start_vm(session: &ProxmoxSession, node: &str, vm_id: u32) -> Result<()
         .header("CSRFPreventionToken", &session.csrf_token)
         .send()
         .await
-        .map_err(|e| Error::ProxmoxApi(format!("Failed to start VM: {}", e)))?;
+        .map_err(|e| request_error(e, "Failed to start VM"))?;
 
     let status = response.status();
     let response_text = response.text().await.unwrap_or_default();
@@ -1173,7 +1181,10 @@ async fn wait_for_ha_webserver(ip: &str) -> bool {
 
 /// Internal helper that accepts a full base URL (for testing).
 async fn wait_for_ha_webserver_at_url(base_url: &str) -> bool {
-    let client = match create_client(10) {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
         Ok(c) => c,
         Err(_) => return false,
     };
@@ -1207,7 +1218,10 @@ async fn wait_for_ha_updated(ip: &str) -> bool {
 /// Internal helper that accepts a full base URL (for testing).
 async fn wait_for_ha_updated_at_url(base_url: &str) -> bool {
     let url = format!("{}/manifest.json", base_url);
-    let client = match create_client(10) {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
         Ok(c) => c,
         Err(_) => return false,
     };
@@ -1241,7 +1255,7 @@ async fn wait_for_vm_ip(session: &ProxmoxSession, node: &str, vm_id: u32) -> Opt
         vm_id
     );
 
-    let client = create_client(10).ok()?;
+    let client = create_client(session, 10).ok()?;
 
     // Try for up to 5 minutes (150 attempts * 2 seconds)
     for _ in 0..150 {
@@ -1446,6 +1460,10 @@ async fn create_vm<B: ReleaseSource, P: ProgressCallback>(
 }
 
 impl ProxmoxBackend for Backend {
+    async fn certificate_fingerprint(&self, server_url: &str) -> Result<Option<String>> {
+        tls::certificate_fingerprint(server_url).await
+    }
+
     async fn authenticate(&self, credentials: &ProxmoxCredentials) -> Result<ProxmoxSession> {
         authenticate(credentials).await
     }
@@ -1546,19 +1564,19 @@ mod tests {
     // create_client() tests
     #[test]
     fn test_create_client_valid_timeout() {
-        let result = create_client(30);
+        let result = tls::client("https://pve.example:8006", None, 30);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_create_client_zero_timeout() {
-        let result = create_client(0);
+        let result = tls::client("https://pve.example:8006", None, 0);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_create_client_large_timeout() {
-        let result = create_client(1800);
+        let result = tls::client("https://pve.example:8006", None, 1800);
         assert!(result.is_ok());
     }
 
@@ -1876,6 +1894,7 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
@@ -1907,6 +1926,7 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "wrong-password".to_string(),
@@ -1938,6 +1958,7 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "user@pam".to_string(),
                 password: "password".to_string(),
@@ -1994,6 +2015,7 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
@@ -2047,6 +2069,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2077,6 +2100,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "expired-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2129,6 +2153,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2161,6 +2186,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2267,6 +2293,7 @@ mod tests {
 
         fn test_session(server: &mockito::ServerGuard) -> ProxmoxSession {
             ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2652,6 +2679,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2679,6 +2707,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2705,6 +2734,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2730,6 +2760,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2761,6 +2792,7 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
@@ -2799,6 +2831,7 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
@@ -2829,6 +2862,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2854,6 +2888,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2884,6 +2919,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2926,6 +2962,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2967,6 +3004,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3014,6 +3052,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3052,6 +3091,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3098,6 +3138,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3132,6 +3173,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3202,6 +3244,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3245,6 +3288,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3287,6 +3331,7 @@ mod tests {
                     server_url: server.url(),
                     ticket: "test-ticket".into(),
                     csrf_token: "test-csrf".into(),
+                    certificate_sha256: None,
                 };
                 let error =
                     delete_import_image(&session, "pve", "local-import", "hai-image-unique.qcow2")
@@ -3341,6 +3386,7 @@ mod tests {
                     server_url: server.url(),
                     ticket: "test-ticket".into(),
                     csrf_token: "test-csrf".into(),
+                    certificate_sha256: None,
                 };
                 let config = ProxmoxVmConfig {
                     vm_id: 100,
@@ -3407,6 +3453,7 @@ mod tests {
                     server_url: server.url(),
                     ticket: "test-ticket".into(),
                     csrf_token: "test-csrf".into(),
+                    certificate_sha256: None,
                 };
                 let config = ProxmoxVmConfig {
                     vm_id: 100,
@@ -3468,6 +3515,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3493,6 +3541,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3548,6 +3597,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3598,6 +3648,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3682,6 +3733,7 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
@@ -3713,6 +3765,7 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
@@ -3758,6 +3811,7 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
@@ -3806,6 +3860,7 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
@@ -3861,6 +3916,7 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
@@ -3892,6 +3948,7 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
@@ -3923,6 +3980,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3954,6 +4012,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3983,6 +4042,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4008,6 +4068,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4039,6 +4100,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4070,6 +4132,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4101,6 +4164,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4135,6 +4199,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4175,6 +4240,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4230,6 +4296,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4271,6 +4338,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4310,6 +4378,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4349,6 +4418,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4374,6 +4444,7 @@ mod tests {
             let server = Server::new_async().await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),

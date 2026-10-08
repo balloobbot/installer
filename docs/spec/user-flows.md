@@ -226,6 +226,24 @@ Then continues to drive selection and flashing.
 
 ### Step 1: Connect
 
+Before authentication, the installer probes TLS without sending an HTTP request.
+Servers trusted by the operating system use normal certificate validation. An
+untrusted issuer prompts the user to compare the SHA-256 fingerprint with the
+node's System > Certificates page through an already trusted connection. Only
+after the user checks that the fingerprints match and chooses "Trust for this
+session" are credentials sent. Cancel, Escape, or closing the view sends none.
+
+The exact approved leaf certificate is pinned for the login session, including
+all preflight, upload, and VM API requests. Renewed or changed certificates are
+rejected and require a new login and comparison. Pins are not saved to disk.
+Explicit pin approval replaces issuer, hostname, and expiry validation for that
+specific certificate, while TLS handshake signatures are still verified. Other
+certificate failures use normal validation and are not offered an override.
+Server URLs must be bare HTTPS origins without embedded credentials, paths,
+queries, or fragments. API redirects are not followed.
+Proxmox connections are direct and do not use system proxies, so an HTTPS proxy's
+certificate cannot be mistaken for the Proxmox certificate during inspection.
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                                                             │

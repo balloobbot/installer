@@ -21,6 +21,9 @@ reqwest = { workspace = true }
 futures-util = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+rustls = { workspace = true }
+rustls-platform-verifier = { workspace = true }
+x509-parser = { workspace = true }
 xz2 = { workspace = true }
 directories = { workspace = true }
 urlencoding = { workspace = true }
@@ -30,6 +33,8 @@ tempfile = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 plist = { workspace = true }
 security-framework = { workspace = true }
+security-framework-sys = { workspace = true }
+core-foundation = { workspace = true }
 rustix = { workspace = true }
 
 # Linux specific
@@ -47,3 +52,5 @@ tokio = { workspace = true }
 tempfile = { workspace = true }
 serial_test = { workspace = true }
 mockito = { workspace = true }
+rcgen = { workspace = true }
+tokio-rustls = { workspace = true }
