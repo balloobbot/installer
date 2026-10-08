@@ -109,7 +109,10 @@ pub(super) fn client(url: &str, pin: Option<&str>, timeout: u64) -> Result<reqwe
             server_name: ServerName::try_from(host.to_owned())
                 .map_err(|_| Error::ProxmoxApi("Invalid server hostname".into()))?,
         };
-        builder = builder.use_preconfigured_tls(config(Arc::new(verifier)));
+        let mut tls = config(Arc::new(verifier));
+        // Resumed handshakes omit the current certificate and would bypass the pin.
+        tls.resumption = rustls::client::Resumption::disabled();
+        builder = builder.use_preconfigured_tls(tls);
     }
     builder
         .build()
@@ -424,6 +427,7 @@ mod tests {
         url: String,
         cert: CertificateDer<'static>,
         requests: Arc<Mutex<Vec<String>>>,
+        handshakes: Arc<Mutex<Vec<rustls::HandshakeKind>>>,
         acceptor: tokio_rustls::TlsAcceptor,
         rotate_to: Arc<Mutex<Option<tokio_rustls::TlsAcceptor>>>,
         task: tokio::task::JoinHandle<()>,
@@ -464,6 +468,8 @@ mod tests {
             let url = format!("https://{}", listener.local_addr().unwrap());
             let requests = Arc::new(Mutex::new(Vec::new()));
             let received = requests.clone();
+            let handshakes = Arc::new(Mutex::new(Vec::new()));
+            let completed_handshakes = handshakes.clone();
             let rotate_to = Arc::new(Mutex::new(None));
             let next_acceptor = rotate_to.clone();
             let mut current_acceptor = acceptor.clone();
@@ -477,6 +483,10 @@ mod tests {
                     else {
                         continue;
                     };
+                    completed_handshakes
+                        .lock()
+                        .unwrap()
+                        .push(tls.get_ref().1.handshake_kind().unwrap());
                     let mut request = Vec::new();
                     loop {
                         let mut buf = [0; 4096];
@@ -532,6 +542,7 @@ mod tests {
                 url,
                 cert,
                 requests,
+                handshakes,
                 acceptor,
                 rotate_to,
                 task,
@@ -865,6 +876,10 @@ mod tests {
             assert_eq!(requests.len(), 3);
             assert!(requests[0].contains("password=fixture-password"));
             assert!(requests[2].contains("PVEAuthCookie=fixture-ticket"));
+            assert_eq!(
+                *server.handshakes.lock().unwrap(),
+                vec![rustls::HandshakeKind::Full; 3]
+            );
         }
     }
 
@@ -895,6 +910,38 @@ mod tests {
         let requests = original.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert!(requests[0].starts_with("POST /api2/json/access/ticket "));
+    }
+
+    async fn rejects_rotation_with_retained_sessions(tls12: bool) {
+        let original = TlsServer::start(None, tls12).await;
+        let changed = TlsServer::start(None, tls12).await;
+        let mut rotated = changed.acceptor.config().as_ref().clone();
+        rotated.session_storage = original.acceptor.config().session_storage.clone();
+        rotated.ticketer = original.acceptor.config().ticketer.clone();
+        *original.rotate_to.lock().unwrap() =
+            Some(tokio_rustls::TlsAcceptor::from(Arc::new(rotated)));
+
+        let result = super::super::authenticate(&original.credentials(true)).await;
+        assert!(
+            result.is_err(),
+            "rotated certificate accepted; handshakes: {:?}",
+            original.handshakes.lock().unwrap()
+        );
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains(CERTIFICATE_CHANGED), "{error}");
+        let requests = original.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("POST /api2/json/access/ticket "));
+    }
+
+    #[tokio::test]
+    async fn tls12_rotation_with_retained_sessions_rejects_new_certificate() {
+        rejects_rotation_with_retained_sessions(true).await;
+    }
+
+    #[tokio::test]
+    async fn tls13_rotation_with_retained_sessions_rejects_new_certificate() {
+        rejects_rotation_with_retained_sessions(false).await;
     }
 
     #[tokio::test]
