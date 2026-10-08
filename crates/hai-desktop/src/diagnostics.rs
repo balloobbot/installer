@@ -325,6 +325,97 @@ mod tests {
     }
 
     #[test]
+    fn frontend_command_records_allowed_events_and_bounds_tail() {
+        // Isolate the process-global logger and tail from concurrent tests.
+        if std::env::var_os("HAI_FRONTEND_LOG_TEST_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "diagnostics::tests::frontend_command_records_allowed_events_and_bounds_tail",
+                    "--nocapture",
+                ])
+                .env("HAI_FRONTEND_LOG_TEST_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("FRONTEND_LOG_COMMAND_ASSERTIONS_PASSED"),
+                "child did not complete the command assertions: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+
+        struct Capture(Mutex<Vec<(log::Level, String)>>);
+        impl log::Log for Capture {
+            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+                metadata.target() == TARGET
+            }
+
+            fn log(&self, record: &log::Record<'_>) {
+                if self.enabled(record.metadata()) {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push((record.level(), record.args().to_string()));
+                }
+            }
+
+            fn flush(&self) {}
+        }
+        static LOG: Capture = Capture(Mutex::new(Vec::new()));
+        log::set_logger(&LOG).unwrap();
+        log::set_max_level(log::LevelFilter::Info);
+
+        for elapsed_ms in 0..=TAIL_LINES as u32 {
+            log_frontend_event(
+                Flow::Flash,
+                Stage::Writing,
+                Outcome::Started,
+                None,
+                elapsed_ms,
+            );
+        }
+        log_frontend_event(
+            Flow::Flash,
+            Stage::Writing,
+            Outcome::Failed,
+            Some(ErrorCategory::DriveDisconnected),
+            99,
+        );
+
+        let records = LOG.0.lock().unwrap();
+        assert_eq!(records.len(), TAIL_LINES + 2);
+        for (elapsed_ms, (level, line)) in records[..=TAIL_LINES].iter().enumerate() {
+            assert_eq!(*level, log::Level::Info);
+            assert!(line.ends_with(&format!(
+                "frontend Flash Writing Started error=None duration_ms={elapsed_ms}"
+            )));
+        }
+        let (level, failure) = records.last().unwrap();
+        assert_eq!(*level, log::Level::Error);
+        assert!(failure.ends_with(
+            "frontend Flash Writing Failed error=Some(DriveDisconnected) duration_ms=99"
+        ));
+        let tail = test_log_tail();
+        assert_eq!(tail.len(), TAIL_LINES);
+        assert_eq!(
+            tail,
+            records[2..]
+                .iter()
+                .map(|(_, line)| line.clone())
+                .collect::<Vec<_>>()
+        );
+        println!("FRONTEND_LOG_COMMAND_ASSERTIONS_PASSED");
+    }
+
+    #[test]
     fn rapid_rotation_retains_one_file_and_only_allowlisted_log_targets() {
         let directory = tempfile::tempdir().unwrap();
         let app = tauri::test::mock_app();
