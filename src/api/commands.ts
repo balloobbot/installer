@@ -530,7 +530,7 @@ export async function proxmoxListNodes(
   return invoke<ProxmoxNode[]>("proxmox_list_nodes", { session });
 }
 
-/** Servers whose "local" storage accepts Import in the browser-only mock */
+/** Server origins whose "local" storage accepts Import in the browser-only mock */
 const mockImportServers = new Set<string>();
 
 /**
@@ -556,7 +556,9 @@ export async function proxmoxListStorage(
           "backup",
           "iso",
           "snippets",
-          ...(mockImportServers.has(session.server_url) ? ["import"] : []),
+          ...(mockImportServers.has(new URL(session.server_url).origin)
+            ? ["import"]
+            : []),
         ],
         available: 200 * 1024 * 1024 * 1024,
         total: 500 * 1024 * 1024 * 1024,
@@ -596,8 +598,10 @@ export async function proxmoxEnableStorageImport(
         details: {},
       };
     }
-    const changed = !mockImportServers.has(session.server_url);
-    mockImportServers.add(session.server_url);
+    // Storage configuration is per cluster, not per spelling of its address
+    const origin = new URL(session.server_url).origin;
+    const changed = !mockImportServers.has(origin);
+    mockImportServers.add(origin);
     return changed;
   }
   return invoke<boolean>("proxmox_enable_storage_import", {

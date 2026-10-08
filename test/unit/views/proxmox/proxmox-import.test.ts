@@ -523,4 +523,30 @@ describe("Proxmox import consent", () => {
     expect(await proxmoxEnableStorageImport(mockSession, "pve", "local")).to.be
       .false;
   });
+
+  it("browser mock persists Import by equivalent origin without affecting another server", async () => {
+    restoreTauriIpc();
+    const first = {
+      ...session,
+      server_url: "https://MOCK-ORIGIN.example:443/",
+    };
+    const renewed = {
+      ...session,
+      server_url: "https://mock-origin.example",
+      ticket: "renewed",
+    };
+    const other = {
+      ...session,
+      server_url: "https://another-mock-origin.example",
+    };
+    expect(await proxmoxEnableStorageImport(first, "pve", "local")).to.be.true;
+    const storage = await proxmoxListStorage(renewed, "pve2");
+    expect(storage[0].content).to.include("import");
+    expect(await proxmoxEnableStorageImport(renewed, "pve2", "local")).to.be
+      .false;
+    expect((await proxmoxListStorage(other, "pve"))[0].content).not.to.include(
+      "import"
+    );
+    expect(await proxmoxEnableStorageImport(other, "pve", "local")).to.be.true;
+  });
 });
