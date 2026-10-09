@@ -1329,16 +1329,21 @@ async fn create_vm_with_disk(
     // Deleting the source is only safe after confirmed import completion.
     wait_for_task_completion(session, &config.node, upid, 600, source_unused).await?;
 
-    resize_vm_disk(session, config).await.map_err(|error| {
-        let message = match error {
-            Error::ProxmoxApi(message) => message,
-            other => other.to_string(),
-        };
-        Error::ProxmoxApi(format!(
-            "VM {} was created but its disk could not be resized: {}",
-            config.vm_id, message
-        ))
-    })
+    resize_vm_disk(session, config)
+        .await
+        .map_err(|error| resize_error(config.vm_id, error))
+}
+
+fn resize_error(vm_id: u32, error: Error) -> Error {
+    let message = match error {
+        // Keep its own code, so the user is told to reconnect
+        Error::ProxmoxCertificateChanged => return error,
+        Error::ProxmoxApi(message) => message,
+        other => other.to_string(),
+    };
+    Error::ProxmoxApi(format!(
+        "VM {vm_id} was created but its disk could not be resized: {message}"
+    ))
 }
 
 /// Apply an absolute size, including the minimum, so Proxmox checks the actual
@@ -4162,6 +4167,19 @@ mod tests {
                 assert!(error.to_string().contains("cannot shrink"));
                 assert!(source_unused);
             }
+        }
+
+        #[test]
+        fn test_disk_resize_keeps_a_certificate_change() {
+            assert!(matches!(
+                resize_error(100, Error::ProxmoxCertificateChanged),
+                Error::ProxmoxCertificateChanged
+            ));
+            let error = resize_error(100, Error::ProxmoxApi("HTTP 500".into()));
+            assert!(
+                matches!(&error, Error::ProxmoxApi(message) if message.contains("VM 100 was created")),
+                "{error}"
+            );
         }
 
         #[tokio::test]

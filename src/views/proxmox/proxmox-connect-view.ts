@@ -3,6 +3,7 @@ import {
   renderErrorHelp,
   type InstallerError,
 } from "../../utils/installer-error.js";
+import { localize, localizeContent } from "../../localization/localize.js";
 import { LitElement, html, css } from "lit";
 import { ViewAccessibility } from "../../utils/view-accessibility.js";
 import { InstallDiagnostics } from "../../utils/diagnostics.js";
@@ -225,7 +226,9 @@ export class ProxmoxConnectView extends LitElement {
 
     if (this._connecting) return false;
     if (!this._serverUrl || !this._username || !this._password) {
-      return this._validationError("Please fill in all fields");
+      return this._validationError(
+        localize("proxmox.validation.required_fields")
+      );
     }
 
     // Validate URL format - must be HTTPS for security
@@ -233,9 +236,7 @@ export class ProxmoxConnectView extends LitElement {
     try {
       const parsed = new URL(url);
       if (parsed.protocol !== "https:") {
-        return this._validationError(
-          "URL must use HTTPS (for example, https://192.168.1.100:8006)"
-        );
+        return this._validationError(localize("proxmox.validation.https_url"));
       }
       if (
         parsed.username ||
@@ -245,13 +246,11 @@ export class ProxmoxConnectView extends LitElement {
         parsed.hash
       ) {
         return this._validationError(
-          "Use a server URL without credentials, a path, query, or fragment"
+          localize("views.proxmox.proxmox_connect_view.url_without_extras")
         );
       }
     } catch {
-      return this._validationError(
-        "Enter a valid URL (for example, https://192.168.1.100:8006)"
-      );
+      return this._validationError(localize("proxmox.validation.valid_url"));
     }
 
     this._connecting = true;
@@ -293,7 +292,10 @@ export class ProxmoxConnectView extends LitElement {
     } catch (error) {
       if (!isCurrent()) return false;
       diagnostics.fail(error);
-      this._error = installerError(error, "Failed to connect to Proxmox");
+      this._error = installerError(
+        error,
+        localize("proxmox.connection_failed")
+      );
       wizardState.setSelection("proxmoxConnected", false);
       return false;
     } finally {
@@ -396,8 +398,14 @@ export class ProxmoxConnectView extends LitElement {
 
   render() {
     return html`
-      <h2>Connect to Proxmox VE</h2>
-      <p class="subtitle">Enter your Proxmox server credentials</p>
+      <h2>
+        ${localize("views.proxmox.proxmox_connect_view.connect_to_proxmox_ve")}
+      </h2>
+      <p class="subtitle">
+        ${localize(
+          "views.proxmox.proxmox_connect_view.enter_your_proxmox_server_credentials"
+        )}
+      </p>
 
       <div class="connect-card">
         ${this._error ? this._renderError() : ""}
@@ -405,8 +413,8 @@ export class ProxmoxConnectView extends LitElement {
         <wa-input
           type="url"
           input-id="server-url"
-          label="Server URL"
-          hint="Full URL to your Proxmox server (for example, https://192.168.1.100:8006)"
+          label=${localize("views.proxmox.proxmox_connect_view.server_url")}
+          hint=${localize("proxmox.server_url_hint")}
           placeholder="https://192.168.1.100:8006"
           autocomplete="url"
           autocapitalize="off"
@@ -421,8 +429,8 @@ export class ProxmoxConnectView extends LitElement {
         <wa-input
           type="text"
           input-id="username"
-          label="Username"
-          hint="Usually root@pam for the default admin account"
+          label=${localize("views.proxmox.proxmox_connect_view.username")}
+          hint=${localize("proxmox.username_hint")}
           placeholder="root@pam"
           autocomplete="username"
           autocapitalize="off"
@@ -437,8 +445,10 @@ export class ProxmoxConnectView extends LitElement {
         <wa-input
           type="password"
           input-id="password"
-          label="Password"
-          placeholder="Enter your password"
+          label=${localize("views.proxmox.proxmox_connect_view.password")}
+          placeholder=${localize(
+            "views.proxmox.proxmox_connect_view.enter_your_password"
+          )}
           autocomplete="current-password"
           password-toggle
           .value=${this._password}
@@ -450,7 +460,9 @@ export class ProxmoxConnectView extends LitElement {
         <wa-input
           type="text"
           input-id="totp"
-          label="Authenticator app code (optional)"
+          label=${localize(
+            "views.proxmox.proxmox_connect_view.authenticator_app_code_optional"
+          )}
           autocomplete="one-time-code"
           inputmode="numeric"
           .value=${this._totp}
@@ -460,26 +472,36 @@ export class ProxmoxConnectView extends LitElement {
         ></wa-input>
       </div>
       <wa-dialog
-        label="Trust this Proxmox server?"
+        label=${localize(
+          "views.proxmox.proxmox_connect_view.trust_server_title"
+        )}
         .open=${this._certificate !== null}
         @wa-after-hide=${() => this._finishCertificate(false)}
       >
         <p>
-          Your computer doesn't trust the security certificate of
-          <strong class="certificate-host">${this._certificate?.url}</strong>.
+          ${localizeContent(
+            "views.proxmox.proxmox_connect_view.untrusted_certificate",
+            {
+              server: html`<strong class="certificate-host"
+                >${this._certificate?.url}</strong
+              >`,
+            }
+          )}
         </p>
         <p>
-          That is normal for most Proxmox servers. Proxmox creates its own
-          certificate when it is installed, and your browser shows the same
-          warning when you open the Proxmox web interface.
+          ${localize(
+            "views.proxmox.proxmox_connect_view.untrusted_certificate_is_normal"
+          )}
         </p>
         <p>
-          Only continue if this is your Proxmox server. If you didn't expect
-          this warning, cancel. Your password has not been sent yet.
+          ${localize(
+            "views.proxmox.proxmox_connect_view.only_continue_for_your_server"
+          )}
         </p>
         <div class="fingerprint-label">
-          Certificate fingerprint (SHA-256), shown in Proxmox under System &gt;
-          Certificates
+          ${localize(
+            "views.proxmox.proxmox_connect_view.certificate_fingerprint"
+          )}
         </div>
         <div class="fingerprint">
           ${this._renderFingerprint(this._certificate?.fingerprint ?? "")}
@@ -488,13 +510,15 @@ export class ProxmoxConnectView extends LitElement {
           slot="footer"
           appearance="outlined"
           @click=${() => this._finishCertificate(false)}
-          >Cancel</wa-button
+          >${localize("common.cancel")}</wa-button
         >
         <wa-button
           slot="footer"
           variant="brand"
           @click=${() => this._finishCertificate(true)}
-          >Trust and connect</wa-button
+          >${localize(
+            "views.proxmox.proxmox_connect_view.trust_and_connect"
+          )}</wa-button
         >
       </wa-dialog>
     `;
@@ -518,7 +542,9 @@ export class ProxmoxConnectView extends LitElement {
           </svg>
         </div>
         <div class="status-text">
-          <p class="status-title">Connection failed</p>
+          <p class="status-title">
+            ${localize("views.proxmox.proxmox_connect_view.connection_failed")}
+          </p>
           <p class="status-description" style="overflow-wrap: anywhere;">
             ${this._error?.message}
           </p>

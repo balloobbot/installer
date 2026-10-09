@@ -273,6 +273,7 @@ where
         .write_image(
             &extracted_path,
             &request.device_id,
+            &request.expected_device,
             request.verify,
             callback,
         )
@@ -1030,6 +1031,7 @@ mod tests {
             removable,
             model: None,
             vendor: None,
+            serial: None,
         }
     }
 
@@ -1046,6 +1048,32 @@ mod tests {
         let devices = [flash_target("/dev/sdb", true)];
         let device = find_flash_target(&devices, "/dev/sdb", &expected(), "rpi5-64").unwrap();
         assert_eq!(device.id, "/dev/sdb");
+    }
+
+    #[test]
+    fn test_find_flash_target_accepts_newly_discovered_serial() {
+        let mut device = flash_target("/dev/sdb", true);
+        device.serial = Some("STICK-A".into());
+        assert!(find_flash_target(&[device.clone()], "/dev/sdb", &expected(), "rpi5-64").is_ok());
+        device.model = Some("Different model".into());
+        assert!(find_flash_target(&[device], "/dev/sdb", &expected(), "rpi5-64").is_err());
+    }
+
+    #[test]
+    fn test_find_flash_target_checks_serial_even_for_identical_models() {
+        let mut device = flash_target("/dev/sdb", true);
+        let expected = ExpectedDevice {
+            serial: Some("STICK-A".into()),
+            ..expected()
+        };
+        for serial in [None, Some("STICK-B".into())] {
+            device.serial = serial;
+            assert!(
+                find_flash_target(&[device.clone()], "/dev/sdb", &expected, "rpi5-64").is_err()
+            );
+        }
+        device.serial = expected.serial.clone();
+        assert!(find_flash_target(&[device], "/dev/sdb", &expected, "rpi5-64").is_ok());
     }
 
     #[test]
@@ -1141,6 +1169,7 @@ mod tests {
             &self,
             _: &std::path::Path,
             _: &str,
+            _: &hai_core::ExpectedDevice,
             _: bool,
             _: &P,
         ) -> hai_core::Result<()> {
@@ -1312,6 +1341,7 @@ mod mock_tests {
             &self,
             path: &std::path::Path,
             _: &str,
+            _: &hai_core::ExpectedDevice,
             _: bool,
             _: &P,
         ) -> hai_core::Result<()> {
@@ -1619,6 +1649,7 @@ mod mock_tests {
                 size: Some(device.size),
                 model: device.model,
                 vendor: device.vendor,
+                serial: device.serial,
             },
         }
     }
@@ -1683,6 +1714,7 @@ mod mock_tests {
             &self,
             _: &std::path::Path,
             _: &str,
+            _: &hai_core::ExpectedDevice,
             _: bool,
             _: &P,
         ) -> hai_core::Result<()> {
