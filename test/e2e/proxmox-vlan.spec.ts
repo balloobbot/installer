@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { approveProxmoxImport } from "./fixtures.js";
 
 for (const width of [1100, 390]) {
   test(`optional VLAN validation and persistence at ${width}px`, async ({
@@ -36,6 +37,8 @@ for (const width of [1100, 390]) {
       "vmbr0"
     );
     await expect(configure.locator("wa-details")).not.toHaveAttribute("open");
+    // The browser mock starts without Import storage, like a fresh Proxmox
+    await approveProxmoxImport(page);
     await next.click();
     await expect(page.locator("proxmox-confirm-view")).not.toContainText(
       "VLAN tag:"
