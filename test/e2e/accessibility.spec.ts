@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { approveProxmoxImport } from "./fixtures.js";
 
 for (const [flow, tag, flag] of [
   ["sbc", "progress-view", "_flashError"],
@@ -190,6 +191,7 @@ test("navigation focuses headings without stealing focus on input", async ({
   await expect(
     page.getByRole("heading", { name: "Configure virtual machine" })
   ).toBeFocused();
+  await approveProxmoxImport(page);
   const name = page
     .locator("proxmox-configure-view")
     .getByRole("textbox", { name: "Display name" });

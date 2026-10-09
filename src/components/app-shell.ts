@@ -286,7 +286,8 @@ export class AppShell extends LitElement {
           !selections.proxmoxNode ||
           !selections.proxmoxStorage ||
           !selections.proxmoxBridge ||
-          !selections.proxmoxBridgeReady
+          !selections.proxmoxBridgeReady ||
+          !selections.proxmoxImportReady
         );
       }
     }
@@ -525,6 +526,16 @@ export class AppShell extends LitElement {
           this._proxmoxConnecting = false;
         }
       }
+    }
+
+    // Next is only clickable while enabled, but the step must never proceed
+    // without import storage, whatever triggered the event
+    if (
+      flow === "proxmox" &&
+      currentStep?.id === "configure" &&
+      this._isNextDisabled(flow, currentStep.id)
+    ) {
+      return;
     }
 
     // Show confirmation dialog before proceeding from confirm step (only for SBC/minipc flows)

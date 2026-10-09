@@ -11,12 +11,40 @@ import { openExternalLink } from "../../utils/external-url.js";
 
 import "../../components/install-success.js";
 
+const DIRECTORY_STORAGE_DOCS =
+  "https://pve.proxmox.com/pve-docs/pve-admin-guide.html#storage_directory";
+
 @customElement("proxmox-success-view")
 export class ProxmoxSuccessView extends LitElement {
   static styles = css`
     :host {
       display: block;
       height: 100%;
+    }
+
+    .import-reminder {
+      width: 100%;
+      max-width: 500px;
+      margin: 0 auto 2rem;
+      padding: 0.75rem 0 0.75rem 1rem;
+      border-left: 3px solid var(--ha-warning-color, #f5a623);
+      text-align: left;
+      font-size: 0.875rem;
+      line-height: 1.5;
+      color: var(--ha-text-color, #212121);
+      overflow-wrap: anywhere;
+    }
+
+    .import-reminder p {
+      margin: 0;
+    }
+
+    .import-reminder p + p {
+      margin-top: 0.5rem;
+    }
+
+    .import-reminder a {
+      color: var(--ha-primary-color, #03a9f4);
     }
   `;
 
@@ -83,8 +111,57 @@ export class ProxmoxSuccessView extends LitElement {
             >`,
           }
         )}`}
-      ></install-success>
+        >${this._renderImportReminder()}</install-success
+      >
     `;
+  }
+
+  /**
+   * Remind the user of Import this installer enabled on the server it is
+   * connected to. The installer never rolls it back: other workloads on the
+   * cluster may rely on it by now.
+   */
+  private _renderImportReminder() {
+    const selections = this._wizardState.selections;
+    if (!selections.proxmoxSession) return "";
+
+    const serverOrigin = new URL(selections.proxmoxSession.server_url).origin;
+    const storages = (selections.proxmoxImportChanges ?? [])
+      .filter((change) => change.serverOrigin === serverOrigin)
+      .map((change) => change.storage);
+    if (!storages.length) return "";
+
+    return html`<section
+      class="import-reminder"
+      aria-label=${localize(
+        "views.proxmox.proxmox_success_view.import_storage_reminder"
+      )}
+    >
+      <p>
+        ${localizeContent(
+          "views.proxmox.proxmox_success_view.installer_enabled_import_on_storages",
+          {
+            storages: storages.map(
+              (storage, index) =>
+                html`${index ? ", " : ""}<strong>"${storage}"</strong>`
+            ),
+          }
+        )}
+      </p>
+      <p>
+        ${localize(
+          "views.proxmox.proxmox_success_view.review_import_in_proxmox"
+        )}
+        <a
+          href=${DIRECTORY_STORAGE_DOCS}
+          target="_blank"
+          rel="noopener noreferrer"
+          @click=${(event: Event) =>
+            openExternalLink(event, DIRECTORY_STORAGE_DOCS)}
+          >${localize("proxmox.directory_storage_documentation")}</a
+        >
+      </p>
+    </section>`;
   }
 }
 

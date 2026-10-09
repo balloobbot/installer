@@ -258,6 +258,7 @@ export class InstallSuccess extends LitElement {
           ? html`<p class="next-steps-footer">${this.footer}</p>`
           : ""}
       </div>
+      <slot></slot>
       ${this.tip ? html`<div class="tip-section">${this.tip}</div>` : ""}
       <div class="companion-section">
         <p class="companion-title">

@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { approveProxmoxImport } from "./fixtures.js";
 
 test.describe("Proxmox Installation Flow", () => {
   test.beforeEach(async ({ page }) => {
@@ -492,6 +493,7 @@ test.describe("Proxmox Installation Flow", () => {
 
     // Step 2: Configure (wait for Next to enable once node/storage defaults load)
     await expect(page.locator("proxmox-configure-view")).toBeVisible();
+    await approveProxmoxImport(page);
     const configNext = page
       .locator("wizard-shell")
       .locator(".footer-right wa-button");
@@ -530,6 +532,7 @@ async function navigateToProxmoxStep2(page: Page) {
   await connectView.locator("#password").fill("test");
   await page.locator("wizard-shell").locator(".footer-right wa-button").click();
   await expect(page.locator("proxmox-configure-view")).toBeVisible();
+  await approveProxmoxImport(page);
 }
 
 async function navigateToProxmoxStep3(page: Page) {

@@ -59,6 +59,14 @@ async function mockLookupFailure(
             case "proxmox_list_storage":
               return [
                 {
+                  name: "local",
+                  storage_type: "dir",
+                  active: true,
+                  content: ["iso", "import"],
+                  available: 100 * 1024 ** 3,
+                  total: 200 * 1024 ** 3,
+                },
+                {
                   name: "local-lvm",
                   storage_type: "lvmthin",
                   active: true,

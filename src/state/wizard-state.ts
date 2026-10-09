@@ -70,6 +70,10 @@ export interface WizardSelections {
   proxmoxVmId?: number;
   /** Node and storage selections were verified by the current configure view. */
   proxmoxConfigureReady?: boolean;
+  /** The current configure view found active import storage on the node. */
+  proxmoxImportReady?: boolean;
+  /** Storage this flow enabled Import on, per server origin, for the reminder. */
+  proxmoxImportChanges?: { serverOrigin: string; storage: string }[];
   /** Set once the Proxmox VM exists, so a retry resumes instead of starting over. */
   proxmoxVmResult?: ProxmoxVmResult;
 

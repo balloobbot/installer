@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { approveProxmoxImport } from "./fixtures.js";
 
 test("holds Next until a restored bridge is verified for the current session", async ({
   page,
@@ -14,6 +15,7 @@ test("holds Next until a restored bridge is verified for the current session", a
   await expect(
     page.locator('wa-select[label="Network bridge"]')
   ).toHaveJSProperty("value", "vmbr0");
+  await approveProxmoxImport(page);
   await page.getByRole("button", { name: "Next", exact: true }).click();
   await page.evaluate(() => {
     const testWindow = window as typeof window & {
@@ -32,7 +34,7 @@ test("holds Next until a restored bridge is verified for the current session", a
             {
               name: "local",
               active: true,
-              content: ["images"],
+              content: ["images", "import"],
               available: 100,
             },
           ];
@@ -73,6 +75,7 @@ test("retains the chosen bridge and sends it to VM creation", async ({
     "value",
     "vmbr0"
   );
+  await approveProxmoxImport(page);
   // Keyboard selection, like the other Web Awesome selects, works in WebKit too
   const bridgeSelect = configure.getByRole("combobox", {
     name: "Network bridge",
