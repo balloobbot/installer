@@ -52,8 +52,9 @@ impl<'a> ProgressCallback for TauriProgressCallback<'a> {
             FlashStage::Writing => "writing",
             FlashStage::Verifying => "verifying",
             FlashStage::Finalizing => "finalizing",
-            FlashStage::Ready => "ready",
-            FlashStage::Updating => "updating",
+            FlashStage::Uploading => "uploading",
+            FlashStage::CreatingVm => "creating_vm",
+            FlashStage::StartingVm => "starting_vm",
             FlashStage::Complete => "complete",
             // Keep the failing stage, never the backend's free-form message.
             FlashStage::Error => {
@@ -532,7 +533,8 @@ pub fn resize_utm_vm_disk(vm_id: String, size_gb: u32) -> Result<(), CommandErro
 /// Get the status of a UTM VM
 #[tauri::command(async)]
 pub fn get_utm_vm_status(vm_id: String) -> Result<VmStatusInfo, CommandError> {
-    Backend.vm_status(&vm_id).map_err(CommandError::from)
+    // Fully qualified: `vm_status` is defined on both UtmBackend and ProxmoxBackend.
+    UtmBackend::vm_status(&Backend, &vm_id).map_err(CommandError::from)
 }
 
 // =============================================================================
@@ -646,6 +648,19 @@ pub async fn proxmox_create_vm(
                 error
             }),
     )
+}
+
+/// Get the run status and IP address of a Proxmox VM
+#[tauri::command]
+pub async fn proxmox_get_vm_status(
+    session: ProxmoxSession,
+    node: String,
+    vm_id: u32,
+) -> Result<VmStatusInfo, CommandError> {
+    // Fully qualified: `vm_status` is defined on both ProxmoxBackend and UtmBackend.
+    ProxmoxBackend::vm_status(&Backend, &session, &node, vm_id)
+        .await
+        .map_err(CommandError::from_query)
 }
 
 // =============================================================================
@@ -1629,6 +1644,23 @@ mod mock_tests {
         assert_eq!(bridges[0].name, "vmbr0");
         assert_eq!(bridges[0].network_type, "bridge");
         assert_eq!(bridges[0].comments, None);
+    }
+
+    #[tokio::test]
+    async fn proxmox_get_vm_status_asks_the_proxmox_backend() {
+        let session = ProxmoxSession {
+            server_url: "https://proxmox.example:8006".to_string(),
+            ticket: "mock-ticket".to_string(),
+            csrf_token: "mock-csrf-token".to_string(),
+            certificate_sha256: None,
+        };
+        let status = proxmox_get_vm_status(session, "pve".to_string(), 100)
+            .await
+            .unwrap();
+
+        // UTM reports "started", so this proves the Proxmox backend answered
+        assert_eq!(status.status, "running");
+        assert_eq!(status.ip_address.as_deref(), Some("192.168.1.100"));
     }
 
     /// A request for `device_id` whose `expected_device` matches what the mock

@@ -174,9 +174,9 @@ fn wide_integers_keep_the_existing_json_number_protocol() {
 fn renamed_stages_and_tagged_options_match_serde() {
     let config = Config::new().with_large_int("number");
     for stage in [
-        FlashStage::Ready,
-        FlashStage::Updating,
-        FlashStage::Finalizing,
+        FlashStage::Uploading,
+        FlashStage::CreatingVm,
+        FlashStage::StartingVm,
     ] {
         let serialized = serde_json::to_string(&stage).unwrap();
         assert!(FlashStage::decl(&config).contains(&serialized));

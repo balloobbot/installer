@@ -322,7 +322,11 @@ for (const tag of [
       page.getByRole("list", { name: "Installation stages" })
     ).toBeVisible();
     await expect(page.getByRole("listitem")).toHaveCount(
-      tag === "progress-view" ? 5 : 7
+      {
+        "progress-view": 5,
+        "proxmox-progress-view": 8,
+        "utm-progress-view": 7,
+      }[tag]!
     );
     // Stage labels are each flow's own descriptions in the shared layout
     await expect(page.locator('[aria-current="step"]')).toContainText(

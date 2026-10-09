@@ -1,5 +1,10 @@
 import { localize } from "../localization/localize.js";
-import type { HaosConfig, ProxmoxSession, UtmVmConfig } from "../api/types.js";
+import type {
+  HaosConfig,
+  ProxmoxSession,
+  ProxmoxVmResult,
+  UtmVmConfig,
+} from "../api/types.js";
 import type { InstallationPath } from "../views/path-selection-view.js";
 
 export type WizardFlow = InstallationPath;
@@ -65,6 +70,8 @@ export interface WizardSelections {
   proxmoxVmId?: number;
   /** Node and storage selections were verified by the current configure view. */
   proxmoxConfigureReady?: boolean;
+  /** Set once the Proxmox VM exists, so a retry resumes instead of starting over. */
+  proxmoxVmResult?: ProxmoxVmResult;
 
   [key: string]: unknown;
 }

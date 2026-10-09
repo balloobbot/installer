@@ -7,8 +7,19 @@ import { LitElement, html, css } from "lit";
 import { InstallDiagnostics } from "../../utils/diagnostics.js";
 import { customElement, state } from "lit/decorators.js";
 import { wizardState, type WizardState } from "../../state/wizard-state.js";
-import { proxmoxCreateVm } from "../../api/commands.js";
-import type { FlashProgress, ProxmoxVmConfig } from "../../api/types.js";
+import {
+  checkHaReady,
+  checkHaUpdated,
+  proxmoxCreateVm,
+  proxmoxGetVmStatus,
+} from "../../api/commands.js";
+import type {
+  FlashProgress,
+  FlashStage,
+  ProxmoxSession,
+  ProxmoxVmConfig,
+  ProxmoxVmResult,
+} from "../../api/types.js";
 import {
   DEFAULT_CPU_CORES,
   DEFAULT_DISK_SIZE_GB,
@@ -18,36 +29,80 @@ import {
   DEFAULT_PROXMOX_VM_ID,
   DEFAULT_PROXMOX_VM_NAME,
 } from "../../state/vm-defaults.js";
-import { isCancelled, throwIfCancelled } from "../../utils/polling.js";
+import {
+  PollTimeoutError,
+  isCancelled,
+  pollUntil,
+  throwIfCancelled,
+} from "../../utils/polling.js";
 import "../../components/install-progress.js";
 
+/** The stages `proxmoxCreateVm` reports, in order */
+const BACKEND_STAGES = [
+  "downloading",
+  "extracting",
+  "uploading",
+  "creating_vm",
+  "starting_vm",
+] as const satisfies readonly FlashStage[];
+
+type BackendStage = (typeof BACKEND_STAGES)[number];
+
+/** The backend's stages, then the waits for the VM and Home Assistant run from here */
 type InstallStage =
-  | "downloading"
-  | "extracting"
-  | "writing"
-  | "verifying"
-  | "finalizing"
+  | BackendStage
+  | "waiting"
   | "ready"
   | "updating"
   | "complete"
   | "error";
 
+function isBackendStage(stage: FlashStage): stage is BackendStage {
+  return (BACKEND_STAGES as readonly FlashStage[]).includes(stage);
+}
+
 // Stages that have measurable progress (0-100%)
 const MEASURABLE_STAGES: InstallStage[] = [
   "downloading",
   "extracting",
-  "writing",
+  "uploading",
 ];
 
 // Stages that use indeterminate progress (waiting for something, or unknown total size)
 const INDETERMINATE_STAGES: InstallStage[] = [
   "extracting",
-  "writing",
-  "verifying",
-  "finalizing",
+  "uploading",
+  "creating_vm",
+  "starting_vm",
+  "waiting",
   "ready",
   "updating",
 ];
+
+/** Delay between polls while waiting for the VM and Home Assistant */
+const POLL_INTERVAL_MS = 2000;
+
+/** How long to wait for the VM to report an IP address */
+const VM_IP_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** How long to wait for the Home Assistant webserver to answer */
+const HA_READY_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** How long to wait for Home Assistant to finish updating itself */
+const HA_UPDATED_TIMEOUT_MS = 60 * 60 * 1000;
+
+/**
+ * Whether a failed VM status request cannot succeed by asking again.
+ *
+ * An expired session or a missing permission fails every poll the same way,
+ * and waiting out the timeout would hide it behind "no IP address". Errors
+ * without a structured code are still treated as "not ready yet".
+ */
+function needsUserAction(error: unknown): boolean {
+  const { code, retryable } = installerError(error);
+  if (code === "unknown") return false;
+  return !retryable || code === "proxmox_action_required";
+}
 
 @customElement("proxmox-progress-view")
 export class ProxmoxProgressView extends LitElement {
@@ -93,7 +148,12 @@ export class ProxmoxProgressView extends LitElement {
     return this._error !== null;
   }
 
-  /** Retry the install operation */
+  /**
+   * Retry the install operation.
+   *
+   * A VM created by an earlier attempt is picked up from the wizard state
+   * instead of being created again. See `_startInstall`.
+   */
   retry(): void {
     if (!this._error?.retryable) return;
     this._error = null;
@@ -164,41 +224,33 @@ export class ProxmoxProgressView extends LitElement {
     };
 
     try {
-      this._stage = "downloading";
-      this._diagnostics?.advance("downloading");
-      this._stageStartTime = Date.now();
-      this._stageStartBytes = 0;
+      // Skipped when an earlier attempt already created the VM: running it
+      // again after a late failure would try to create a second VM with the
+      // same id, which Proxmox rejects.
+      let result = selections.proxmoxVmResult;
+      if (!result) {
+        result = await this._createVm(session, config, signal);
+        throwIfCancelled(signal);
+        wizardState.setSelection("proxmoxVmResult", result);
+      }
 
-      const result = await proxmoxCreateVm(
-        session,
-        config,
-        (progress: FlashProgress) => {
-          // Progress keeps arriving from the backend after a cancel; a
-          // detached view must stop reporting on it
-          if (signal.aborted) return;
+      // Wait for the VM to get an IP address. Asked again on a retry rather
+      // than reusing the last one: a restarted VM can get a new DHCP lease.
+      this._startStage("waiting");
+      wizardState.setSelection("ipAddress", undefined);
+      const ipAddress = await this._waitForVmIp(session, result, signal);
+      throwIfCancelled(signal);
+      wizardState.setSelection("ipAddress", ipAddress);
 
-          // Use raw per-stage progress
-          const newStage = progress.stage as InstallStage;
-          this._diagnostics?.advance(progress.stage);
-          if (newStage !== this._stage) {
-            this._stage = newStage;
-            this._stageStartTime = Date.now();
-            this._stageStartBytes = progress.bytes_processed;
-          }
-
-          this._progress = progress.progress;
-          this._bytesProcessed = progress.bytes_processed;
-          this._totalBytes = progress.total_bytes;
-        }
-      );
-
+      // Wait for the Home Assistant webserver to be ready
+      this._startStage("ready");
+      await this._waitForHaReady(ipAddress, signal);
       throwIfCancelled(signal);
 
-      // Store result in wizard state
-      wizardState.setSelection("proxmoxVmResult", result);
-      if (result.ip_address) {
-        wizardState.setSelection("ipAddress", result.ip_address);
-      }
+      // Wait for Home Assistant to finish updating
+      this._startStage("updating");
+      await this._waitForHaUpdated(ipAddress, signal);
+      throwIfCancelled(signal);
 
       // Complete
       this._stage = "complete";
@@ -219,7 +271,16 @@ export class ProxmoxProgressView extends LitElement {
         return;
       }
 
-      this._setError(error);
+      this._setError(
+        error instanceof PollTimeoutError
+          ? {
+              code: "timeout",
+              message: error.message,
+              retryable: true,
+              details: {},
+            }
+          : error
+      );
     } finally {
       // A newer attempt may own the component by now (cancel, then retry)
       if (this._abortController === controller) {
@@ -227,6 +288,119 @@ export class ProxmoxProgressView extends LitElement {
         this._abortController = undefined;
       }
     }
+  }
+
+  /** Create and start the VM, reporting the backend's progress */
+  private async _createVm(
+    session: ProxmoxSession,
+    config: ProxmoxVmConfig,
+    signal: AbortSignal
+  ): Promise<ProxmoxVmResult> {
+    this._stage = "downloading";
+    this._diagnostics?.advance("downloading");
+    this._stageStartTime = Date.now();
+    this._stageStartBytes = 0;
+
+    return proxmoxCreateVm(session, config, (progress: FlashProgress) => {
+      // Progress keeps arriving from the backend after a cancel; a
+      // detached view must stop reporting on it
+      if (signal.aborted) return;
+
+      if (!isBackendStage(progress.stage)) {
+        // A stage the backend gained without this view learning it
+        console.warn(
+          `Ignoring unknown Proxmox install stage: ${progress.stage}`
+        );
+        return;
+      }
+
+      // Use raw per-stage progress
+      this._diagnostics?.advance(progress.stage);
+      if (progress.stage !== this._stage) {
+        this._stage = progress.stage;
+        this._stageStartTime = Date.now();
+        this._stageStartBytes = progress.bytes_processed;
+      }
+
+      this._progress = progress.progress;
+      this._bytesProcessed = progress.bytes_processed;
+      this._totalBytes = progress.total_bytes;
+    });
+  }
+
+  /** Move to an indeterminate stage, clearing the previous stage's progress */
+  private _startStage(stage: InstallStage) {
+    this._diagnostics?.advance(stage);
+    this._stage = stage;
+    this._progress = 0;
+    this._stageStartTime = null;
+    this._bytesProcessed = 0;
+    this._totalBytes = 0;
+  }
+
+  /**
+   * Wait for the VM to get an IP address from its guest agent, polling every
+   * 2 seconds for up to 5 minutes.
+   *
+   * A status request that fails for a reason asking again cannot fix, like an
+   * expired session, ends the wait right away with that error.
+   */
+  private async _waitForVmIp(
+    session: ProxmoxSession,
+    { node, vm_id }: ProxmoxVmResult,
+    signal: AbortSignal
+  ): Promise<string> {
+    return pollUntil(
+      async () => (await proxmoxGetVmStatus(session, node, vm_id)).ip_address,
+      {
+        interval: POLL_INTERVAL_MS,
+        timeout: VM_IP_TIMEOUT_MS,
+        signal,
+        timeoutMessage: localize(
+          "views.proxmox.proxmox_progress_view.the_virtual_machine_did_not_report_an_ip_address"
+        ),
+        stopOn: needsUserAction,
+      }
+    );
+  }
+
+  /**
+   * Wait for the Home Assistant webserver to be ready on port 80, polling
+   * every 2 seconds for up to 5 minutes.
+   */
+  private async _waitForHaReady(
+    ipAddress: string,
+    signal: AbortSignal
+  ): Promise<void> {
+    await pollUntil(async () => (await checkHaReady(ipAddress)) || null, {
+      interval: POLL_INTERVAL_MS,
+      timeout: HA_READY_TIMEOUT_MS,
+      signal,
+      timeoutMessage: localize(
+        "views.proxmox.proxmox_progress_view.home_assistant_did_not_respond_at_value_within_5_minutes",
+        { value0: ipAddress }
+      ),
+    });
+  }
+
+  /**
+   * Wait for Home Assistant to finish updating to the latest version, which
+   * is when it starts serving `manifest.json`. Polls every 2 seconds for up
+   * to 1 hour.
+   */
+  private async _waitForHaUpdated(
+    ipAddress: string,
+    signal: AbortSignal
+  ): Promise<void> {
+    await pollUntil(async () => (await checkHaUpdated(ipAddress)) || null, {
+      interval: POLL_INTERVAL_MS,
+      timeout: HA_UPDATED_TIMEOUT_MS,
+      signal,
+      timeoutMessage: localize(
+        "views.proxmox.proxmox_progress_view.update_timeout",
+        { address: `http://${ipAddress}` }
+      ),
+    });
   }
 
   /** Show an error and tell the shell whether a retry is safe. */
@@ -255,9 +429,10 @@ export class ProxmoxProgressView extends LitElement {
         .stages=${[
           "downloading",
           "extracting",
-          "writing",
-          "verifying",
-          "finalizing",
+          "uploading",
+          "creating_vm",
+          "starting_vm",
+          "waiting",
           "ready",
           "updating",
         ].map((id) => ({
@@ -305,12 +480,14 @@ export class ProxmoxProgressView extends LitElement {
       case "downloading":
         return localize("views.proxmox.proxmox_progress_view.downloading");
       case "extracting":
+        return localize("views.sbc.progress_view.extracting");
+      case "uploading":
         return localize("views.proxmox.proxmox_progress_view.uploading");
-      case "writing":
+      case "creating_vm":
         return localize("views.proxmox.proxmox_progress_view.creating");
-      case "verifying":
+      case "starting_vm":
         return localize("views.proxmox.proxmox_progress_view.starting");
-      case "finalizing":
+      case "waiting":
         return localize("views.proxmox.proxmox_progress_view.connecting");
       case "ready":
         return localize("views.proxmox.proxmox_progress_view.waiting");
@@ -332,18 +509,20 @@ export class ProxmoxProgressView extends LitElement {
           "views.proxmox.proxmox_progress_view.downloading_home_assistant_os"
         );
       case "extracting":
+        return localize("views.sbc.progress_view.extracting_the_image");
+      case "uploading":
         return localize(
           "views.proxmox.proxmox_progress_view.uploading_image_to_proxmox"
         );
-      case "writing":
+      case "creating_vm":
         return localize(
           "views.proxmox.proxmox_progress_view.creating_virtual_machine"
         );
-      case "verifying":
+      case "starting_vm":
         return localize(
           "views.proxmox.proxmox_progress_view.starting_home_assistant_os"
         );
-      case "finalizing":
+      case "waiting":
         return localize(
           "views.proxmox.proxmox_progress_view.waiting_for_network_connection"
         );

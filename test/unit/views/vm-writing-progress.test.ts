@@ -44,7 +44,7 @@ describe("VM writing progress", () => {
 
       for (const progress of [0, 25, 75, 100]) {
         channel.onmessage({
-          stage: "writing",
+          stage: "uploading",
           progress,
           bytes_processed: progress * 1000,
           total_bytes: 100_000,
@@ -64,7 +64,7 @@ describe("VM writing progress", () => {
       }
 
       channel.onmessage({
-        stage: "writing",
+        stage: "uploading",
         progress: 50,
         bytes_processed: 0,
         total_bytes: 0,

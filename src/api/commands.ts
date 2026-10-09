@@ -594,11 +594,36 @@ export async function proxmoxGetNextVmId(
 }
 
 /**
- * Create a Home Assistant VM on Proxmox.
+ * Get the status of a Proxmox VM including its IP address if available.
+ * @param session The authentication session
+ * @param node Node the VM runs on
+ * @param vmId The VM ID
+ * @returns VM status and IP address
+ */
+export async function proxmoxGetVmStatus(
+  session: ProxmoxSession,
+  node: string,
+  vmId: number
+): Promise<VmStatusInfo> {
+  if (MOCK_ALLOWED && isBrowserOnly()) {
+    return {
+      status: "running",
+      ip_address: "192.168.1.150",
+    };
+  }
+  return invoke<VmStatusInfo>("proxmox_get_vm_status", {
+    session,
+    node,
+    vmId,
+  });
+}
+
+/**
+ * Create and start a Home Assistant VM on Proxmox.
  * @param session The authentication session
  * @param config VM configuration
  * @param onProgress Callback for progress updates
- * @returns Result with VM ID and IP address
+ * @returns Result with VM ID and node
  */
 export async function proxmoxCreateVm(
   session: ProxmoxSession,
@@ -644,31 +669,31 @@ async function simulateProxmoxInstall(
     },
     {
       stage: "extracting",
-      message: localize("api.commands.uploading_to_proxmox"),
-      weight: 25,
-      steps: 25,
+      message: localize("api.commands.extracting_image"),
+      weight: 10,
+      steps: 10,
       delay: 80,
     },
     {
-      stage: "writing",
-      message: localize("api.commands.creating_virtual_machine"),
+      stage: "uploading",
+      message: localize("api.commands.uploading_to_proxmox"),
       weight: 20,
       steps: 20,
+      delay: 80,
+    },
+    {
+      stage: "creating_vm",
+      message: localize("api.commands.creating_virtual_machine"),
+      weight: 15,
+      steps: 15,
       delay: 100,
     },
     {
-      stage: "verifying",
+      stage: "starting_vm",
       message: localize("api.commands.starting_home_assistant_os"),
-      weight: 10,
+      weight: 15,
       steps: 10,
       delay: 150,
-    },
-    {
-      stage: "finalizing",
-      message: localize("api.commands.waiting_for_network"),
-      weight: 5,
-      steps: 10,
-      delay: 200,
     },
   ];
 
@@ -687,24 +712,15 @@ async function simulateProxmoxInstall(
         message,
       });
 
-      if (stage === "writing" && step === 0) failMockOperation("proxmox");
+      if (stage === "creating_vm" && step === 0) failMockOperation("proxmox");
 
       await new Promise((resolve) => setTimeout(resolve, delay));
     }
     overallProgress += weight;
   }
 
-  onProgress({
-    stage: "complete",
-    progress: 100,
-    bytes_processed: 0,
-    total_bytes: 0,
-    message: localize("api.commands.installation_complete"),
-  });
-
   return {
     vm_id: config.vm_id,
     node: config.node,
-    ip_address: "192.168.1.150",
   };
 }

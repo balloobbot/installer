@@ -154,7 +154,21 @@ pub trait ProxmoxBackend {
     /// Get the next free VM id.
     async fn get_next_vm_id(&self, session: &ProxmoxSession) -> Result<u32>;
 
-    /// Create a Home Assistant VM, reporting progress.
+    /// Get a VM's run status and, while it runs, its IP address.
+    /// Backends without status queries report an error, so the install
+    /// never treats a VM it cannot see as ready.
+    async fn vm_status(
+        &self,
+        _session: &ProxmoxSession,
+        _node: &str,
+        _vm_id: u32,
+    ) -> Result<VmStatusInfo> {
+        Err(Error::ProxmoxApi(
+            "VM status is not supported by this backend".to_string(),
+        ))
+    }
+
+    /// Create and start a Home Assistant VM.
     async fn create_vm<P: ProgressCallback>(
         &self,
         session: &ProxmoxSession,

@@ -59,7 +59,7 @@ total_bytes: number,
  */
 message: string, };
 
-export type FlashStage = "downloading" | "extracting" | "writing" | "verifying" | "finalizing" | "ready" | "updating" | "complete" | "error";
+export type FlashStage = "downloading" | "extracting" | "writing" | "verifying" | "finalizing" | "uploading" | "creating_vm" | "starting_vm" | "complete" | "error";
 
 export type DeviceManifest = {
 /**
@@ -309,11 +309,7 @@ vm_id: number,
 /**
  * Node where VM was created
  */
-node: string,
-/**
- * IP address if available
- */
-ip_address: string | null, };
+node: string, };
 
 export type UtmVmConfig = {
 /**

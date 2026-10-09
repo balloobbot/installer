@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::types::{
     FlashProgress, FlashStage, ProxmoxBridge, ProxmoxCredentials, ProxmoxNode, ProxmoxSession,
-    ProxmoxStorage, ProxmoxVmConfig, ProxmoxVmResult,
+    ProxmoxStorage, ProxmoxVmConfig, ProxmoxVmResult, VmStatusInfo,
 };
 use crate::{ProgressCallback, ProxmoxBackend, Result};
 
@@ -91,27 +91,35 @@ impl ProxmoxBackend for BackendMock {
         Ok(100)
     }
 
+    async fn vm_status(
+        &self,
+        _session: &ProxmoxSession,
+        _node: &str,
+        _vm_id: u32,
+    ) -> Result<VmStatusInfo> {
+        Ok(VmStatusInfo {
+            status: "running".to_string(),
+            ip_address: Some("192.168.1.100".to_string()),
+        })
+    }
+
     async fn create_vm<P: ProgressCallback>(
         &self,
         _session: &ProxmoxSession,
         config: &ProxmoxVmConfig,
         progress_callback: &P,
     ) -> Result<ProxmoxVmResult> {
-        for (progress, message) in [
-            (10, "Downloading HAOS image..."),
-            (30, "Uploading to Proxmox..."),
-            (50, "Creating VM..."),
-            (70, "Configuring VM..."),
-            (90, "Starting VM..."),
-            (100, "Complete"),
+        // Same stages, in the same order, as the real `create_vm`
+        for (stage, message) in [
+            (FlashStage::Downloading, "Downloading HAOS image..."),
+            (FlashStage::Extracting, "Extracting image..."),
+            (FlashStage::Uploading, "Uploading to Proxmox..."),
+            (FlashStage::CreatingVm, "Creating virtual machine..."),
+            (FlashStage::StartingVm, "Starting virtual machine..."),
         ] {
             progress_callback.on_progress(FlashProgress {
-                stage: if progress < 100 {
-                    FlashStage::Downloading
-                } else {
-                    FlashStage::Complete
-                },
-                progress,
+                stage,
+                progress: 0,
                 bytes_processed: 0,
                 total_bytes: 0,
                 message: message.to_string(),
@@ -121,7 +129,6 @@ impl ProxmoxBackend for BackendMock {
         Ok(ProxmoxVmResult {
             vm_id: config.vm_id,
             node: config.node.clone(),
-            ip_address: Some("192.168.1.100".to_string()),
         })
     }
 }

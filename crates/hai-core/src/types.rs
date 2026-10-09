@@ -83,13 +83,18 @@ impl FlashProgress {
 pub enum FlashStage {
     Downloading,
     Extracting,
+    /// Writing the image to a disk
     Writing,
+    /// Verifying the image written to a disk
     Verifying,
+    /// Flushing a written disk before it is removed
     Finalizing,
-    /// Waiting for Home Assistant to be ready
-    Ready,
-    /// Updating Home Assistant to latest version
-    Updating,
+    /// Uploading the image to a hypervisor's storage
+    Uploading,
+    /// Creating a VM from the uploaded image
+    CreatingVm,
+    /// Starting a newly created VM
+    StartingVm,
     Complete,
     Error,
 }
@@ -391,8 +396,6 @@ pub struct ProxmoxVmResult {
     pub vm_id: u32,
     /// Node where VM was created
     pub node: String,
-    /// IP address if available
-    pub ip_address: Option<String>,
 }
 
 // ============================================================================
@@ -527,8 +530,9 @@ mod tests {
             FlashStage::Writing,
             FlashStage::Verifying,
             FlashStage::Finalizing,
-            FlashStage::Ready,
-            FlashStage::Updating,
+            FlashStage::Uploading,
+            FlashStage::CreatingVm,
+            FlashStage::StartingVm,
             FlashStage::Complete,
             FlashStage::Error,
         ];
@@ -724,8 +728,9 @@ mod tests {
             (FlashStage::Writing, "Writing to device..."),
             (FlashStage::Verifying, "Verifying write..."),
             (FlashStage::Finalizing, "Finalizing..."),
-            (FlashStage::Ready, "Waiting for Home Assistant..."),
-            (FlashStage::Updating, "Updating to latest version..."),
+            (FlashStage::Uploading, "Uploading to Proxmox..."),
+            (FlashStage::CreatingVm, "Creating virtual machine..."),
+            (FlashStage::StartingVm, "Starting virtual machine..."),
             (FlashStage::Complete, "Complete!"),
             (FlashStage::Error, "Error occurred"),
         ];
@@ -1035,30 +1040,13 @@ mod tests {
     }
 
     #[test]
-    fn test_proxmox_vm_result_with_ip() {
+    fn test_proxmox_vm_result_roundtrip() {
         let result = ProxmoxVmResult {
             vm_id: 100,
             node: "pve".to_string(),
-            ip_address: Some("192.168.1.100".to_string()),
-        };
-        let json = serde_json::to_string(&result).unwrap();
-        assert!(json.contains("192.168.1.100"));
-
-        let parsed: ProxmoxVmResult = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.vm_id, 100);
-        assert_eq!(parsed.ip_address, Some("192.168.1.100".to_string()));
-    }
-
-    #[test]
-    fn test_proxmox_vm_result_without_ip() {
-        let result = ProxmoxVmResult {
-            vm_id: 100,
-            node: "pve".to_string(),
-            ip_address: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: ProxmoxVmResult = serde_json::from_str(&json).unwrap();
-        assert!(parsed.ip_address.is_none());
         assert_eq!(parsed.vm_id, 100);
         assert_eq!(parsed.node, "pve");
     }

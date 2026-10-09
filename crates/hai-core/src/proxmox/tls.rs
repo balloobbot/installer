@@ -651,13 +651,13 @@ mod tests {
             super::super::delete_import_image(&session, "pve", "local", "fixture.qcow2")
                 .await
                 .unwrap_err(),
+            super::super::vm_status(&session, "pve", 100)
+                .await
+                .unwrap_err(),
         ];
         for error in errors {
             assert!(matches!(error, Error::ProxmoxCertificateChanged), "{error}");
         }
-        assert!(super::super::wait_for_vm_ip(&session, "pve", 100)
-            .await
-            .is_none());
         let config = crate::types::ProxmoxVmConfig {
             node: "pve".into(),
             storage: "local".into(),

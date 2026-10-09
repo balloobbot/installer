@@ -81,10 +81,11 @@ for (const flow of ["sbc", "utm", "proxmox"]) {
           window as unknown as { artworkProgress: (stage: string) => void }
         ).artworkProgress("complete")
       );
-      if (flow === "utm") {
-        // Download completion is not VM completion. Exercise the terminal render
-        // state without running provisioning or changing that pipeline contract.
-        await page.locator("utm-progress-view").evaluate((view) => {
+      if (flow !== "sbc") {
+        // A VM is not complete when the backend is done with it: the view
+        // still waits for Home Assistant. Exercise the terminal render state
+        // without running provisioning or changing that pipeline contract.
+        await page.locator(`${flow}-progress-view`).evaluate((view) => {
           (view as unknown as { _stage: string })._stage = "complete";
         });
       }
