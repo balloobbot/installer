@@ -13,16 +13,20 @@
 //! 5. Wait for upload task to complete
 //! 6. Create VM with UEFI/OVMF, EFI disk, and import-from to import the disk
 //! 7. Wait for VM creation task to complete
-//! 8. Start VM and wait for IP via QEMU guest agent
+//! 8. Resize the imported disk to the selected size and wait for completion
+//! 9. Start VM and wait for IP via QEMU guest agent
 //!
 //! References:
 //! - https://forum.proxmox.com/threads/api-equivalent-of-qm-importdisk.157457/
 //! - https://forum.proxmox.com/threads/guide-install-home-assistant-os-in-a-vm.143251/
 
+pub mod tls;
+
 use crate::error::{Error, Result};
 use crate::types::{
-    FlashProgress, FlashStage, HaosImage, HaosRelease, ImageFormat, ProxmoxCredentials,
-    ProxmoxNode, ProxmoxSession, ProxmoxStorage, ProxmoxVmConfig, ProxmoxVmResult,
+    FlashProgress, FlashStage, HaosImage, HaosRelease, ImageFormat, ProxmoxBridge,
+    ProxmoxCredentials, ProxmoxNode, ProxmoxSession, ProxmoxStorage, ProxmoxVmConfig,
+    ProxmoxVmResult,
 };
 use crate::{Backend, ProgressCallback, ProxmoxBackend, ReleaseSource};
 use std::collections::HashSet;
@@ -31,17 +35,34 @@ use std::collections::HashSet;
 /// Version 8.4.1 added support for uploading qcow2/raw/img/vmdk files with content=import.
 const MIN_PROXMOX_VERSION: (u32, u32, u32) = (8, 4, 1);
 
+/// Minimum size of the HAOS OVA disk, matching the configure view.
+const MIN_DISK_SIZE_GB: u32 = 32;
+
+fn validate_disk_size(disk_size_gb: u32) -> Result<()> {
+    if disk_size_gb < MIN_DISK_SIZE_GB {
+        return Err(Error::ProxmoxApi(format!(
+            "The HAOS disk must be at least {} GiB. Proxmox cannot shrink the imported disk.",
+            MIN_DISK_SIZE_GB
+        )));
+    }
+    Ok(())
+}
+
 /// How often to send progress updates (every N bytes)
 const PROGRESS_UPDATE_INTERVAL: u64 = 10 * 1024 * 1024; // 10 MB
 
 /// Create a configured HTTP client for Proxmox API calls.
-/// Accepts self-signed certificates (common for Proxmox installations).
-fn create_client(timeout_secs: u64) -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(timeout_secs))
-        .build()
-        .map_err(|e| Error::ProxmoxApi(format!("Failed to create HTTP client: {}", e)))
+fn create_client(session: &ProxmoxSession, timeout_secs: u64) -> Result<reqwest::Client> {
+    tls::client(
+        &session.server_url,
+        session.certificate_sha256.as_deref(),
+        timeout_secs,
+    )
+}
+
+fn request_error(error: reqwest::Error, context: &str) -> Error {
+    tls::certificate_error(&error)
+        .unwrap_or_else(|| Error::ProxmoxApi(format!("{}: {}", context, error)))
 }
 
 /// Parse a Proxmox version string like "8.4.1" into (major, minor, patch).
@@ -64,21 +85,117 @@ fn version_meets_minimum(version: (u32, u32, u32), minimum: (u32, u32, u32)) -> 
         || (version.0 == minimum.0 && version.1 == minimum.1 && version.2 >= minimum.2)
 }
 
+fn needs_second_factor(data: &serde_json::Value) -> bool {
+    let flagged = data.get("NeedTFA").is_some_and(|value| {
+        !matches!(
+            value,
+            serde_json::Value::Null | serde_json::Value::Bool(false)
+        ) && value != &serde_json::json!(0)
+    });
+    flagged
+        || data["ticket"]
+            .as_str()
+            .is_some_and(|ticket| ticket.starts_with("PVE:!"))
+}
+
+async fn complete_second_factor(
+    client: &reqwest::Client,
+    auth_url: &str,
+    credentials: &ProxmoxCredentials,
+    data: serde_json::Value,
+) -> Result<serde_json::Value> {
+    if !needs_second_factor(&data) {
+        return Ok(data);
+    }
+
+    // PVE embeds URL-encoded JSON in the signed ticket, as used by its web UI.
+    let ticket = data["ticket"].as_str().unwrap_or_default();
+    let challenge = ticket
+        .strip_prefix("PVE:!tfa!")
+        .and_then(|rest| rest.split(':').next())
+        .and_then(|encoded| urlencoding::decode(encoded).ok())
+        .and_then(|decoded| serde_json::from_str::<serde_json::Value>(&decoded).ok());
+    if challenge.as_ref().and_then(|value| value["totp"].as_bool()) != Some(true) {
+        return Err(Error::ProxmoxTwoFactor(
+            "This account requires a second factor, but Proxmox did not offer TOTP. \
+             This installer supports authenticator app (TOTP) codes only; \
+             WebAuthn, security keys, Yubico OTP, and recovery codes are not supported."
+                .to_string(),
+        ));
+    }
+
+    let code = credentials.totp.as_deref().unwrap_or_default().trim();
+    if code.is_empty() {
+        return Err(Error::ProxmoxTwoFactor(
+            "This account requires an authenticator app code. Enter the current code and try again."
+                .to_string(),
+        ));
+    }
+    if !(2..=16).contains(&code.len()) || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(Error::ProxmoxTwoFactor(
+            "Enter a valid numeric authenticator app code.".to_string(),
+        ));
+    }
+
+    let password = format!("totp:{code}");
+    let response = client
+        .post(auth_url)
+        .form(&[
+            ("username", credentials.username.as_str()),
+            ("password", password.as_str()),
+            ("tfa-challenge", ticket),
+        ])
+        .send()
+        .await
+        .map_err(|error| {
+            tls::certificate_error(&error).unwrap_or_else(|| {
+                Error::ProxmoxTwoFactor(
+                    "Could not complete the second-factor request. Check your connection and try again."
+                        .to_string(),
+                )
+            })
+        })?;
+    if !response.status().is_success() {
+        if response.status().as_u16() != 401 {
+            return Err(Error::ProxmoxTwoFactor(format!(
+                "Proxmox returned HTTP {} while completing the second-factor login. \
+                 Check the server and try again.",
+                response.status()
+            )));
+        }
+        return Err(Error::ProxmoxTwoFactor(
+            "Proxmox rejected the second-factor login. Check your current authenticator app code \
+             and try again. If it still fails, check the account in Proxmox."
+                .to_string(),
+        ));
+    }
+
+    let response: serde_json::Value = response.json().await.map_err(|_| {
+        Error::ProxmoxTwoFactor("Invalid second-factor response from Proxmox.".to_string())
+    })?;
+    let data = response.get("data").ok_or_else(|| {
+        Error::ProxmoxTwoFactor("Missing second-factor response from Proxmox.".to_string())
+    })?;
+    if needs_second_factor(data) {
+        return Err(Error::ProxmoxTwoFactor(
+            "The second-factor login is incomplete. Enter a current authenticator app code and try again."
+                .to_string(),
+        ));
+    }
+    Ok(data.clone())
+}
+
 /// Authenticate with a Proxmox server and verify version requirements.
 ///
 /// This function also verifies the Proxmox version is at least 8.4.1,
 /// which is required for disk image import via the API.
 async fn authenticate(credentials: &ProxmoxCredentials) -> Result<ProxmoxSession> {
-    // Validate URL format (skip in tests to allow mockito HTTP server)
-    #[cfg(not(test))]
-    if !credentials.server_url.starts_with("https://") {
-        return Err(Error::ProxmoxApi(
-            "Server URL must start with https://".to_string(),
-        ));
-    }
-
     let base_url = credentials.server_url.trim_end_matches('/');
-    let client = create_client(30)?;
+    let client = tls::client(
+        &credentials.server_url,
+        credentials.certificate_sha256.as_deref(),
+        30,
+    )?;
 
     // Step 1: Authenticate
     let auth_url = format!("{}/api2/json/access/ticket", base_url);
@@ -88,17 +205,20 @@ async fn authenticate(credentials: &ProxmoxCredentials) -> Result<ProxmoxSession
         .form(&[
             ("username", credentials.username.as_str()),
             ("password", credentials.password.as_str()),
+            ("new-format", "1"),
         ])
         .send()
         .await
         .map_err(|e| {
-            if e.is_timeout() {
-                Error::ProxmoxApi(
+            if let Some(error) = tls::certificate_error(&e) {
+                error
+            } else if e.is_timeout() {
+                Error::ProxmoxActionRequired(
                     "Connection timed out. Please check the server URL and network connectivity."
                         .to_string(),
                 )
             } else if e.is_connect() {
-                Error::ProxmoxApi(
+                Error::ProxmoxActionRequired(
                     "Failed to connect to Proxmox server. Please verify the URL is correct."
                         .to_string(),
                 )
@@ -110,11 +230,11 @@ async fn authenticate(credentials: &ProxmoxCredentials) -> Result<ProxmoxSession
     if !response.status().is_success() {
         let status = response.status();
         if status.as_u16() == 401 {
-            return Err(Error::ProxmoxApi(
+            return Err(Error::ProxmoxActionRequired(
                 "Authentication failed. Please check your username and password.".to_string(),
             ));
         } else if status.as_u16() == 403 {
-            return Err(Error::ProxmoxApi(
+            return Err(Error::ProxmoxActionRequired(
                 "Access denied. The user may not have sufficient permissions.".to_string(),
             ));
         }
@@ -133,6 +253,7 @@ async fn authenticate(credentials: &ProxmoxCredentials) -> Result<ProxmoxSession
     let data = json.get("data").ok_or_else(|| {
         Error::ProxmoxApi("Invalid response from server: missing 'data' field".to_string())
     })?;
+    let data = complete_second_factor(&client, &auth_url, credentials, data.clone()).await?;
 
     let ticket = data
         .get("ticket")
@@ -160,7 +281,7 @@ async fn authenticate(credentials: &ProxmoxCredentials) -> Result<ProxmoxSession
         .header("Cookie", format!("PVEAuthCookie={}", ticket))
         .send()
         .await
-        .map_err(|e| Error::ProxmoxApi(format!("Failed to get Proxmox version: {}", e)))?;
+        .map_err(|e| request_error(e, "Failed to get Proxmox version"))?;
 
     if !version_response.status().is_success() {
         return Err(Error::ProxmoxApi(format!(
@@ -187,11 +308,16 @@ async fn authenticate(credentials: &ProxmoxCredentials) -> Result<ProxmoxSession
     })?;
 
     if !version_meets_minimum(version, MIN_PROXMOX_VERSION) {
-        return Err(Error::ProxmoxApi(format!(
-            "Proxmox VE version {} is not supported. \
+        return Err(Error::ProxmoxActionRequired(format!(
+            "Proxmox VE version {}.{}.{} is not supported. \
              This installer requires Proxmox VE {}.{}.{} or later for disk image import. \
              Please upgrade your Proxmox installation.",
-            version_str, MIN_PROXMOX_VERSION.0, MIN_PROXMOX_VERSION.1, MIN_PROXMOX_VERSION.2
+            version.0,
+            version.1,
+            version.2,
+            MIN_PROXMOX_VERSION.0,
+            MIN_PROXMOX_VERSION.1,
+            MIN_PROXMOX_VERSION.2
         )));
     }
 
@@ -199,12 +325,13 @@ async fn authenticate(credentials: &ProxmoxCredentials) -> Result<ProxmoxSession
         server_url: credentials.server_url.clone(),
         ticket,
         csrf_token,
+        certificate_sha256: credentials.certificate_sha256.clone(),
     })
 }
 
 /// List available nodes on the Proxmox cluster
 async fn list_nodes(session: &ProxmoxSession) -> Result<Vec<ProxmoxNode>> {
-    let client = create_client(30)?;
+    let client = create_client(session, 30)?;
 
     let url = format!(
         "{}/api2/json/nodes",
@@ -217,16 +344,18 @@ async fn list_nodes(session: &ProxmoxSession) -> Result<Vec<ProxmoxNode>> {
         .send()
         .await
         .map_err(|e| {
-            if e.is_timeout() {
-                Error::ProxmoxApi(
+            if let Some(error) = tls::certificate_error(&e) {
+                error
+            } else if e.is_timeout() {
+                Error::ProxmoxActionRequired(
                     "Connection timed out while listing nodes. Please check network connectivity."
                         .to_string(),
                 )
             } else if e.is_connect() {
-                Error::ProxmoxApi(format!(
-                    "Failed to connect to Proxmox server at {}",
-                    session.server_url
-                ))
+                Error::ProxmoxActionRequired(
+                    "Could not connect to Proxmox. Check the server URL and network connection."
+                        .into(),
+                )
             } else {
                 Error::ProxmoxApi(format!("Network error while listing nodes: {}", e))
             }
@@ -235,11 +364,9 @@ async fn list_nodes(session: &ProxmoxSession) -> Result<Vec<ProxmoxNode>> {
     if !response.status().is_success() {
         let status = response.status();
         if status.as_u16() == 401 {
-            return Err(Error::ProxmoxApi(
-                "Authentication expired or invalid. Please reconnect to Proxmox.".to_string(),
-            ));
+            return Err(Error::ProxmoxSessionExpired);
         } else if status.as_u16() == 403 {
-            return Err(Error::ProxmoxApi(
+            return Err(Error::ProxmoxActionRequired(
                 "Access denied. Your user may not have permission to list nodes.".to_string(),
             ));
         }
@@ -279,9 +406,97 @@ async fn list_nodes(session: &ProxmoxSession) -> Result<Vec<ProxmoxNode>> {
     Ok(nodes)
 }
 
+/// Proxmox's pve-bridge-id format, restricted to ASCII identifiers.
+fn valid_bridge_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        && name != "."
+        && name != ".."
+}
+
+fn valid_sdn_zone(zone: &str) -> bool {
+    (2..=8).contains(&zone.len())
+        && zone.as_bytes()[0].is_ascii_alphabetic()
+        && zone.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// `any_bridge` includes Linux/OVS bridges and access-filtered, node-local running SDN VNets.
+async fn list_bridges(session: &ProxmoxSession, node: &str) -> Result<Vec<ProxmoxBridge>> {
+    let client = create_client(session, 30)?;
+    let response = client
+        .get(format!(
+            "{}/api2/json/nodes/{}/network?type=any_bridge",
+            session.server_url.trim_end_matches('/'),
+            urlencoding::encode(node)
+        ))
+        .header("Cookie", format!("PVEAuthCookie={}", session.ticket))
+        .send()
+        .await
+        .map_err(|e| request_error(e, "Failed to list network bridges"))?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(Error::ProxmoxSessionExpired);
+    }
+    if !response.status().is_success() {
+        return Err(Error::ProxmoxApi(format!(
+            "Failed to list network bridges: {}",
+            response.status()
+        )));
+    }
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| Error::ProxmoxApi(format!("Failed to parse network bridges: {}", e)))?;
+    let data = json.get("data").and_then(|v| v.as_array()).ok_or_else(|| {
+        Error::ProxmoxApi("Invalid network response: missing 'data' array".to_string())
+    })?;
+    let mut bridges = Vec::new();
+    for item in data {
+        let network_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if !matches!(network_type, "bridge" | "OVSBridge" | "vnet") {
+            continue;
+        }
+        let name = item
+            .get("iface")
+            .and_then(|v| v.as_str())
+            .filter(|name| valid_bridge_name(name))
+            .ok_or_else(|| {
+                Error::ProxmoxApi(
+                    "Invalid network bridge identifier returned by Proxmox".to_string(),
+                )
+            })?;
+        bridges.push(ProxmoxBridge {
+            name: name.to_string(),
+            network_type: network_type.to_string(),
+            comments: item
+                .get("comments")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        });
+    }
+    bridges.sort_by(|a, b| a.name.cmp(&b.name));
+    bridges.dedup_by(|a, b| a.name == b.name);
+    Ok(bridges)
+}
+
+async fn ensure_bridge_available(
+    session: &ProxmoxSession,
+    config: &ProxmoxVmConfig,
+) -> Result<ProxmoxBridge> {
+    if !valid_bridge_name(&config.bridge) {
+        return Err(Error::ProxmoxApi(
+            "Select a valid network bridge before continuing.".to_string(),
+        ));
+    }
+    list_bridges(session, &config.node).await?.into_iter()
+        .find(|bridge| bridge.name == config.bridge)
+        .ok_or_else(|| Error::ProxmoxApi(format!("Network bridge '{}' is no longer available on node '{}'. Return to configuration and select a network bridge.", config.bridge, config.node)))
+}
+
 /// List available storage on a node
 async fn list_storage(session: &ProxmoxSession, node: &str) -> Result<Vec<ProxmoxStorage>> {
-    let client = create_client(30)?;
+    let client = create_client(session, 30)?;
 
     let url = format!(
         "{}/api2/json/nodes/{}/storage",
@@ -294,7 +509,11 @@ async fn list_storage(session: &ProxmoxSession, node: &str) -> Result<Vec<Proxmo
         .header("Cookie", format!("PVEAuthCookie={}", session.ticket))
         .send()
         .await
-        .map_err(|e| Error::ProxmoxApi(format!("Failed to list storage: {}", e)))?;
+        .map_err(|e| request_error(e, "Failed to list storage"))?;
+
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(Error::ProxmoxSessionExpired);
+    }
 
     if !response.status().is_success() {
         return Err(Error::ProxmoxApi(format!(
@@ -356,14 +575,14 @@ fn select_import_storage(storage_list: &[ProxmoxStorage], required_bytes: u64) -
     }
 
     if !too_small.is_empty() {
-        return Err(Error::ProxmoxApi(format!(
+        return Err(Error::ProxmoxActionRequired(format!(
             "Not enough free space for the {} MB image on import storage: {}. Free up space or enable 'import' on another storage.",
             required_bytes / 1_000_000,
             too_small.join(", ")
         )));
     }
 
-    Err(Error::ProxmoxApi(
+    Err(Error::ProxmoxActionRequired(
         "No active storage with 'import' content type found. Enable 'import' on an active directory storage in PVE."
             .to_string(),
     ))
@@ -406,7 +625,7 @@ async fn uploadable_import_storages(
     }
 
     if allowed.is_empty() && !denied.is_empty() {
-        return Err(Error::ProxmoxApi(format!(
+        return Err(Error::ProxmoxActionRequired(format!(
             "Your Proxmox user cannot both upload to and read from any import storage (needs Datastore.AllocateTemplate plus one of Datastore.Allocate, Datastore.AllocateSpace, or Datastore.Audit on: {}).",
             denied.join(", ")
         )));
@@ -426,21 +645,21 @@ fn check_disk_storage(
         .iter()
         .find(|storage| storage.name == disk_storage)
         .ok_or_else(|| {
-            Error::ProxmoxApi(format!(
+            Error::ProxmoxActionRequired(format!(
                 "Storage '{}' was not found on this node.",
                 disk_storage
             ))
         })?;
 
     if !storage.active {
-        return Err(Error::ProxmoxApi(format!(
+        return Err(Error::ProxmoxActionRequired(format!(
             "Storage '{}' is not active.",
             disk_storage
         )));
     }
 
     if !storage.content.iter().any(|content| content == "images") {
-        return Err(Error::ProxmoxApi(format!(
+        return Err(Error::ProxmoxActionRequired(format!(
             "Storage '{}' cannot hold VM disks. Enable the 'Disk image' content type on it in PVE.",
             disk_storage
         )));
@@ -449,7 +668,7 @@ fn check_disk_storage(
     // Proxmox disk sizes like "32G" are GiB.
     let required_bytes = u64::from(disk_size_gb) * 1024 * 1024 * 1024;
     if storage.available < required_bytes {
-        return Err(Error::ProxmoxApi(format!(
+        return Err(Error::ProxmoxActionRequired(format!(
             "Not enough free space on '{}' for the {} GB disk ({} GB free).",
             disk_storage,
             disk_size_gb,
@@ -476,19 +695,11 @@ async fn ensure_vm_id_free(session: &ProxmoxSession, vm_id: u32) -> Result<()> {
         )));
     }
 
-    // Proxmox rejects a taken or invalid ID with 400; pass its reason on when it gives one.
-    let body = response.text().await.unwrap_or_default();
-    let reason = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|json| Some(json.get("errors")?.get("vmid")?.as_str()?.to_string()));
-
-    Err(Error::ProxmoxApi(match reason {
-        Some(reason) => format!(
-            "VM ID {} can't be used ({}). Choose a different ID.",
-            vm_id, reason
-        ),
-        None => format!("VM ID {} can't be used. Choose a different ID.", vm_id),
-    }))
+    // Keep the corrective action without exposing arbitrary server response data.
+    Err(Error::ProxmoxActionRequired(format!(
+        "VM ID {} can't be used. Choose a different ID.",
+        vm_id
+    )))
 }
 
 /// Call `/cluster/nextid`; with `vm_id` set, Proxmox checks that ID cluster-wide instead of picking one.
@@ -504,32 +715,29 @@ async fn send_nextid_request(
         url.push_str(&format!("?vmid={}", vm_id));
     }
 
-    create_client(30)?
+    create_client(session, 30)?
         .get(&url)
         .header("Cookie", format!("PVEAuthCookie={}", session.ticket))
         .send()
         .await
-        .map_err(|e| Error::ProxmoxApi(format!("Failed to query VM ID: {}", e)))
+        .map_err(|e| request_error(e, "Failed to query VM ID"))
 }
 
 /// Fail early if the node is missing from the cluster or not online.
 fn check_node_online(nodes: &[ProxmoxNode], node: &str) -> Result<()> {
     let found = nodes.iter().find(|n| n.name == node).ok_or_else(|| {
-        Error::ProxmoxApi(format!("Node '{}' was not found in the cluster.", node))
+        Error::ProxmoxActionRequired(format!("Node '{}' was not found in the cluster.", node))
     })?;
 
     if found.status != "online" {
-        return Err(Error::ProxmoxApi(format!(
-            "Node '{}' is {}, not online.",
-            node, found.status
+        return Err(Error::ProxmoxActionRequired(format!(
+            "Node '{}' is offline. Choose an online node or start it in Proxmox.",
+            node
         )));
     }
 
     Ok(())
 }
-
-/// Network bridge the VM's network card is attached to.
-const VM_BRIDGE: &str = "vmbr0";
 
 /// Privileges Proxmox checks on `/vms/{id}` for the options `create_vm_with_disk` sends.
 const VM_CREATE_PRIVILEGES: &[&str] = &[
@@ -544,7 +752,7 @@ const VM_CREATE_PRIVILEGES: &[&str] = &[
 
 /// Privileges the logged-in user has on `path`, including inherited ones.
 async fn fetch_privileges(session: &ProxmoxSession, path: &str) -> Result<HashSet<String>> {
-    let client = create_client(30)?;
+    let client = create_client(session, 30)?;
 
     let url = format!(
         "{}/api2/json/access/permissions?path={}",
@@ -557,7 +765,7 @@ async fn fetch_privileges(session: &ProxmoxSession, path: &str) -> Result<HashSe
         .header("Cookie", format!("PVEAuthCookie={}", session.ticket))
         .send()
         .await
-        .map_err(|e| Error::ProxmoxApi(format!("Failed to check permissions: {}", e)))?;
+        .map_err(|e| request_error(e, "Failed to check permissions"))?;
 
     if !response.status().is_success() {
         return Err(Error::ProxmoxApi(format!(
@@ -591,7 +799,7 @@ fn ensure_privileges(granted: &HashSet<String>, path: &str, required: &[&str]) -
         return Ok(());
     }
 
-    Err(Error::ProxmoxApi(format!(
+    Err(Error::ProxmoxActionRequired(format!(
         "Your Proxmox user is missing {} on {}.",
         missing.join(", "),
         path
@@ -614,8 +822,49 @@ async fn ensure_user_can_create_vm(
         &required,
     )?;
 
-    // Plain bridges are checked under the built-in `localnetwork` SDN zone.
-    let bridge_path = format!("/sdn/zones/localnetwork/{}", VM_BRIDGE);
+    ensure_bridge_access(session, config).await
+}
+
+async fn ensure_bridge_access(session: &ProxmoxSession, config: &ProxmoxVmConfig) -> Result<()> {
+    let bridge = ensure_bridge_available(session, config).await?;
+    let zone = if bridge.network_type == "vnet" {
+        // GuestHelpers::check_vnet_access checks the edited config, even when
+        // a zone move has not been applied. Do not request running=1 here.
+        let client = create_client(session, 30)?;
+        let response = client
+            .get(format!(
+                "{}/api2/json/cluster/sdn/vnets/{}",
+                session.server_url.trim_end_matches('/'),
+                urlencoding::encode(&bridge.name)
+            ))
+            .header("Cookie", format!("PVEAuthCookie={}", session.ticket))
+            .send()
+            .await
+            .map_err(|e| request_error(e, "Failed to check SDN VNet configuration"))?;
+        if response.status() == reqwest::StatusCode::FORBIDDEN {
+            return Err(Error::ProxmoxApi(format!("Cannot read SDN VNet '{}'. Grant SDN.Audit on this VNet so its network permissions can be checked.", bridge.name)));
+        }
+        if !response.status().is_success() {
+            return Err(Error::ProxmoxApi(format!(
+                "Cannot read the selected SDN VNet's configuration: {}",
+                response.status()
+            )));
+        }
+        let json: serde_json::Value = response.json().await.map_err(|e| {
+            Error::ProxmoxApi(format!("Failed to parse SDN VNet configuration: {}", e))
+        })?;
+        json.get("data")
+            .and_then(|v| v.get("zone"))
+            .and_then(|v| v.as_str())
+            .filter(|zone| valid_sdn_zone(zone))
+            .ok_or_else(|| {
+                Error::ProxmoxApi("Missing or invalid SDN zone for the selected VNet".to_string())
+            })?
+            .to_string()
+    } else {
+        "localnetwork".to_string()
+    };
+    let bridge_path = format!("/sdn/zones/{}/{}", zone, bridge.name);
     ensure_privileges(
         &fetch_privileges(session, &bridge_path).await?,
         &bridge_path,
@@ -679,6 +928,10 @@ async fn recheck_before_upload(
 /// Get the next available VM ID on the Proxmox server.
 async fn get_next_vm_id(session: &ProxmoxSession) -> Result<u32> {
     let response = send_nextid_request(session, None).await?;
+
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(Error::ProxmoxSessionExpired);
+    }
 
     if !response.status().is_success() {
         return Err(Error::ProxmoxApi(format!(
@@ -748,7 +1001,7 @@ async fn wait_for_task_completion(
         urlencoding::encode(upid)
     );
 
-    let client = create_client(30)?;
+    let client = create_client(session, 30)?;
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(timeout_secs);
 
@@ -765,7 +1018,7 @@ async fn wait_for_task_completion(
             .header("Cookie", format!("PVEAuthCookie={}", session.ticket))
             .send()
             .await
-            .map_err(|e| Error::ProxmoxApi(format!("Failed to check task status: {}", e)))?;
+            .map_err(|e| request_error(e, "Failed to check task status"))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -822,11 +1075,11 @@ async fn upload_image_to_proxmox<P: ProgressCallback>(
     progress_callback: &P,
     storage_name: &str,
 ) -> Result<String> {
-    use futures_util::stream;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Arc;
+    use futures_util::TryStreamExt;
     use tokio::fs::File;
     use tokio::io::AsyncReadExt;
+    use tokio::sync::watch;
+    use tokio_util::io::ReaderStream;
 
     // Get the filename from the path
     let filename = local_path
@@ -840,11 +1093,10 @@ async fn upload_image_to_proxmox<P: ProgressCallback>(
         progress: 0,
         bytes_processed: 0,
         total_bytes: 0,
-        message: format!("Reading {} for upload...", filename),
+        message: format!("Preparing {} for upload...", filename),
     });
 
-    // Read the file into memory
-    let mut file = File::open(local_path)
+    let file = File::open(local_path)
         .await
         .map_err(|e| Error::ProxmoxApi(format!("Failed to open image file: {}", e)))?;
 
@@ -853,11 +1105,6 @@ async fn upload_image_to_proxmox<P: ProgressCallback>(
         .await
         .map_err(|e| Error::ProxmoxApi(format!("Failed to get file metadata: {}", e)))?
         .len();
-
-    let mut file_contents = Vec::with_capacity(file_size as usize);
-    file.read_to_end(&mut file_contents)
-        .await
-        .map_err(|e| Error::ProxmoxApi(format!("Failed to read image file: {}", e)))?;
 
     progress_callback.on_progress(FlashProgress {
         stage: FlashStage::Writing,
@@ -880,37 +1127,23 @@ async fn upload_image_to_proxmox<P: ProgressCallback>(
     );
 
     // Create client with longer timeout for large uploads
-    let client = create_client(1800)?; // 30 minutes
+    let client = create_client(session, 1800)?; // 30 minutes
 
-    // Create a chunked stream that reports upload progress
-    let chunk_size = 256 * 1024; // 256KB chunks
-    let bytes_sent = Arc::new(AtomicU64::new(0));
-
-    // Convert file contents to owned chunks for streaming
-    let chunks: Vec<Vec<u8>> = file_contents
-        .chunks(chunk_size)
-        .map(|c| c.to_vec())
-        .collect();
-    let total_chunks = chunks.len();
-
-    // Track last progress update
-    let last_progress_bytes = Arc::new(AtomicU64::new(0));
-    let last_progress_bytes_clone = Arc::clone(&last_progress_bytes);
-
-    let progress_stream = stream::iter(chunks.into_iter().enumerate().map(
-        move |(chunk_idx, chunk)| {
-            let chunk_len = chunk.len() as u64;
-            let sent = bytes_sent.fetch_add(chunk_len, Ordering::SeqCst) + chunk_len;
-            let last_update = last_progress_bytes_clone.load(Ordering::SeqCst);
-
-            // Send progress update every PROGRESS_UPDATE_INTERVAL bytes or at the end
-            if sent - last_update >= PROGRESS_UPDATE_INTERVAL || chunk_idx == total_chunks - 1 {
-                last_progress_bytes_clone.store(sent, Ordering::SeqCst);
+    // The body owns the file; a watch channel keeps progress bounded while the
+    // caller retains its borrowed callback. Reads follow HTTP backpressure.
+    let (progress_tx, mut progress_rx) = watch::channel(0_u64);
+    let mut bytes_sent = 0;
+    let mut last_progress_bytes = 0;
+    let progress_stream =
+        ReaderStream::with_capacity(file.take(file_size), 256 * 1024).inspect_ok(move |chunk| {
+            bytes_sent += chunk.len() as u64;
+            if bytes_sent - last_progress_bytes >= PROGRESS_UPDATE_INTERVAL
+                || bytes_sent == file_size
+            {
+                progress_tx.send_replace(bytes_sent);
+                last_progress_bytes = bytes_sent;
             }
-
-            Ok::<_, std::io::Error>(chunk)
-        },
-    ));
+        });
 
     // Create the multipart part with streaming body
     let body = reqwest::Body::wrap_stream(progress_stream);
@@ -923,14 +1156,47 @@ async fn upload_image_to_proxmox<P: ProgressCallback>(
         .text("content", "import")
         .part("filename", file_part);
 
-    let response = client
+    let request = client
         .post(&url)
         .header("Cookie", format!("PVEAuthCookie={}", session.ticket))
         .header("CSRFPreventionToken", &session.csrf_token)
         .multipart(form)
-        .send()
-        .await
-        .map_err(|e| Error::ProxmoxApi(format!("Failed to upload image: {}", e)))?;
+        .send();
+    tokio::pin!(request);
+    let mut progress_open = true;
+    let response = loop {
+        tokio::select! {
+            biased;
+            changed = progress_rx.changed(), if progress_open => {
+                if changed.is_err() {
+                    progress_open = false;
+                    continue;
+                }
+                let bytes_sent = *progress_rx.borrow_and_update();
+                progress_callback.on_progress(FlashProgress {
+                    stage: FlashStage::Writing,
+                    progress: 5 + (bytes_sent as f64 / file_size.max(1) as f64 * 90.0) as u8,
+                    bytes_processed: bytes_sent,
+                    total_bytes: file_size,
+                    message: format!("Uploading {} to Proxmox...", filename),
+                });
+            }
+            response = &mut request => {
+                break response.map_err(|error| {
+                    if let Some(error) = tls::certificate_error(&error) {
+                        return error;
+                    }
+                    let mut message = format!("Failed to upload image: {error}");
+                    let mut source = std::error::Error::source(&error);
+                    while let Some(cause) = source {
+                        message.push_str(&format!(": {cause}"));
+                        source = cause.source();
+                    }
+                    Error::ProxmoxApi(message)
+                })?;
+            }
+        }
+    };
 
     let status = response.status();
     let response_text = response.text().await.unwrap_or_default();
@@ -976,7 +1242,7 @@ async fn upload_image_to_proxmox<P: ProgressCallback>(
 /// Create a VM with the disk imported during creation.
 ///
 /// Uses the `import-from` parameter on scsi0 to import the uploaded
-/// disk image during VM creation.
+/// disk image during VM creation, then grows it to the selected size.
 async fn create_vm_with_disk(
     session: &ProxmoxSession,
     config: &ProxmoxVmConfig,
@@ -984,13 +1250,24 @@ async fn create_vm_with_disk(
     storage_name: &str,
     source_unused: &mut bool,
 ) -> Result<()> {
+    if let Err(error) = validate_disk_size(config.disk_size_gb) {
+        *source_unused = true;
+        return Err(error);
+    }
+
+    // Networks and ACLs can change during the download/upload.
+    if let Err(error) = ensure_bridge_access(session, config).await {
+        // No create request was sent, so the uploaded source is unused.
+        *source_unused = true;
+        return Err(error);
+    }
     let url = format!(
         "{}/api2/json/nodes/{}/qemu",
         session.server_url.trim_end_matches('/'),
         config.node
     );
 
-    let client = create_client(300)?; // 5 minutes for VM creation with disk import
+    let client = create_client(session, 300)?; // 5 minutes for VM creation with disk import
 
     // Build the disk import specification
     // Format: storage:0,import-from="storage name":import/filename.qcow2
@@ -1018,13 +1295,13 @@ async fn create_vm_with_disk(
             ("ostype", "l26".to_string()), // Linux 2.6/3.x/4.x/5.x/6.x kernel
             ("efidisk0", efidisk0_spec),  // EFI disk for UEFI
             ("scsi0", scsi0_spec),        // Main disk with import
-            ("net0", format!("virtio,bridge={}", VM_BRIDGE)), // VirtIO network
+            ("net0", format!("virtio,bridge={}", config.bridge)), // VirtIO network
             ("agent", "enabled=1".to_string()), // QEMU guest agent
             ("boot", "order=scsi0".to_string()), // Boot from main disk
         ])
         .send()
         .await
-        .map_err(|e| Error::ProxmoxApi(format!("Failed to create VM: {}", e)))?;
+        .map_err(|e| request_error(e, "Failed to create VM"))?;
 
     let status = response.status();
     let response_text = response.text().await.unwrap_or_default();
@@ -1052,7 +1329,63 @@ async fn create_vm_with_disk(
     // Deleting the source is only safe after confirmed import completion.
     wait_for_task_completion(session, &config.node, upid, 600, source_unused).await?;
 
-    Ok(())
+    resize_vm_disk(session, config)
+        .await
+        .map_err(|error| resize_error(config.vm_id, error))
+}
+
+fn resize_error(vm_id: u32, error: Error) -> Error {
+    let message = match error {
+        // Keep its own code, so the user is told to reconnect
+        Error::ProxmoxCertificateChanged => return error,
+        Error::ProxmoxApi(message) => message,
+        other => other.to_string(),
+    };
+    Error::ProxmoxApi(format!(
+        "VM {vm_id} was created but its disk could not be resized: {message}"
+    ))
+}
+
+/// Apply an absolute size, including the minimum, so Proxmox checks the actual
+/// imported volume and rejects shrinking if a future HAOS image is larger.
+async fn resize_vm_disk(session: &ProxmoxSession, config: &ProxmoxVmConfig) -> Result<()> {
+    let url = format!(
+        "{}/api2/json/nodes/{}/qemu/{}/resize",
+        session.server_url.trim_end_matches('/'),
+        config.node,
+        config.vm_id
+    );
+    let client = create_client(session, 60)?;
+    let response = client
+        .put(&url)
+        .header("Cookie", format!("PVEAuthCookie={}", session.ticket))
+        .header("CSRFPreventionToken", &session.csrf_token)
+        .form(&[
+            ("disk", "scsi0".to_string()),
+            ("size", format!("{}G", config.disk_size_gb)),
+        ])
+        .send()
+        .await
+        .map_err(|e| request_error(e, "Failed to resize VM disk"))?;
+
+    let status = response.status();
+    let response_text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(Error::ProxmoxApi(format!(
+            "Failed to resize VM disk ({}): {}",
+            status, response_text
+        )));
+    }
+
+    let json: serde_json::Value = serde_json::from_str(&response_text)
+        .map_err(|e| Error::ProxmoxApi(format!("Failed to parse disk resize response: {}", e)))?;
+    let upid = json
+        .get("data")
+        .and_then(|v| v.as_str())
+        .filter(|upid| !upid.is_empty())
+        .ok_or_else(|| Error::ProxmoxApi("Disk resize response missing task UPID".to_string()))?;
+
+    wait_for_task(session, &config.node, upid, 600).await
 }
 
 async fn delete_import_image(
@@ -1069,12 +1402,13 @@ async fn delete_import_image(
         urlencoding::encode(storage),
         urlencoding::encode(&volume)
     );
-    let response = create_client(60)?
+    let response = create_client(session, 60)?
         .delete(url)
         .header("Cookie", format!("PVEAuthCookie={}", session.ticket))
         .header("CSRFPreventionToken", &session.csrf_token)
         .send()
-        .await?;
+        .await
+        .map_err(|e| request_error(e, "Could not delete import volume"))?;
     if !response.status().is_success() {
         return Err(Error::ProxmoxApi(format!(
             "Could not delete import volume {volume}: HTTP {}",
@@ -1108,7 +1442,7 @@ async fn import_and_cleanup_image(
         &mut source_unused,
     )
     .await;
-    // The request was rejected or the import task has stopped. Cleanup is
+    // Creation was prevented/rejected or the import task stopped. Cleanup is
     // best effort and must never replace the original installation result.
     if source_unused {
         if let Err(error) =
@@ -1132,7 +1466,7 @@ async fn start_vm(session: &ProxmoxSession, node: &str, vm_id: u32) -> Result<()
         vm_id
     );
 
-    let client = create_client(60)?;
+    let client = create_client(session, 60)?;
 
     let response = client
         .post(&url)
@@ -1140,7 +1474,7 @@ async fn start_vm(session: &ProxmoxSession, node: &str, vm_id: u32) -> Result<()
         .header("CSRFPreventionToken", &session.csrf_token)
         .send()
         .await
-        .map_err(|e| Error::ProxmoxApi(format!("Failed to start VM: {}", e)))?;
+        .map_err(|e| request_error(e, "Failed to start VM"))?;
 
     let status = response.status();
     let response_text = response.text().await.unwrap_or_default();
@@ -1173,7 +1507,10 @@ async fn wait_for_ha_webserver(ip: &str) -> bool {
 
 /// Internal helper that accepts a full base URL (for testing).
 async fn wait_for_ha_webserver_at_url(base_url: &str) -> bool {
-    let client = match create_client(10) {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
         Ok(c) => c,
         Err(_) => return false,
     };
@@ -1207,7 +1544,10 @@ async fn wait_for_ha_updated(ip: &str) -> bool {
 /// Internal helper that accepts a full base URL (for testing).
 async fn wait_for_ha_updated_at_url(base_url: &str) -> bool {
     let url = format!("{}/manifest.json", base_url);
-    let client = match create_client(10) {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
         Ok(c) => c,
         Err(_) => return false,
     };
@@ -1241,7 +1581,7 @@ async fn wait_for_vm_ip(session: &ProxmoxSession, node: &str, vm_id: u32) -> Opt
         vm_id
     );
 
-    let client = create_client(10).ok()?;
+    let client = create_client(session, 10).ok()?;
 
     // Try for up to 5 minutes (150 attempts * 2 seconds)
     for _ in 0..150 {
@@ -1297,6 +1637,8 @@ async fn create_vm<B: ReleaseSource, P: ProgressCallback>(
     config: &ProxmoxVmConfig,
     progress_callback: &P,
 ) -> Result<ProxmoxVmResult> {
+    validate_disk_size(config.disk_size_gb)?;
+
     // Step 1: Get HAOS release info
     progress_callback.on_progress(FlashProgress {
         stage: FlashStage::Downloading,
@@ -1350,7 +1692,6 @@ async fn create_vm<B: ReleaseSource, P: ProgressCallback>(
     backend
         .extract_temporary_image(&temporary_image, progress_callback)
         .await?;
-    temporary_image.cache_archive(&cache_dir, "ova", haos_version);
 
     let storage_name = recheck_before_upload(session, config, &extracted_path).await?;
 
@@ -1365,7 +1706,7 @@ async fn create_vm<B: ReleaseSource, P: ProgressCallback>(
     .await?;
     drop(temporary_image);
 
-    // Step 5: Create the VM with disk import
+    // Step 5: Create the VM with disk import and apply the selected size
     progress_callback.on_progress(FlashProgress {
         stage: FlashStage::Verifying,
         progress: 0,
@@ -1446,6 +1787,10 @@ async fn create_vm<B: ReleaseSource, P: ProgressCallback>(
 }
 
 impl ProxmoxBackend for Backend {
+    async fn certificate_fingerprint(&self, server_url: &str) -> Result<Option<String>> {
+        tls::certificate_fingerprint(server_url).await
+    }
+
     async fn authenticate(&self, credentials: &ProxmoxCredentials) -> Result<ProxmoxSession> {
         authenticate(credentials).await
     }
@@ -1464,6 +1809,14 @@ impl ProxmoxBackend for Backend {
 
     async fn get_next_vm_id(&self, session: &ProxmoxSession) -> Result<u32> {
         get_next_vm_id(session).await
+    }
+
+    async fn list_bridges(
+        &self,
+        session: &ProxmoxSession,
+        node: &str,
+    ) -> Result<Vec<ProxmoxBridge>> {
+        list_bridges(session, node).await
     }
 
     async fn create_vm<P: ProgressCallback>(
@@ -1546,19 +1899,19 @@ mod tests {
     // create_client() tests
     #[test]
     fn test_create_client_valid_timeout() {
-        let result = create_client(30);
+        let result = tls::client("https://pve.example:8006", None, 30);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_create_client_zero_timeout() {
-        let result = create_client(0);
+        let result = tls::client("https://pve.example:8006", None, 0);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_create_client_large_timeout() {
-        let result = create_client(1800);
+        let result = tls::client("https://pve.example:8006", None, 1800);
         assert!(result.is_ok());
     }
 
@@ -1632,7 +1985,7 @@ mod tests {
             ..storage("local-lvm", true, &["images"])
         }];
         match check_disk_storage(&storage_list, "local-lvm", 32) {
-            Err(Error::ProxmoxApi(msg)) => {
+            Err(Error::ProxmoxActionRequired(msg)) => {
                 assert!(msg.contains("Not enough free space"), "{}", msg);
                 assert!(msg.contains("32 GB"), "{}", msg);
                 assert!(msg.contains("20 GB free"), "{}", msg);
@@ -1645,7 +1998,7 @@ mod tests {
     fn test_check_disk_storage_rejects_missing_storage() {
         let storage_list = vec![storage("local-lvm", true, &["images"])];
         match check_disk_storage(&storage_list, "ceph-pool", 32) {
-            Err(Error::ProxmoxApi(msg)) => assert!(msg.contains("not found"), "{}", msg),
+            Err(Error::ProxmoxActionRequired(msg)) => assert!(msg.contains("not found"), "{}", msg),
             other => panic!("Expected not-found error, got {:?}", other),
         }
     }
@@ -1654,7 +2007,9 @@ mod tests {
     fn test_check_disk_storage_rejects_inactive_storage() {
         let storage_list = vec![storage("local-lvm", false, &["images"])];
         match check_disk_storage(&storage_list, "local-lvm", 32) {
-            Err(Error::ProxmoxApi(msg)) => assert!(msg.contains("not active"), "{}", msg),
+            Err(Error::ProxmoxActionRequired(msg)) => {
+                assert!(msg.contains("not active"), "{}", msg)
+            }
             other => panic!("Expected inactive error, got {:?}", other),
         }
     }
@@ -1664,7 +2019,9 @@ mod tests {
         // The import storage is a common wrong pick: it's active but can't hold VM disks.
         let storage_list = vec![storage("local", true, &["iso", "import"])];
         match check_disk_storage(&storage_list, "local", 32) {
-            Err(Error::ProxmoxApi(msg)) => assert!(msg.contains("Disk image"), "{}", msg),
+            Err(Error::ProxmoxActionRequired(msg)) => {
+                assert!(msg.contains("Disk image"), "{}", msg)
+            }
             other => panic!("Expected missing-images error, got {:?}", other),
         }
     }
@@ -1702,7 +2059,7 @@ mod tests {
         ];
 
         match select_import_storage(&storage_list, 0) {
-            Err(Error::ProxmoxApi(msg)) => assert!(msg.contains("import"), "{}", msg),
+            Err(Error::ProxmoxActionRequired(msg)) => assert!(msg.contains("import"), "{}", msg),
             other => panic!("Expected no-import-storage error, got {:?}", other),
         }
     }
@@ -1743,7 +2100,7 @@ mod tests {
             ..storage("small-import", true, &["import"])
         }];
         match select_import_storage(&storage_list, 1_000_000_000) {
-            Err(Error::ProxmoxApi(msg)) => {
+            Err(Error::ProxmoxActionRequired(msg)) => {
                 assert!(msg.contains("Not enough free space"), "{}", msg);
                 assert!(msg.contains("small-import"), "{}", msg);
             }
@@ -1761,7 +2118,7 @@ mod tests {
         assert!(ensure_privileges(&granted, "/vms/100", &["VM.Allocate"]).is_ok());
 
         match ensure_privileges(&granted, "/vms/100", &["VM.Allocate", "VM.Config.CPU"]) {
-            Err(Error::ProxmoxApi(msg)) => {
+            Err(Error::ProxmoxActionRequired(msg)) => {
                 assert!(msg.contains("VM.Config.CPU"), "{}", msg);
                 assert!(msg.contains("/vms/100"), "{}", msg);
                 assert!(!msg.contains("VM.Allocate"), "{}", msg);
@@ -1790,7 +2147,7 @@ mod tests {
     fn test_check_node_online_rejects_offline_node() {
         let nodes = vec![node("pve", "online"), node("pve2", "offline")];
         match check_node_online(&nodes, "pve2") {
-            Err(Error::ProxmoxApi(msg)) => assert!(msg.contains("offline"), "{}", msg),
+            Err(Error::ProxmoxActionRequired(msg)) => assert!(msg.contains("offline"), "{}", msg),
             other => panic!("Expected offline error, got {:?}", other),
         }
     }
@@ -1799,7 +2156,7 @@ mod tests {
     fn test_check_node_online_rejects_missing_node() {
         let nodes = vec![node("pve", "online")];
         match check_node_online(&nodes, "pve3") {
-            Err(Error::ProxmoxApi(msg)) => assert!(msg.contains("not found"), "{}", msg),
+            Err(Error::ProxmoxActionRequired(msg)) => assert!(msg.contains("not found"), "{}", msg),
             other => panic!("Expected not-found error, got {:?}", other),
         }
     }
@@ -1876,9 +2233,11 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
@@ -1895,6 +2254,171 @@ mod tests {
 
         #[tokio::test]
         #[serial]
+        async fn test_authenticate_two_factor() {
+            let challenge = format!(
+                "PVE:!tfa!{}:12345678::signature",
+                urlencoding::encode(r#"{"totp":true,"recovery":[1,2]}"#)
+            );
+            let unsupported = format!(
+                "PVE:!tfa!{}:12345678::signature",
+                urlencoding::encode(r#"{"webauthn":{},"recovery":[1]}"#)
+            );
+            let complete = serde_json::json!({
+                "ticket": "PVE:root@pam:12345678::complete",
+                "CSRFPreventionToken": "final-csrf",
+            });
+            let partial = serde_json::json!({"ticket": challenge, "NeedTFA": 1});
+
+            for (initial, code, second_status, second_data, error) in [
+                (
+                    partial.clone(),
+                    None,
+                    200,
+                    complete.clone(),
+                    Some("requires an authenticator"),
+                ),
+                (
+                    partial.clone(),
+                    Some("abc123"),
+                    200,
+                    complete.clone(),
+                    Some("valid numeric"),
+                ),
+                (partial.clone(), Some("123456"), 200, complete.clone(), None),
+                (
+                    serde_json::json!({"ticket": challenge}),
+                    Some("123456"),
+                    200,
+                    complete.clone(),
+                    None,
+                ),
+                (
+                    serde_json::json!({"NeedTFA": true}),
+                    None,
+                    200,
+                    complete.clone(),
+                    Some("did not offer TOTP"),
+                ),
+                (
+                    serde_json::json!({"NeedTFA": 1, "ticket": unsupported}),
+                    Some("123456"),
+                    200,
+                    complete.clone(),
+                    Some("not supported"),
+                ),
+                (
+                    serde_json::json!({"ticket": "PVE:!tfa!malformed:time::sig"}),
+                    Some("123456"),
+                    200,
+                    complete.clone(),
+                    Some("did not offer TOTP"),
+                ),
+                (
+                    partial.clone(),
+                    Some("123456"),
+                    401,
+                    serde_json::Value::Null,
+                    Some("rejected"),
+                ),
+                (
+                    partial.clone(),
+                    Some("123456"),
+                    503,
+                    serde_json::Value::Null,
+                    Some("HTTP 503"),
+                ),
+                (
+                    partial.clone(),
+                    Some("123456"),
+                    200,
+                    partial.clone(),
+                    Some("incomplete"),
+                ),
+                (
+                    partial.clone(),
+                    Some("123456"),
+                    200,
+                    serde_json::json!({"ticket": challenge}),
+                    Some("incomplete"),
+                ),
+                (
+                    serde_json::json!({"NeedTFA": 1, "ticket": "PVE:root@pam:time::partial", "CSRFPreventionToken": "partial-csrf"}),
+                    None,
+                    200,
+                    complete.clone(),
+                    Some("did not offer TOTP"),
+                ),
+            ] {
+                let mut server = Server::new_async().await;
+                let first = server
+                    .mock("POST", "/api2/json/access/ticket")
+                    .match_body(mockito::Matcher::AllOf(vec![
+                        mockito::Matcher::UrlEncoded("username".into(), "root@pam".into()),
+                        mockito::Matcher::UrlEncoded("password".into(), "password".into()),
+                        mockito::Matcher::UrlEncoded("new-format".into(), "1".into()),
+                    ]))
+                    .with_header("content-type", "application/json")
+                    .with_body(serde_json::json!({"data": initial}).to_string())
+                    .create_async()
+                    .await;
+                let sends_code = initial["ticket"] == challenge && code == Some("123456");
+                let second = server
+                    .mock("POST", "/api2/json/access/ticket")
+                    .match_header("cookie", mockito::Matcher::Missing)
+                    .match_body(mockito::Matcher::AllOf(vec![
+                        mockito::Matcher::UrlEncoded("username".into(), "root@pam".into()),
+                        mockito::Matcher::UrlEncoded("password".into(), "totp:123456".into()),
+                        mockito::Matcher::UrlEncoded("tfa-challenge".into(), challenge.clone()),
+                    ]))
+                    .with_status(second_status)
+                    .with_header("content-type", "application/json")
+                    .with_body(serde_json::json!({"data": second_data}).to_string())
+                    .expect(usize::from(sends_code))
+                    .create_async()
+                    .await;
+                let version = server
+                    .mock("GET", "/api2/json/version")
+                    .match_header("cookie", "PVEAuthCookie=PVE:root@pam:12345678::complete")
+                    .with_header("content-type", "application/json")
+                    .with_body(r#"{"data":{"version":"8.4.1"}}"#)
+                    .expect(usize::from(error.is_none()))
+                    .create_async()
+                    .await;
+                // Catch any attempt to send the partial ticket to the version API.
+                let partial_version = server
+                    .mock("GET", "/api2/json/version")
+                    .match_header("cookie", format!("PVEAuthCookie={challenge}").as_str())
+                    .expect(0)
+                    .create_async()
+                    .await;
+                let credentials = ProxmoxCredentials {
+                    server_url: server.url(),
+                    username: "root@pam".into(),
+                    password: "password".into(),
+                    totp: code.map(str::to_string),
+                    certificate_sha256: None,
+                };
+                let result = authenticate(&credentials).await;
+                if let Some(expected) = error {
+                    let err = result.unwrap_err();
+                    assert!(matches!(err, Error::ProxmoxTwoFactor(_)), "{err}");
+                    assert!(err.to_string().contains(expected), "{err}");
+                    assert!(!err.to_string().contains("signature"));
+                    assert!(!err.to_string().contains("123456"));
+                } else {
+                    let session = result.unwrap();
+                    assert_eq!(session.ticket, complete["ticket"]);
+                    assert_eq!(session.csrf_token, "final-csrf");
+                }
+                first.assert_async().await;
+                second.assert_async().await;
+                version.assert_async().await;
+                partial_version.assert_async().await;
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
         async fn test_authenticate_wrong_credentials() {
             let mut server = Server::new_async().await;
 
@@ -1907,15 +2431,17 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "wrong-password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
             assert!(result.is_err());
 
-            if let Err(Error::ProxmoxApi(msg)) = result {
+            if let Err(Error::ProxmoxActionRequired(msg)) = result {
                 assert!(msg.contains("Authentication failed"));
             } else {
                 panic!("Expected ProxmoxApi error for 401");
@@ -1938,15 +2464,17 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "user@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
             assert!(result.is_err());
 
-            if let Err(Error::ProxmoxApi(msg)) = result {
+            if let Err(Error::ProxmoxActionRequired(msg)) = result {
                 assert!(msg.contains("Access denied"));
             } else {
                 panic!("Expected ProxmoxApi error for 403");
@@ -1994,15 +2522,17 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
             assert!(result.is_err());
 
-            if let Err(Error::ProxmoxApi(msg)) = result {
+            if let Err(Error::ProxmoxActionRequired(msg)) = result {
                 assert!(msg.contains("not supported"));
                 assert!(msg.contains("8.4.1"));
             } else {
@@ -2047,6 +2577,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2077,21 +2608,49 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "expired-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
             };
 
             let result = list_nodes(&session).await;
-            assert!(result.is_err());
-
-            if let Err(Error::ProxmoxApi(msg)) = result {
-                assert!(msg.contains("expired") || msg.contains("Authentication"));
-            } else {
-                panic!("Expected ProxmoxApi error for 401");
-            }
+            assert!(matches!(result, Err(Error::ProxmoxSessionExpired)));
 
             nodes_mock.assert_async().await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn test_storage_and_vm_id_auth_expired() {
+            let mut server = Server::new_async().await;
+            let storage_mock = server
+                .mock("GET", "/api2/json/nodes/pve/storage")
+                .with_status(401)
+                .create_async()
+                .await;
+            let vm_id_mock = server
+                .mock("GET", "/api2/json/cluster/nextid")
+                .with_status(401)
+                .create_async()
+                .await;
+            let session = ProxmoxSession {
+                certificate_sha256: None,
+                server_url: server.url(),
+                ticket: "expired-ticket".to_string(),
+                csrf_token: "test-csrf".to_string(),
+            };
+
+            assert!(matches!(
+                list_storage(&session, "pve").await,
+                Err(Error::ProxmoxSessionExpired)
+            ));
+            assert!(matches!(
+                get_next_vm_id(&session).await,
+                Err(Error::ProxmoxSessionExpired)
+            ));
+            storage_mock.assert_async().await;
+            vm_id_mock.assert_async().await;
         }
 
         #[tokio::test]
@@ -2129,6 +2688,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2161,6 +2721,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2190,7 +2751,7 @@ mod tests {
                 .await;
 
             match ensure_vm_id_free(&test_session(&server), 101).await {
-                Err(Error::ProxmoxApi(msg)) => {
+                Err(Error::ProxmoxActionRequired(msg)) => {
                     assert_eq!(msg, "VM ID 101 can't be used. Choose a different ID.");
                 }
                 other => panic!("Expected taken-ID error, got {:?}", other),
@@ -2214,9 +2775,10 @@ mod tests {
                 .await;
 
             match ensure_vm_id_free(&test_session(&server), 101).await {
-                Err(Error::ProxmoxApi(msg)) => {
+                Err(Error::ProxmoxActionRequired(msg)) => {
                     assert!(msg.contains("101"), "{}", msg);
-                    assert!(msg.contains("already exists"), "{}", msg);
+                    assert!(msg.contains("Choose a different ID"), "{}", msg);
+                    assert!(!msg.contains("already exists"), "{}", msg);
                 }
                 other => panic!("Expected taken-ID error, got {:?}", other),
             }
@@ -2267,6 +2829,7 @@ mod tests {
 
         fn test_session(server: &mockito::ServerGuard) -> ProxmoxSession {
             ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2279,10 +2842,258 @@ mod tests {
                 name: "homeassistant".to_string(),
                 node: "pve".to_string(),
                 storage: "local-lvm".to_string(),
+                bridge: "vmbr0".to_string(),
                 cpu_cores: 2,
                 memory_mb: 4096,
                 disk_size_gb: 32,
                 auto_start,
+            }
+        }
+
+        async fn mock_bridges(server: &mut Server, data: serde_json::Value) -> mockito::Mock {
+            server
+                .mock("GET", "/api2/json/nodes/pve/network")
+                .match_query(Matcher::UrlEncoded(
+                    "type".to_string(),
+                    "any_bridge".to_string(),
+                ))
+                .match_header("Cookie", "PVEAuthCookie=test-ticket")
+                .with_header("content-type", "application/json")
+                .with_body(serde_json::json!({"data": data}).to_string())
+                .create_async()
+                .await
+        }
+
+        async fn mock_default_bridge(server: &mut Server) -> mockito::Mock {
+            mock_bridges(
+                server,
+                serde_json::json!([{"iface":"vmbr0", "type":"bridge"}]),
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_list_bridges_includes_node_local_sdn_and_ovs() {
+            let mut server = Server::new_async().await;
+            let network = mock_bridges(
+                &mut server,
+                serde_json::json!([
+                    {"iface":"vmbr1", "type":"OVSBridge"},
+                    {"iface":"lan", "type":"vnet", "comments":"Home network", "active":"1"},
+                    {"iface":"vmbr0", "type":"bridge"},
+                    {"iface":"eth0", "type":"eth"}
+                ]),
+            )
+            .await;
+            let bridges = list_bridges(&test_session(&server), "pve").await.unwrap();
+            assert_eq!(
+                bridges.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+                ["lan", "vmbr0", "vmbr1"]
+            );
+            assert_eq!(bridges[0].network_type, "vnet");
+            assert_eq!(bridges[0].comments.as_deref(), Some("Home network"));
+            network.assert_async().await;
+        }
+
+        #[tokio::test]
+        async fn test_list_bridges_empty_or_permission_filtered() {
+            let mut server = Server::new_async().await;
+            let network = mock_bridges(&mut server, serde_json::json!([])).await;
+            assert!(list_bridges(&test_session(&server), "pve")
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(
+                ensure_bridge_available(&test_session(&server), &vm_config(false))
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("no longer available")
+            );
+            network.expect(2).assert_async().await;
+        }
+
+        #[tokio::test]
+        async fn test_list_bridges_errors() {
+            for (status, body) in [
+                (401, ""),
+                (403, ""),
+                (500, ""),
+                (200, "{}"),
+                (200, "invalid"),
+                (
+                    200,
+                    r#"{"data":[{"iface":"vmbr0,tag=10","type":"bridge"}]}"#,
+                ),
+            ] {
+                let mut server = Server::new_async().await;
+                let network = server
+                    .mock("GET", "/api2/json/nodes/pve/network")
+                    .match_query(Matcher::Any)
+                    .with_status(status)
+                    .with_body(body)
+                    .create_async()
+                    .await;
+                let error = list_bridges(&test_session(&server), "pve")
+                    .await
+                    .unwrap_err();
+                // An expired session offers reconnecting, like the other lookups
+                if status == 401 {
+                    assert!(matches!(error, Error::ProxmoxSessionExpired));
+                } else {
+                    assert!(matches!(error, Error::ProxmoxApi(_)));
+                }
+                network.assert_async().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn test_bridge_validation_rejects_net0_and_path_injection_before_create() {
+            let server = Server::new_async().await;
+            for name in [
+                "",
+                "vmbr0,tag=10",
+                "vmbr0\n",
+                "../vmbr0",
+                "..",
+                "vmbr0&firewall=0",
+                "vmbr0/100",
+            ] {
+                let mut config = vm_config(false);
+                config.bridge = name.to_string();
+                let error = create_vm_with_disk(
+                    &test_session(&server),
+                    &config,
+                    "image.qcow2",
+                    "local",
+                    &mut false,
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    error.to_string().contains("valid network bridge"),
+                    "{error}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn test_selected_bridge_permission_path() {
+            let mut server = Server::new_async().await;
+            let network = mock_bridges(
+                &mut server,
+                serde_json::json!([{"iface":"vmbr1", "type":"bridge"}]),
+            )
+            .await;
+            let permissions =
+                mock_privileges(&mut server, "/sdn/zones/localnetwork/vmbr1", &["SDN.Use"]).await;
+            let mut config = vm_config(false);
+            config.bridge = "vmbr1".to_string();
+            ensure_bridge_access(&test_session(&server), &config)
+                .await
+                .unwrap();
+            network.assert_async().await;
+            permissions.assert_async().await;
+        }
+
+        #[tokio::test]
+        async fn test_sdn_permission_uses_edited_zone_and_requires_use() {
+            for privileges in [vec!["SDN.Use"], vec!["SDN.Audit"], vec![]] {
+                let mut server = Server::new_async().await;
+                let network = mock_bridges(
+                    &mut server,
+                    serde_json::json!([{"iface":"lan", "type":"vnet"}]),
+                )
+                .await;
+                // A pending move means the running zone differs from the
+                // edited zone that Proxmox checks during VM creation.
+                let running = server
+                    .mock("GET", "/api2/json/cluster/sdn/vnets/lan")
+                    .match_query(Matcher::UrlEncoded("running".to_string(), "1".to_string()))
+                    .with_body(r#"{"data":{"zone":"oldzone"}}"#)
+                    .expect(0)
+                    .create_async()
+                    .await;
+                let vnet = server
+                    .mock("GET", "/api2/json/cluster/sdn/vnets/lan")
+                    .with_body(r#"{"data":{"vnet":"lan","type":"vnet","zone":"home"}}"#)
+                    .create_async()
+                    .await;
+                let permissions =
+                    mock_privileges(&mut server, "/sdn/zones/home/lan", &privileges).await;
+                let mut config = vm_config(false);
+                config.bridge = "lan".to_string();
+                let result = ensure_bridge_access(&test_session(&server), &config).await;
+                assert_eq!(result.is_ok(), privileges.contains(&"SDN.Use"));
+                network.assert_async().await;
+                vnet.assert_async().await;
+                running.assert_async().await;
+                permissions.assert_async().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn test_sdn_metadata_failure_is_not_treated_as_local_bridge() {
+            for status in [401, 403, 500] {
+                let mut server = Server::new_async().await;
+                let network = mock_bridges(
+                    &mut server,
+                    serde_json::json!([{"iface":"lan", "type":"vnet"}]),
+                )
+                .await;
+                let vnet = server
+                    .mock("GET", "/api2/json/cluster/sdn/vnets/lan")
+                    .match_query(Matcher::Any)
+                    .with_status(status)
+                    .create_async()
+                    .await;
+                let mut config = vm_config(false);
+                config.bridge = "lan".to_string();
+                let error = ensure_bridge_access(&test_session(&server), &config)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, Error::ProxmoxApi(_)));
+                network.assert_async().await;
+                vnet.assert_async().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn test_invalid_sdn_zone_never_reaches_permissions_or_create() {
+            for zone in [
+                "",
+                "..",
+                "../home",
+                "home/lan",
+                "home,tag=10",
+                "localnetwork",
+            ] {
+                let mut server = Server::new_async().await;
+                let network = mock_bridges(
+                    &mut server,
+                    serde_json::json!([{"iface":"lan", "type":"vnet"}]),
+                )
+                .await;
+                let vnet = server
+                    .mock("GET", "/api2/json/cluster/sdn/vnets/lan")
+                    .match_query(Matcher::Any)
+                    .with_body(serde_json::json!({"data":{"zone":zone}}).to_string())
+                    .create_async()
+                    .await;
+                let mut config = vm_config(false);
+                config.bridge = "lan".to_string();
+                let error = create_vm_with_disk(
+                    &test_session(&server),
+                    &config,
+                    "image.qcow2",
+                    "local",
+                    &mut false,
+                )
+                .await
+                .unwrap_err();
+                assert!(error.to_string().contains("invalid SDN zone"), "{error}");
+                network.assert_async().await;
+                vnet.assert_async().await;
             }
         }
 
@@ -2310,6 +3121,7 @@ mod tests {
         #[serial]
         async fn test_ensure_user_can_create_vm_allowed() {
             let mut server = Server::new_async().await;
+            let _network = mock_default_bridge(&mut server).await;
 
             let mut vm_privileges = VM_CREATE_PRIVILEGES.to_vec();
             vm_privileges.push("VM.PowerMgmt");
@@ -2333,7 +3145,7 @@ mod tests {
             let vm_mock = mock_privileges(&mut server, "/vms/100", &["VM.Audit"]).await;
 
             match ensure_user_can_create_vm(&test_session(&server), &vm_config(true)).await {
-                Err(Error::ProxmoxApi(msg)) => {
+                Err(Error::ProxmoxActionRequired(msg)) => {
                     assert!(msg.contains("VM.Allocate"), "{}", msg);
                     assert!(msg.contains("VM.PowerMgmt"), "{}", msg);
                     assert!(!msg.contains("VM.Audit"), "{}", msg);
@@ -2348,6 +3160,7 @@ mod tests {
         #[serial]
         async fn test_ensure_user_can_create_vm_needs_power_only_for_auto_start() {
             let mut server = Server::new_async().await;
+            let _network = mock_default_bridge(&mut server).await;
 
             let vm_mock = mock_privileges(&mut server, "/vms/100", VM_CREATE_PRIVILEGES).await;
             let bridge_mock =
@@ -2364,13 +3177,14 @@ mod tests {
         #[serial]
         async fn test_ensure_user_can_create_vm_needs_bridge_access() {
             let mut server = Server::new_async().await;
+            let _network = mock_default_bridge(&mut server).await;
 
             let vm_mock = mock_privileges(&mut server, "/vms/100", VM_CREATE_PRIVILEGES).await;
             let bridge_mock =
                 mock_privileges(&mut server, "/sdn/zones/localnetwork/vmbr0", &[]).await;
 
             match ensure_user_can_create_vm(&test_session(&server), &vm_config(false)).await {
-                Err(Error::ProxmoxApi(msg)) => {
+                Err(Error::ProxmoxActionRequired(msg)) => {
                     assert!(msg.contains("SDN.Use"), "{}", msg);
                     assert!(msg.contains("vmbr0"), "{}", msg);
                 }
@@ -2431,7 +3245,7 @@ mod tests {
             let storage_list = vec![storage("local", true, &["iso", "import"])];
 
             match uploadable_import_storages(&test_session(&server), &storage_list).await {
-                Err(Error::ProxmoxApi(msg)) => {
+                Err(Error::ProxmoxActionRequired(msg)) => {
                     assert!(msg.contains("Datastore.AllocateTemplate"), "{}", msg);
                     assert!(msg.contains("local"), "{}", msg);
                 }
@@ -2445,12 +3259,17 @@ mod tests {
         #[serial]
         async fn test_create_vm_digest_failure_after_healthy_preflight() {
             let mut server = Server::new_async().await;
+            let _network = mock_default_bridge(&mut server).await;
 
             struct ImageSource {
                 cache: tempfile::TempDir,
                 url: String,
             }
             impl ReleaseSource for ImageSource {
+                async fn check_connection(&self) -> Result<()> {
+                    unreachable!("must not check connectivity during VM creation")
+                }
+
                 async fn get_device_manifest(&self) -> Result<crate::DeviceManifest> {
                     unreachable!()
                 }
@@ -2468,7 +3287,7 @@ mod tests {
                             board: "ova".into(),
                             format: ImageFormat::Qcow2,
                             download_url: self.url.clone(),
-                            size: 400_000_000,
+                            size: 8,
                             digest: Some(format!("sha256:{}", "0".repeat(64))),
                         }],
                     })
@@ -2568,6 +3387,7 @@ mod tests {
                 name: "homeassistant".to_string(),
                 node: "pve".to_string(),
                 storage: "local-lvm".to_string(),
+                bridge: "vmbr0".to_string(),
                 cpu_cores: 2,
                 memory_mb: 4096,
                 disk_size_gb: 32,
@@ -2623,6 +3443,7 @@ mod tests {
                 name: "homeassistant".to_string(),
                 node: "pve".to_string(),
                 storage: "local-lvm".to_string(),
+                bridge: "vmbr0".to_string(),
                 cpu_cores: 2,
                 memory_mb: 4096,
                 disk_size_gb: 32,
@@ -2630,7 +3451,9 @@ mod tests {
             };
 
             match pre_install_checks(&test_session(&server), &config, 400_000_000).await {
-                Err(Error::ProxmoxApi(msg)) => assert!(msg.contains("offline"), "{}", msg),
+                Err(Error::ProxmoxActionRequired(msg)) => {
+                    assert!(msg.contains("offline"), "{}", msg)
+                }
                 other => panic!("Expected offline node error, got {:?}", other),
             }
 
@@ -2652,6 +3475,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2679,6 +3503,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2705,6 +3530,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2730,6 +3556,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2761,9 +3588,11 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
@@ -2799,9 +3628,11 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
@@ -2829,6 +3660,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2854,6 +3686,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2884,6 +3717,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2892,7 +3726,7 @@ mod tests {
             let result = list_nodes(&session).await;
             assert!(result.is_err());
 
-            if let Err(Error::ProxmoxApi(msg)) = result {
+            if let Err(Error::ProxmoxActionRequired(msg)) = result {
                 assert!(msg.contains("Access denied") || msg.contains("permission"));
             } else {
                 panic!("Expected ProxmoxApi error for 403");
@@ -2926,6 +3760,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -2967,6 +3802,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3014,6 +3850,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3052,6 +3889,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3098,6 +3936,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3132,6 +3971,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3157,7 +3997,21 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn test_create_vm_with_disk_success() {
+            for disk_size_gb in [32, 64, 128, 256, 512] {
+                check_create_vm_with_disk_size(disk_size_gb).await;
+            }
+        }
+
+        async fn check_create_vm_with_disk_size(disk_size_gb: u32) {
             let mut server = Server::new_async().await;
+            let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let network = mock_bridges(
+                &mut server,
+                serde_json::json!([{"iface":"vmbr1", "type":"bridge"}]),
+            )
+            .await;
+            let permissions =
+                mock_privileges(&mut server, "/sdn/zones/localnetwork/vmbr1", &["SDN.Use"]).await;
 
             let vm_create_mock = server
                 .mock("POST", "/api2/json/nodes/pve/qemu")
@@ -3167,10 +4021,13 @@ mod tests {
                     Matcher::Regex("test-csrf".to_string()),
                 )
                 // The import source must use the selected storage, not a hardcoded "local".
-                .match_body(Matcher::UrlEncoded(
-                    "scsi0".to_string(),
-                    "local-lvm:0,import-from=local-import:import/test-image.qcow2".to_string(),
-                ))
+                .match_body(Matcher::AllOf(vec![
+                    Matcher::UrlEncoded(
+                        "scsi0".to_string(),
+                        "local-lvm:0,import-from=local-import:import/test-image.qcow2".to_string(),
+                    ),
+                    Matcher::UrlEncoded("net0".to_string(), "virtio,bridge=vmbr1".to_string()),
+                ]))
                 .with_status(200)
                 .with_header("content-type", "application/json")
                 .with_body(
@@ -3182,6 +4039,7 @@ mod tests {
                 .await;
 
             // Mock task completion
+            let create_requests = requests.clone();
             let task_mock = server
                 .mock(
                     "GET",
@@ -3189,19 +4047,43 @@ mod tests {
                 )
                 .with_status(200)
                 .with_header("content-type", "application/json")
-                .with_body(
-                    r#"{
-                        "data": {
-                            "status": "stopped",
-                            "exitstatus": "OK"
-                        }
-                    }"#,
-                )
+                .with_body_from_request(move |_| {
+                    create_requests.lock().unwrap().push("import complete");
+                    r#"{"data":{"status":"stopped","exitstatus":"OK"}}"#.into()
+                })
                 .expect_at_least(1)
                 .create_async()
                 .await;
 
+            let resize_requests = requests.clone();
+            let resize_mock = server
+                .mock("PUT", "/api2/json/nodes/pve/qemu/100/resize")
+                .match_header("Cookie", "PVEAuthCookie=test-ticket")
+                .match_header("CSRFPreventionToken", "test-csrf")
+                .match_body(Matcher::AllOf(vec![
+                    Matcher::UrlEncoded("disk".into(), "scsi0".into()),
+                    Matcher::UrlEncoded("size".into(), format!("{}G", disk_size_gb)),
+                ]))
+                .with_header("content-type", "application/json")
+                .with_body_from_request(move |_| {
+                    resize_requests.lock().unwrap().push("resize requested");
+                    r#"{"data":"resize-task"}"#.into()
+                })
+                .create_async()
+                .await;
+            let resize_task_requests = requests.clone();
+            let resize_task_mock = server
+                .mock("GET", "/api2/json/nodes/pve/tasks/resize-task/status")
+                .with_header("content-type", "application/json")
+                .with_body_from_request(move |_| {
+                    resize_task_requests.lock().unwrap().push("resize complete");
+                    r#"{"data":{"status":"stopped","exitstatus":"OK"}}"#.into()
+                })
+                .create_async()
+                .await;
+
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3212,15 +4094,19 @@ mod tests {
                 name: "test-vm".to_string(),
                 node: "pve".to_string(),
                 storage: "local-lvm".to_string(),
+                bridge: "vmbr0".to_string(),
                 cpu_cores: 2,
                 memory_mb: 2048,
-                disk_size_gb: 32,
+                disk_size_gb,
                 auto_start: false,
             };
 
             let result = create_vm_with_disk(
                 &session,
-                &config,
+                &ProxmoxVmConfig {
+                    bridge: "vmbr1".to_string(),
+                    ..config
+                },
                 "test-image.qcow2",
                 "local-import",
                 &mut false,
@@ -3229,13 +4115,223 @@ mod tests {
             assert!(result.is_ok());
 
             vm_create_mock.assert_async().await;
+            network.assert_async().await;
+            permissions.assert_async().await;
             task_mock.assert_async().await;
+            resize_mock.assert_async().await;
+            resize_task_mock.assert_async().await;
+            assert_eq!(
+                *requests.lock().unwrap(),
+                ["import complete", "resize requested", "resize complete"]
+            );
+        }
+
+        fn disk_test_config(disk_size_gb: u32) -> ProxmoxVmConfig {
+            ProxmoxVmConfig {
+                vm_id: 100,
+                name: "test-vm".into(),
+                node: "pve".into(),
+                storage: "local-lvm".into(),
+                cpu_cores: 2,
+                memory_mb: 2048,
+                disk_size_gb,
+                auto_start: true,
+                bridge: "vmbr0".into(),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_disk_minimum_rejected_before_download_or_creation() {
+            let session = ProxmoxSession {
+                certificate_sha256: None,
+                server_url: "http://127.0.0.1:1".into(),
+                ticket: "test-ticket".into(),
+                csrf_token: "test-csrf".into(),
+            };
+            for size in [0, 1, 31] {
+                let config = disk_test_config(size);
+                let error = create_vm(&Backend, &session, &config, &crate::NoOpProgress)
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("at least 32 GiB"));
+                let mut source_unused = false;
+                let error = create_vm_with_disk(
+                    &session,
+                    &config,
+                    "haos.qcow2",
+                    "local",
+                    &mut source_unused,
+                )
+                .await
+                .unwrap_err();
+                assert!(error.to_string().contains("cannot shrink"));
+                assert!(source_unused);
+            }
+        }
+
+        #[test]
+        fn test_disk_resize_keeps_a_certificate_change() {
+            assert!(matches!(
+                resize_error(100, Error::ProxmoxCertificateChanged),
+                Error::ProxmoxCertificateChanged
+            ));
+            let error = resize_error(100, Error::ProxmoxApi("HTTP 500".into()));
+            assert!(
+                matches!(&error, Error::ProxmoxApi(message) if message.contains("VM 100 was created")),
+                "{error}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_disk_resize_failures_propagate_from_creation() {
+            for (status, body, task_status, expected_error) in [
+                (500, "Insufficient storage", None, "Insufficient storage"),
+                (403, "Permission denied", None, "Permission denied"),
+                (200, "invalid json", None, "parse disk resize response"),
+                (200, r#"{"data":null}"#, None, "missing task UPID"),
+                (200, r#"{"data":""}"#, None, "missing task UPID"),
+                (200, r#"{"data":12}"#, None, "missing task UPID"),
+                (
+                    200,
+                    r#"{"data":"resize-task"}"#,
+                    Some("shrinking disks is not supported"),
+                    "shrinking disks is not supported",
+                ),
+            ] {
+                let mut server = Server::new_async().await;
+                // Creating the VM first rechecks the selected bridge
+                let _network = mock_bridges(
+                    &mut server,
+                    serde_json::json!([{"iface":"vmbr0", "type":"bridge"}]),
+                )
+                .await;
+                let _permissions =
+                    mock_privileges(&mut server, "/sdn/zones/localnetwork/vmbr0", &["SDN.Use"])
+                        .await;
+                let create_mock = server
+                    .mock("POST", "/api2/json/nodes/pve/qemu")
+                    .with_header("content-type", "application/json")
+                    .with_body(r#"{"data":"create-task"}"#)
+                    .create_async()
+                    .await;
+                let create_task = server
+                    .mock("GET", "/api2/json/nodes/pve/tasks/create-task/status")
+                    .with_header("content-type", "application/json")
+                    .with_body(r#"{"data":{"status":"stopped","exitstatus":"OK"}}"#)
+                    .create_async()
+                    .await;
+                let resize_mock = server
+                    .mock("PUT", "/api2/json/nodes/pve/qemu/100/resize")
+                    .with_status(status)
+                    .with_body(body)
+                    .create_async()
+                    .await;
+                let resize_task = server
+                    .mock("GET", "/api2/json/nodes/pve/tasks/resize-task/status")
+                    .with_header("content-type", "application/json")
+                    .with_body(
+                        serde_json::json!({
+                            "data": {"status": "stopped", "exitstatus": task_status}
+                        })
+                        .to_string(),
+                    )
+                    .expect(usize::from(task_status.is_some()))
+                    .create_async()
+                    .await;
+                let session = ProxmoxSession {
+                    certificate_sha256: None,
+                    server_url: server.url(),
+                    ticket: "test-ticket".into(),
+                    csrf_token: "test-csrf".into(),
+                };
+                let delete = server
+                    .mock(
+                        "DELETE",
+                        "/api2/json/nodes/pve/storage/local/content/local%3Aimport%2Fhaos.qcow2",
+                    )
+                    .with_status(500)
+                    .create_async()
+                    .await;
+                let error = import_and_cleanup_image(
+                    &session,
+                    &disk_test_config(32),
+                    "haos.qcow2",
+                    "local",
+                )
+                .await
+                .unwrap_err();
+                assert!(error.to_string().contains(expected_error), "{error}");
+                assert!(error
+                    .to_string()
+                    .contains("VM 100 was created but its disk could not be resized"));
+                assert_eq!(error.to_string().matches("Proxmox API error:").count(), 1);
+                create_mock.assert_async().await;
+                create_task.assert_async().await;
+                resize_mock.assert_async().await;
+                resize_task.assert_async().await;
+                delete.assert_async().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn test_disk_resize_requires_successful_import() {
+            for body in [r#"{"data":null}"#, r#"{"data":"create-task"}"#] {
+                let mut server = Server::new_async().await;
+                // Creating the VM first rechecks the selected bridge
+                let _network = mock_bridges(
+                    &mut server,
+                    serde_json::json!([{"iface":"vmbr0", "type":"bridge"}]),
+                )
+                .await;
+                let _permissions =
+                    mock_privileges(&mut server, "/sdn/zones/localnetwork/vmbr0", &["SDN.Use"])
+                        .await;
+                let create_mock = server
+                    .mock("POST", "/api2/json/nodes/pve/qemu")
+                    .with_header("content-type", "application/json")
+                    .with_body(body)
+                    .create_async()
+                    .await;
+                let create_task = server
+                    .mock("GET", "/api2/json/nodes/pve/tasks/create-task/status")
+                    .with_header("content-type", "application/json")
+                    .with_body(r#"{"data":{"status":"stopped","exitstatus":"import failed"}}"#)
+                    .expect(usize::from(body.contains("create-task")))
+                    .create_async()
+                    .await;
+                let resize_mock = server
+                    .mock("PUT", "/api2/json/nodes/pve/qemu/100/resize")
+                    .expect(0)
+                    .create_async()
+                    .await;
+                let session = ProxmoxSession {
+                    certificate_sha256: None,
+                    server_url: server.url(),
+                    ticket: "test-ticket".into(),
+                    csrf_token: "test-csrf".into(),
+                };
+                assert!(create_vm_with_disk(
+                    &session,
+                    &disk_test_config(64),
+                    "haos.qcow2",
+                    "local",
+                    &mut false,
+                )
+                .await
+                .is_err());
+                create_mock.assert_async().await;
+                create_task.assert_async().await;
+                resize_mock.assert_async().await;
+            }
         }
 
         #[tokio::test]
         #[serial]
         async fn test_create_vm_with_disk_error() {
             let mut server = Server::new_async().await;
+            let _network = mock_default_bridge(&mut server).await;
+            let _permissions =
+                mock_privileges(&mut server, "/sdn/zones/localnetwork/vmbr0", &["SDN.Use"]).await;
 
             let vm_create_mock = server
                 .mock("POST", "/api2/json/nodes/pve/qemu")
@@ -3245,6 +4341,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3255,6 +4352,7 @@ mod tests {
                 name: "test-vm".to_string(),
                 node: "pve".to_string(),
                 storage: "local-lvm".to_string(),
+                bridge: "vmbr0".to_string(),
                 cpu_cores: 2,
                 memory_mb: 2048,
                 disk_size_gb: 32,
@@ -3287,6 +4385,7 @@ mod tests {
                     server_url: server.url(),
                     ticket: "test-ticket".into(),
                     csrf_token: "test-csrf".into(),
+                    certificate_sha256: None,
                 };
                 let error =
                     delete_import_image(&session, "pve", "local-import", "hai-image-unique.qcow2")
@@ -3301,6 +4400,74 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn failed_bridge_recheck_deletes_unused_import_without_creating_vm() {
+            for bridge_removed in [true, false] {
+                let mut server = Server::new_async().await;
+                let session = test_session(&server);
+                let config = vm_config(false);
+                let initial_network = mock_default_bridge(&mut server).await;
+                let initial_permissions =
+                    mock_privileges(&mut server, "/sdn/zones/localnetwork/vmbr0", &["SDN.Use"])
+                        .await;
+                ensure_bridge_access(&session, &config).await.unwrap();
+                initial_network.assert_async().await;
+                initial_permissions.assert_async().await;
+                initial_network.remove_async().await;
+                initial_permissions.remove_async().await;
+
+                // Simulate a network change after the image has been uploaded.
+                let network = mock_bridges(
+                    &mut server,
+                    if bridge_removed {
+                        serde_json::json!([])
+                    } else {
+                        serde_json::json!([{"iface":"vmbr0", "type":"bridge"}])
+                    },
+                )
+                .await;
+                let permissions =
+                    mock_privileges(&mut server, "/sdn/zones/localnetwork/vmbr0", &[]).await;
+                let create = server
+                    .mock("POST", "/api2/json/nodes/pve/qemu")
+                    .expect(0)
+                    .create_async()
+                    .await;
+                let delete = server.mock("DELETE", "/api2/json/nodes/pve/storage/local-import/content/local-import%3Aimport%2Fhai-image-unique.qcow2")
+                    .match_header("cookie", "PVEAuthCookie=test-ticket")
+                    .match_header("CSRFPreventionToken", "test-csrf")
+                    .with_body(r#"{"data":"delete-task"}"#).create_async().await;
+                let cleanup_task = server
+                    .mock("GET", "/api2/json/nodes/pve/tasks/delete-task/status")
+                    .with_body(r#"{"data":{"status":"stopped","exitstatus":"OK"}}"#)
+                    .create_async()
+                    .await;
+                let error = import_and_cleanup_image(
+                    &session,
+                    &config,
+                    "hai-image-unique.qcow2",
+                    "local-import",
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    error.to_string().contains(if bridge_removed {
+                        "no longer available"
+                    } else {
+                        "SDN.Use"
+                    }),
+                    "{error}"
+                );
+                network.assert_async().await;
+                if !bridge_removed {
+                    permissions.assert_async().await;
+                }
+                create.assert_async().await;
+                delete.assert_async().await;
+                cleanup_task.assert_async().await;
+            }
+        }
+
+        #[tokio::test]
         async fn import_cleanup_waits_for_completion_and_preserves_install_result() {
             use std::sync::{
                 atomic::{AtomicBool, Ordering},
@@ -3308,6 +4475,10 @@ mod tests {
             };
             for cleanup_status in [200, 403, 500] {
                 let mut server = Server::new_async().await;
+                let network = mock_default_bridge(&mut server).await;
+                let permissions =
+                    mock_privileges(&mut server, "/sdn/zones/localnetwork/vmbr0", &["SDN.Use"])
+                        .await;
                 let completed = Arc::new(AtomicBool::new(false));
                 let task_completed = completed.clone();
                 let create = server
@@ -3321,6 +4492,16 @@ mod tests {
                         task_completed.store(true, Ordering::SeqCst);
                         writer.write_all(br#"{"data":{"status":"stopped","exitstatus":"OK"}}"#)
                     })
+                    .create_async()
+                    .await;
+                let resize = server
+                    .mock("PUT", "/api2/json/nodes/pve/qemu/100/resize")
+                    .with_body(r#"{"data":"resize-task"}"#)
+                    .create_async()
+                    .await;
+                let resize_task = server
+                    .mock("GET", "/api2/json/nodes/pve/tasks/resize-task/status")
+                    .with_body(r#"{"data":{"status":"stopped","exitstatus":"OK"}}"#)
                     .create_async()
                     .await;
                 let delete = server.mock("DELETE", "/api2/json/nodes/pve/storage/local-import/content/local-import%3Aimport%2Fhai-image-unique.qcow2")
@@ -3341,12 +4522,14 @@ mod tests {
                     server_url: server.url(),
                     ticket: "test-ticket".into(),
                     csrf_token: "test-csrf".into(),
+                    certificate_sha256: None,
                 };
                 let config = ProxmoxVmConfig {
                     vm_id: 100,
                     name: "test-vm".into(),
                     node: "pve".into(),
                     storage: "local-lvm".into(),
+                    bridge: "vmbr0".into(),
                     cpu_cores: 2,
                     memory_mb: 2048,
                     disk_size_gb: 32,
@@ -3362,8 +4545,12 @@ mod tests {
                 .unwrap();
                 create.assert_async().await;
                 task.assert_async().await;
+                resize.assert_async().await;
+                resize_task.assert_async().await;
                 delete.assert_async().await;
                 cleanup_task.assert_async().await;
+                network.assert_async().await;
+                permissions.assert_async().await;
             }
         }
 
@@ -3385,6 +4572,10 @@ mod tests {
                 ),
             ] {
                 let mut server = Server::new_async().await;
+                let network = mock_default_bridge(&mut server).await;
+                let permissions =
+                    mock_privileges(&mut server, "/sdn/zones/localnetwork/vmbr0", &["SDN.Use"])
+                        .await;
                 server
                     .mock("POST", "/api2/json/nodes/pve/qemu")
                     .with_status(create_status)
@@ -3407,12 +4598,14 @@ mod tests {
                     server_url: server.url(),
                     ticket: "test-ticket".into(),
                     csrf_token: "test-csrf".into(),
+                    certificate_sha256: None,
                 };
                 let config = ProxmoxVmConfig {
                     vm_id: 100,
                     name: "test-vm".into(),
                     node: "pve".into(),
                     storage: "local-lvm".into(),
+                    bridge: "vmbr0".into(),
                     cpu_cores: 2,
                     memory_mb: 2048,
                     disk_size_gb: 32,
@@ -3427,6 +4620,8 @@ mod tests {
                 .await
                 .is_err());
                 delete.assert_async().await;
+                network.assert_async().await;
+                permissions.assert_async().await;
             }
         }
 
@@ -3468,6 +4663,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3493,6 +4689,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3548,6 +4745,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3598,6 +4796,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3682,9 +4881,11 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
@@ -3713,9 +4914,11 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
@@ -3758,9 +4961,11 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
@@ -3806,9 +5011,11 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
@@ -3861,9 +5068,11 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
@@ -3892,9 +5101,11 @@ mod tests {
                 .await;
 
             let credentials = ProxmoxCredentials {
+                certificate_sha256: None,
                 server_url: server.url(),
                 username: "root@pam".to_string(),
                 password: "password".to_string(),
+                totp: None,
             };
 
             let result = authenticate(&credentials).await;
@@ -3923,6 +5134,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3954,6 +5166,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -3983,6 +5196,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4008,6 +5222,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4039,6 +5254,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4070,6 +5286,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4101,6 +5318,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4135,6 +5353,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4175,6 +5394,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4211,6 +5431,19 @@ mod tests {
             // Mocking a non-default storage proves the upload URL uses the supplied name.
             let upload_mock = server
                 .mock("POST", "/api2/json/nodes/pve/storage/local-import/upload")
+                .match_header("cookie", "PVEAuthCookie=test-ticket")
+                .match_header("CSRFPreventionToken", "test-csrf")
+                .match_request(|request| {
+                    let body = request.body().unwrap();
+                    request
+                        .header("content-length")
+                        .first()
+                        .and_then(|value| value.to_str().ok())
+                        == Some(body.len().to_string().as_str())
+                        && String::from_utf8_lossy(body).contains("test image content")
+                        && String::from_utf8_lossy(body).contains("filename=\"test-image.qcow2\"")
+                        && String::from_utf8_lossy(body).contains("\r\n\r\nimport\r\n")
+                })
                 .with_status(200)
                 .with_header("content-type", "application/json")
                 .with_body(r#"{"data": "UPID:pve:00000001:00000002:00000003:imgup:root@pam:"}"#)
@@ -4230,6 +5463,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4246,10 +5480,142 @@ mod tests {
 
             // Verify progress updates were sent
             let updates = callback.get_updates();
-            assert!(!updates.is_empty());
+            assert!(updates.iter().any(|update| {
+                update.bytes_processed == 18 && update.message.starts_with("Uploading ")
+            }));
+            assert_eq!(updates.last().unwrap().progress, 100);
 
             upload_mock.assert_async().await;
             task_mock.assert_async().await;
+        }
+
+        #[tokio::test]
+        async fn test_upload_image_to_proxmox_backpressure_and_disconnect() {
+            use tokio::io::AsyncReadExt;
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let session = ProxmoxSession {
+                certificate_sha256: None,
+                server_url: format!("http://{}", listener.local_addr().unwrap()),
+                ticket: "test-ticket".into(),
+                csrf_token: "test-csrf".into(),
+            };
+            let temp_dir = tempfile::tempdir().unwrap();
+            let path = temp_dir.path().join("large.qcow2");
+            let size = 128 * 1024 * 1024;
+            std::fs::File::create(&path).unwrap().set_len(size).unwrap();
+            let callback = TestProgressCallback::new();
+
+            let server = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut received = 0;
+                let mut buffer = [0; 64 * 1024];
+                while received < PROGRESS_UPDATE_INTERVAL + 1024 * 1024 {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(count, 0);
+                    received += count as u64;
+                }
+                // Stop consuming the body, leaving most of the file unsent.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let updates = callback.get_updates();
+                let live: Vec<_> = updates
+                    .iter()
+                    .filter(|update| update.bytes_processed > 0)
+                    .collect();
+                assert!(!live.is_empty(), "progress must arrive before a response");
+                assert!(live.iter().all(|update| update.bytes_processed < size / 2));
+                assert!(live.iter().all(|update| update.total_bytes == size));
+                assert!(live
+                    .iter()
+                    .all(|update| update.progress > 5 && update.progress < 95));
+                // Dropping the socket makes the in-flight request fail.
+            };
+            let upload = upload_image_to_proxmox(&session, "pve", &path, &callback, "local");
+            let (_, result) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(server, upload)
+            })
+            .await
+            .expect("upload must not hang after the peer disconnects");
+            assert!(
+                matches!(result, Err(Error::ProxmoxApi(message)) if message.contains("Failed to upload image"))
+            );
+            let updates = callback.get_updates();
+            assert!(updates.iter().all(|update| update.progress < 100));
+            assert!(updates.windows(2).all(|pair| {
+                pair[0].bytes_processed <= pair[1].bytes_processed
+                    && pair[0].progress <= pair[1].progress
+            }));
+        }
+
+        #[tokio::test]
+        async fn test_upload_image_to_proxmox_short_file() {
+            struct TruncateOnUpload<'a>(&'a std::path::Path);
+            impl ProgressCallback for TruncateOnUpload<'_> {
+                fn on_progress(&self, progress: FlashProgress) {
+                    assert!(progress.progress < 100);
+                    if progress.progress == 5 {
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(self.0)
+                            .unwrap()
+                            .set_len(0)
+                            .unwrap();
+                    }
+                }
+            }
+
+            let mut server = Server::new_async().await;
+            let upload_mock = server
+                .mock("POST", "/api2/json/nodes/pve/storage/local/upload")
+                .expect(0)
+                .create_async()
+                .await;
+            let session = ProxmoxSession {
+                certificate_sha256: None,
+                server_url: server.url(),
+                ticket: "test-ticket".into(),
+                csrf_token: "test-csrf".into(),
+            };
+            let temp_dir = tempfile::tempdir().unwrap();
+            let path = temp_dir.path().join("short.qcow2");
+            std::fs::write(&path, b"test image content").unwrap();
+            let callback = TruncateOnUpload(&path);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                upload_image_to_proxmox(&session, "pve", &path, &callback, "local"),
+            )
+            .await
+            .expect("short body must fail without waiting for the upload timeout");
+            assert!(
+                matches!(result, Err(Error::ProxmoxApi(message)) if message.contains("Failed to upload image"))
+            );
+            upload_mock.assert_async().await;
+        }
+
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn test_upload_image_to_proxmox_read_error() {
+            let server = Server::new_async().await;
+            let session = ProxmoxSession {
+                server_url: server.url(),
+                ticket: "test-ticket".into(),
+                csrf_token: "test-csrf".into(),
+                certificate_sha256: None,
+            };
+            // Linux can open a directory as a file, but reading it fails.
+            let temp_dir = tempfile::tempdir().unwrap();
+            std::fs::write(temp_dir.path().join("image.qcow2"), b"image").unwrap();
+            let path = temp_dir.path().to_path_buf();
+            let callback = TestProgressCallback::new();
+            let error = upload_image_to_proxmox(&session, "pve", &path, &callback, "local")
+                .await
+                .unwrap_err();
+            let cause = std::io::Error::from_raw_os_error(libc::EISDIR).to_string();
+            assert!(error.to_string().contains(&cause), "{error}");
+            assert!(callback
+                .get_updates()
+                .iter()
+                .all(|update| update.progress < 100));
         }
 
         #[tokio::test]
@@ -4271,6 +5637,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4310,6 +5677,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4349,6 +5717,7 @@ mod tests {
                 .await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),
@@ -4374,6 +5743,7 @@ mod tests {
             let server = Server::new_async().await;
 
             let session = ProxmoxSession {
+                certificate_sha256: None,
                 server_url: server.url(),
                 ticket: "test-ticket".to_string(),
                 csrf_token: "test-csrf".to_string(),

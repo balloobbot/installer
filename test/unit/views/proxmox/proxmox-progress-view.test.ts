@@ -127,6 +127,39 @@ describe("proxmox-progress-view", () => {
     );
   });
 
+  // A failed creation can hide a VM that was already created, so the view
+  // never repeats it in place
+  it("renders a creation failure without retrying it in place", async () => {
+    let attempts = 0;
+    mockTauriIpc((cmd) => {
+      expect(cmd).to.equal("proxmox_create_vm");
+      attempts++;
+      return Promise.reject({
+        code: "proxmox_api",
+        message: "Storage unavailable",
+        retryable: false,
+        details: {},
+      });
+    });
+    const el = mount();
+    let completed = 0;
+    let errors = 0;
+    el.addEventListener("install-complete", () => completed++);
+    el.addEventListener("install-error", () => errors++);
+    await settle();
+    expect(
+      el
+        .shadowRoot!.querySelector("install-progress")!
+        .shadowRoot!.querySelector(".error-message")!.textContent
+    ).to.contain("account permissions");
+    expect(completed).to.equal(0);
+    expect(errors).to.equal(1);
+    el.retry();
+    await settle();
+    expect(attempts).to.equal(1);
+    expect(el.hasError).to.be.true;
+  });
+
   it("reports an error without starting when there is no session", async () => {
     wizardState.startFlow("proxmox");
 
@@ -141,7 +174,10 @@ describe("proxmox-progress-view", () => {
 
       expect(abortSignalOf(el), "install should not have started").to.not.exist;
       expect(el.hasError).to.be.true;
-      expect(el.shadowRoot!.textContent).to.contain("No Proxmox session");
+      expect(
+        el.shadowRoot!.querySelector("install-progress")!.shadowRoot!
+          .textContent
+      ).to.contain("No Proxmox session");
       expect(errorEvents).to.equal(1);
     } finally {
       document.removeEventListener("install-error", onError);

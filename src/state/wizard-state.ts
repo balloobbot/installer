@@ -1,4 +1,5 @@
-import type { HaosConfig, ProxmoxSession } from "../api/types.js";
+import { localize } from "../localization/localize.js";
+import type { HaosConfig, ProxmoxSession, UtmVmConfig } from "../api/types.js";
 import type { InstallationPath } from "../views/path-selection-view.js";
 
 export type WizardFlow = InstallationPath;
@@ -18,6 +19,8 @@ export interface WizardStep {
  */
 export interface WizardSelections {
   device?: string;
+  /** The current device picker has successfully refreshed board availability. */
+  deviceCatalogReady?: boolean;
   /** HAOS image of the selected device; its board picks the image to flash. */
   deviceConfig?: HaosConfig;
   /** Device id of the selected drive; also the path sent to the backend. */
@@ -27,6 +30,7 @@ export interface WizardSelections {
   driveSize?: number;
   driveModel?: string;
   driveVendor?: string;
+  driveSerial?: string;
 
   /** VM configuration, shared by the UTM and Proxmox "Configure VM" steps. */
   vmName?: string;
@@ -39,6 +43,10 @@ export interface WizardSelections {
 
   /** UTM install progress, so a retry resumes instead of starting over. */
   vmId?: string;
+  /** Native creation outlives its view; reentry must await the same result. */
+  utmCreation?: { config: UtmVmConfig; result: Promise<string> };
+  /** A completed VM with superseded settings must not be silently recreated. */
+  utmSupersededVmId?: string;
   /** Set once the disk of the VM in `vmId` has been resized. */
   utmDiskResized?: boolean;
 
@@ -51,7 +59,12 @@ export interface WizardSelections {
   /** Proxmox target picked in the "Configure VM" step. */
   proxmoxNode?: string;
   proxmoxStorage?: string;
+  proxmoxBridge?: string;
+  /** The selected bridge was verified for the current node and session. */
+  proxmoxBridgeReady?: boolean;
   proxmoxVmId?: number;
+  /** Node and storage selections were verified by the current configure view. */
+  proxmoxConfigureReady?: boolean;
 
   [key: string]: unknown;
 }
@@ -67,38 +80,44 @@ type WizardStateListener = (state: WizardState) => void;
 
 const FLOW_STEPS: Record<WizardFlow, WizardStep[]> = {
   sbc: [
-    { id: "device", title: "Select device" },
-    { id: "drive", title: "Select drive" },
-    { id: "confirm", title: "Confirm" },
-    { id: "flash", title: "Install" },
-    { id: "success", title: "Done" },
+    { id: "device", title: localize("state.wizard_state.select_device") },
+    { id: "drive", title: localize("state.wizard_state.select_drive") },
+    { id: "confirm", title: localize("common.confirm") },
+    { id: "flash", title: localize("common.install") },
+    { id: "success", title: localize("common.done") },
   ],
   minipc: [
-    { id: "method", title: "Installation method" },
-    { id: "architecture", title: "Select architecture" },
-    { id: "drive", title: "Select drive" },
-    { id: "confirm", title: "Confirm" },
-    { id: "flash", title: "Install" },
-    { id: "success", title: "Done" },
+    { id: "method", title: localize("state.wizard_state.installation_method") },
+    {
+      id: "architecture",
+      title: localize("state.wizard_state.select_architecture"),
+    },
+    { id: "drive", title: localize("state.wizard_state.select_drive") },
+    { id: "confirm", title: localize("common.confirm") },
+    { id: "flash", title: localize("common.install") },
+    { id: "success", title: localize("common.done") },
   ],
   "ha-hardware": [
-    { id: "device", title: "Select device" },
-    { id: "connect", title: "Connect" },
-    { id: "success", title: "Done" },
+    { id: "device", title: localize("state.wizard_state.select_device") },
+    { id: "connect", title: localize("state.wizard_state.connect") },
+    { id: "success", title: localize("common.done") },
   ],
   proxmox: [
-    { id: "connection", title: "Connect to Proxmox" },
-    { id: "configure", title: "Configure VM" },
-    { id: "confirm", title: "Confirm" },
-    { id: "install", title: "Install" },
-    { id: "success", title: "Done" },
+    {
+      id: "connection",
+      title: localize("state.wizard_state.connect_to_proxmox"),
+    },
+    { id: "configure", title: localize("state.wizard_state.configure_vm") },
+    { id: "confirm", title: localize("common.confirm") },
+    { id: "install", title: localize("common.install") },
+    { id: "success", title: localize("common.done") },
   ],
   vm: [
-    { id: "check", title: "Check requirements" },
-    { id: "configure", title: "Configure VM" },
-    { id: "confirm", title: "Confirm" },
-    { id: "install", title: "Install" },
-    { id: "success", title: "Done" },
+    { id: "check", title: localize("state.wizard_state.check_requirements") },
+    { id: "configure", title: localize("state.wizard_state.configure_vm") },
+    { id: "confirm", title: localize("common.confirm") },
+    { id: "install", title: localize("common.install") },
+    { id: "success", title: localize("common.done") },
   ],
 };
 
@@ -113,7 +132,13 @@ function createInitialState(): WizardState {
 
 class WizardStateStore {
   private state: WizardState = createInitialState();
+  private _flowGeneration = 0;
   private listeners: Set<WizardStateListener> = new Set();
+
+  /** Identifies a flow across navigation and selection updates. */
+  get flowGeneration(): number {
+    return this._flowGeneration;
+  }
 
   getState(): WizardState {
     return this.state;
@@ -129,6 +154,7 @@ class WizardStateStore {
   }
 
   startFlow(flow: WizardFlow) {
+    this._flowGeneration++;
     this.state = {
       currentFlow: flow,
       currentStepIndex: 0,
@@ -143,6 +169,7 @@ class WizardStateStore {
       this.state = {
         ...this.state,
         currentStepIndex: this.state.currentStepIndex + 1,
+        selections: { ...this.state.selections, deviceCatalogReady: false },
       };
       this.notify();
     }
@@ -153,6 +180,7 @@ class WizardStateStore {
       this.state = {
         ...this.state,
         currentStepIndex: this.state.currentStepIndex - 1,
+        selections: { ...this.state.selections, deviceCatalogReady: false },
       };
       this.notify();
     }
@@ -163,6 +191,10 @@ class WizardStateStore {
       this.state = {
         ...this.state,
         currentStepIndex: index,
+        selections:
+          index === this.state.currentStepIndex
+            ? this.state.selections
+            : { ...this.state.selections, deviceCatalogReady: false },
       };
       this.notify();
     }
@@ -183,6 +215,7 @@ class WizardStateStore {
   }
 
   reset() {
+    this._flowGeneration++;
     this.state = createInitialState();
     this.notify();
   }

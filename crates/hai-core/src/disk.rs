@@ -7,7 +7,7 @@
 use crate::error::{Error, Result};
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::types::DeviceType;
-use crate::types::{BlockDevice, FlashProgress, FlashStage};
+use crate::types::{BlockDevice, ExpectedDevice, FlashProgress, FlashStage};
 use crate::{Backend, DeviceBackend, ProgressCallback};
 use std::path::Path;
 
@@ -36,10 +36,18 @@ mod macos_logic;
 #[path = "disk/macos/safety.rs"]
 mod macos_safety;
 
+#[cfg(any(target_os = "windows", test))]
+#[path = "disk/windows/transfer.rs"]
+mod windows_transfer;
+
 #[cfg(all(test, not(target_os = "macos")))]
 #[allow(dead_code)]
 #[path = "disk/macos/device.rs"]
 mod macos_device_tests;
+
+#[cfg(any(target_os = "windows", test))]
+#[path = "disk/windows/serial.rs"]
+mod windows_serial;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 compile_error!("hai-core supports only Linux, macOS and Windows");
@@ -55,6 +63,26 @@ const FAST_DRIVE_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 /// How often to send progress updates (every N bytes)
 #[allow(dead_code)]
 const PROGRESS_UPDATE_INTERVAL: u64 = 10 * 1024 * 1024; // 10 MB
+
+pub(super) fn normalize_serial(serial: Option<&str>) -> Option<String> {
+    serial
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+fn check_identity(devices: &[BlockDevice], id: &str, expected: &ExpectedDevice) -> Result<()> {
+    if devices
+        .iter()
+        .any(|device| device.id == id && expected.matches(device))
+    {
+        Ok(())
+    } else {
+        Err(Error::DeviceNotFound(
+            "The selected drive changed or was disconnected. Select it again.".into(),
+        ))
+    }
+}
 
 /// Whether a media type/model string refers to an SD card. Matches "SD" as
 /// its own word (plus SDHC/SDXC/microSD variants) so names like "Samsung
@@ -118,7 +146,7 @@ fn is_write_protected(io_err: &std::io::Error) -> bool {
 /// Map an I/O error from reading or writing the device onto an [`Error`]:
 /// a disconnect and write protection get their own errors, so the user is
 /// told what to do about them.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 fn device_io_error(io_err: std::io::Error) -> Error {
     if is_drive_disconnected(&io_err) {
         Error::DriveDisconnected
@@ -126,6 +154,32 @@ fn device_io_error(io_err: std::io::Error) -> Error {
         Error::WriteProtected
     } else {
         Error::Io(io_err)
+    }
+}
+
+/// Check known capacity before any destructive disk operation.
+pub fn ensure_image_fits(image_size: u64, drive_size: u64) -> Result<()> {
+    if image_size > drive_size {
+        return Err(Error::ImageTooLarge {
+            written: 0,
+            image_size,
+            drive_size: Some(drive_size),
+        });
+    }
+    Ok(())
+}
+
+// Also compiled in tests, which cover the Windows transfer on every platform
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+fn device_write_error(error: std::io::Error, written: u64, image_size: u64) -> Error {
+    if error.kind() == std::io::ErrorKind::StorageFull {
+        Error::ImageTooLarge {
+            written,
+            image_size,
+            drive_size: None,
+        }
+    } else {
+        device_io_error(error)
     }
 }
 
@@ -167,12 +221,13 @@ async fn list_devices() -> Result<Vec<BlockDevice>> {
 async fn write_image<P: ProgressCallback>(
     image_path: &Path,
     device_id: &str,
+    expected: &ExpectedDevice,
     verify: bool,
     progress_callback: &P,
 ) -> Result<()> {
     std::fs::metadata(image_path)?;
 
-    imp::write_image(image_path, device_id, verify, progress_callback).await
+    imp::write_image(image_path, device_id, expected, verify, progress_callback).await
 }
 
 impl DeviceBackend for Backend {
@@ -192,16 +247,54 @@ impl DeviceBackend for Backend {
         &self,
         image_path: &Path,
         device_id: &str,
+        expected: &ExpectedDevice,
         verify: bool,
         progress_callback: &P,
     ) -> Result<()> {
-        write_image(image_path, device_id, verify, progress_callback).await
+        write_image(image_path, device_id, expected, verify, progress_callback).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capacity_check_rejects_only_oversized_images() {
+        ensure_image_fits(1024, 1024).unwrap();
+        ensure_image_fits(512, 1024).unwrap();
+        assert!(matches!(
+            ensure_image_fits(2048, 1024),
+            Err(Error::ImageTooLarge {
+                written: 0,
+                image_size: 2048,
+                drive_size: Some(1024)
+            })
+        ));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn full_disk_write_retains_progress_and_size() {
+        #[cfg(target_os = "linux")]
+        let codes = [28, 28]; // ENOSPC
+        #[cfg(target_os = "windows")]
+        let codes = [39, 112]; // ERROR_HANDLE_DISK_FULL, ERROR_DISK_FULL
+        for code in codes {
+            assert!(matches!(
+                device_write_error(std::io::Error::from_raw_os_error(code), 10, 20),
+                Error::ImageTooLarge {
+                    written: 10,
+                    image_size: 20,
+                    drive_size: None
+                }
+            ));
+        }
+        assert!(matches!(
+            device_write_error(std::io::Error::other("unknown"), 10, 20),
+            Error::Io(_)
+        ));
+    }
 
     #[test]
     #[cfg(not(target_os = "windows"))]
@@ -389,7 +482,14 @@ mod tests {
         // The image metadata check runs before any platform code, so a
         // missing image surfaces as Io and the device id is never touched.
         let image_path = Path::new("/nonexistent/image/file.img");
-        let result = write_image(image_path, "unused-device-id", false, &crate::NoOpProgress).await;
+        let result = write_image(
+            image_path,
+            "unused-device-id",
+            &ExpectedDevice::default(),
+            false,
+            &crate::NoOpProgress,
+        )
+        .await;
         assert!(matches!(result.unwrap_err(), Error::Io(_)));
     }
 }

@@ -8,46 +8,46 @@ body:
         Thanks for taking the time to report a bug!
         Please fill out the information below to help us investigate.
 
-  - type: dropdown
+  - type: input
     id: platform
     attributes:
       label: Operating System
-      description: What OS runs the installer (not the device receiving Home Assistant OS)? See the README for beta requirements.
-      options:
-        - macOS 14.5+ (Apple Silicon)
-        - macOS 14.5+ (Intel)
-        - Windows 11 (x64)
-        - Windows 10 (x64)
-        - Linux (Ubuntu 22.04+ / Debian 12+, x86_64)
-        - Linux (Fedora, x86_64)
-        - Other / unsupported host
+      description: OS and version that runs the installer, not the device receiving Home Assistant OS. See the README for beta requirements.
     validations:
       required: true
 
   - type: input
-    id: os-version
+    id: architecture
     attributes:
-      label: OS Version
-      description: Include the exact OS or distribution version and architecture.
-      placeholder: "macOS 14.5 (Intel), Windows 11 24H2 (x64), Ubuntu 22.04.5 (x86_64)"
+      label: Architecture
+      placeholder: "aarch64 or x86_64"
     validations:
       required: true
 
-  - type: dropdown
-    id: installation-path
+  - type: input
+    id: package
     attributes:
-      label: Installation Path
-      description: What were you trying to install?
-      options:
-        - Raspberry Pi / SBC
-        - Mini PC / NUC
-        - Home Assistant Yellow
-        - Home Assistant Green
-        - Proxmox VM
-        - UTM VM (macOS)
-        - Other
+      label: Package Type
+      placeholder: "App, AppImage, Deb, Rpm, Nsis, or unbundled"
+
+  - type: input
+    id: flow
+    attributes:
+      label: Installation Flow
+      placeholder: "flash, utm, proxmox, or application"
     validations:
       required: true
+
+  - type: input
+    id: stage
+    attributes:
+      label: Failed Stage
+
+  - type: input
+    id: error
+    attributes:
+      label: Error Category
+      description: Diagnostics omit raw error details for privacy.
 
   - type: input
     id: version
@@ -93,7 +93,7 @@ body:
     id: logs
     attributes:
       label: Logs or Screenshots
-      description: Paste any error messages or attach screenshots
+      description: Paste the diagnostic log tail or attach logs/screenshots. This issue is public; review attachments for private information first.
     validations:
       required: false
 
