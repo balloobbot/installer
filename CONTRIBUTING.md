@@ -92,13 +92,13 @@ these fields are not gated by command permissions. Other OS commands,
 including hostname, are not permitted by this capability.
 
 Use `formatNumber` or ICU number placeholders for displayed numbers. Preserve
-the existing unit basis and rounding: byte formatting currently divides by
-1024 while retaining its existing B/KB/MB/GB/TB labels. IDs, version strings,
+the existing unit basis and rounding: byte formatting uses decimal units
+(1000 bytes is 1 KB) with its existing B/KB/MB/GB/TB labels. IDs, version strings,
 URLs, filenames, IPC names, state keys, and device names are data, not messages.
 
-Backend error strings still pass through unchanged. Translating those requires
-a separate structured error-code contract; this catalog does not infer codes
-from English error text. Copy added by other branches must be extracted when
+Backend errors carry a fixed `code`. The frontend maps known codes to fixed
+English messages in `src/utils/installer-error.ts`; moving that map into the
+catalog is a follow-up. Never infer a code from English error text. Copy added by other branches must be extracted when
 those changes are integrated.
 
 ### Code Style
@@ -120,6 +120,7 @@ type(scope): description
 Types: `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`
 
 Examples:
+
 - `feat(proxmox): add node selection dropdown`
 - `fix(flash): handle USB disconnect during write`
 - `docs: update installation instructions`
