@@ -1,5 +1,6 @@
 import { formatNumber, localize } from "../localization/localize.js";
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { failMockOperation } from "./mock-failures.js";
 import type {
   BlockDevice,
   DeviceManifest,
@@ -12,11 +13,15 @@ import type {
   ProxmoxSession,
   ProxmoxStorage,
   ProxmoxVmConfig,
+  ProxmoxBridge,
   ProxmoxVmResult,
   SystemInfo,
   UtmStatus,
   UtmVmConfig,
+  VmStatusInfo,
 } from "./types.js";
+
+export type { VmStatusInfo } from "./types.js";
 
 /**
  * Whether to answer with mock data because there's no Tauri backend, as in
@@ -28,6 +33,14 @@ import type {
  * `if (false)` and Vite drops the mock branches and the fixture data.
  */
 const MOCK_ALLOWED = import.meta.env.DEV;
+
+/** Check the Home Assistant version service before starting a flow. */
+export async function checkConnection(): Promise<void> {
+  if (MOCK_ALLOWED && isBrowserOnly()) {
+    return;
+  }
+  return invoke<void>("check_connection");
+}
 
 function isBrowserOnly(): boolean {
   return typeof window !== "undefined" && !("__TAURI__" in window);
@@ -166,6 +179,8 @@ async function simulateFlashProgress(
         message,
       });
 
+      if (stage === "writing" && step === 0) failMockOperation("flash");
+
       await new Promise((resolve) => setTimeout(resolve, delay));
     }
     overallProgress += weight;
@@ -180,7 +195,6 @@ async function simulateFlashProgress(
   });
 
   return {
-    success: true,
     duration_secs: 45,
   };
 }
@@ -196,17 +210,25 @@ export async function getManifest(): Promise<DeviceManifest> {
 }
 
 /**
- * Format bytes to a human-readable string.
+ * Format bytes using decimal units, matching storage manufacturers.
  */
 export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0)
+    return localize("views.sbc.confirmation_view.unknown_size");
   if (bytes === 0) return localize("api.commands.0_b");
 
-  const k = 1024;
+  const k = 1000;
   const sizes = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  const i = Math.max(
+    0,
+    Math.min(sizes.length - 1, Math.floor(Math.log(bytes) / Math.log(k)))
+  );
 
+  // Do not round a drive just below a capacity threshold up to that threshold.
+  const value = Math.floor((bytes / Math.pow(k, i)) * 10) / 10;
+  // Grouping would turn the oversized "1000 TB" clamp into "1,000 TB".
   return localize("format.bytes", {
-    amount: formatNumber(parseFloat((bytes / Math.pow(k, i)).toFixed(1))),
+    amount: formatNumber(value, { useGrouping: false }),
     unit: sizes[i],
   });
 }
@@ -214,12 +236,24 @@ export function formatBytes(bytes: number): string {
 /**
  * Get HAOS release information.
  * @param version Optional specific version to fetch (defaults to latest stable)
+ * @param board Board whose stable release should be shown
  */
-export async function getHaosRelease(version?: string): Promise<HaosRelease> {
+export async function getHaosRelease(
+  version?: string,
+  board?: string
+): Promise<HaosRelease> {
   if (MOCK_ALLOWED && isBrowserOnly()) {
     return MOCK_HAOS_RELEASE;
   }
-  return invoke<HaosRelease>("get_haos_release", { version });
+  return invoke<HaosRelease>("get_haos_release", { version, board });
+}
+
+/** Get the stable release for the backend's UTM download architecture. */
+export async function getUtmHaosRelease(): Promise<HaosRelease> {
+  if (MOCK_ALLOWED && isBrowserOnly()) {
+    return MOCK_HAOS_RELEASE;
+  }
+  return invoke<HaosRelease>("get_utm_haos_release");
 }
 
 // ============================================================================
@@ -353,6 +387,7 @@ async function simulateUtmDownload(
  */
 export async function createUtmVm(config: UtmVmConfig): Promise<string> {
   if (MOCK_ALLOWED && isBrowserOnly()) {
+    failMockOperation("utm");
     // Simulate VM creation
     await new Promise((resolve) => setTimeout(resolve, 2000));
     return "mock-vm-id-12345";
@@ -386,14 +421,6 @@ export async function resizeUtmVmDisk(
     return;
   }
   return invoke<void>("resize_utm_vm_disk", { vmId, sizeGb });
-}
-
-/**
- * VM status info from backend.
- */
-export interface VmStatusInfo {
-  status: string;
-  ip_address: string | null;
 }
 
 /**
@@ -527,6 +554,20 @@ export async function proxmoxListStorage(
   return invoke<ProxmoxStorage[]>("proxmox_list_storage", { session, node });
 }
 
+/** List bridges and eligible SDN VNets on the selected node. */
+export async function proxmoxListBridges(
+  session: ProxmoxSession,
+  node: string
+): Promise<ProxmoxBridge[]> {
+  if (MOCK_ALLOWED && isBrowserOnly()) {
+    return [
+      { name: "vmbr0", network_type: "bridge", comments: null },
+      { name: "vmbr1", network_type: "bridge", comments: "LAN" },
+    ];
+  }
+  return invoke<ProxmoxBridge[]>("proxmox_list_bridges", { session, node });
+}
+
 /**
  * Get the next available VM ID on the Proxmox server.
  * @param session The authentication session
@@ -635,6 +676,8 @@ async function simulateProxmoxInstall(
         total_bytes: 0,
         message,
       });
+
+      if (stage === "writing" && step === 0) failMockOperation("proxmox");
 
       await new Promise((resolve) => setTimeout(resolve, delay));
     }

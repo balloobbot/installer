@@ -27,10 +27,14 @@ hai-core = { workspace = true, features = ["proxmox", "utm"] }
 # Tauri
 tauri = { workspace = true }
 tauri-plugin-opener = { workspace = true }
+tauri-plugin-log = { workspace = true }
 tauri-plugin-os = { workspace = true }
+log = { workspace = true }
+os_info = { workspace = true }
 
 # Serialization (for Tauri commands)
 serde = { workspace = true }
+serde_json = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
@@ -39,8 +43,8 @@ tokio = { workspace = true }
 tauri-plugin-single-instance = { workspace = true }
 
 [dev-dependencies]
+tauri = { workspace = true, features = ["test"] }
 plist = { workspace = true }
-serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 serial_test = { workspace = true }
 tempfile = { workspace = true }

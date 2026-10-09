@@ -32,11 +32,27 @@ pub enum Error {
     #[error("Proxmox API error: {0}")]
     ProxmoxApi(String),
 
+    #[error("Proxmox session expired or invalid. Please reconnect to Proxmox.")]
+    ProxmoxSessionExpired,
+
+    #[error("Proxmox two-factor authentication: {0}")]
+    ProxmoxTwoFactor(String),
+    /// Installer-authored guidance, without raw HTTP responses or request URLs.
+    #[error("{0}")]
+    ProxmoxActionRequired(String),
+
+    /// GitHub's API limit was reached; installer-authored guidance with the wait time.
+    #[error("{0}")]
+    RateLimited(String),
+
     #[error("UTM error: {0}")]
     Utm(String),
 
     #[error("UTM operation outcome is unknown: {0}")]
     UtmOperationUncertain(String),
+
+    #[error("{0}")]
+    UtmVmCreated(String),
 
     #[error("Drive disconnected")]
     DriveDisconnected,
@@ -64,12 +80,14 @@ pub enum Error {
     #[error("Verification failed: {0}")]
     VerificationFailed(String),
 
-    /// The drive ran out of space part-way through the write.
-    #[error(
-        "Image is larger than the selected drive: only {written} of {image_size} bytes fit \
-         before the drive reported that it was full"
-    )]
-    ImageTooLarge { written: u64, image_size: u64 },
+    /// Known capacity is too small, or writing/flushing reported a full device;
+    /// `written` is zero for preflight failures.
+    #[error("Image is larger than the selected drive: image size {image_size} bytes; {written} bytes written")]
+    ImageTooLarge {
+        written: u64,
+        image_size: u64,
+        drive_size: Option<u64>,
+    },
 }
 
 /// Result type alias for hai-core operations
@@ -228,6 +246,7 @@ mod tests {
         let error = Error::ImageTooLarge {
             written: 3_000_000_000,
             image_size: 4_000_000_000,
+            drive_size: None,
         };
         let msg = error.to_string();
         assert!(msg.contains("larger than the selected drive"));

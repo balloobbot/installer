@@ -46,6 +46,9 @@ use std::path::{Path, PathBuf};
 
 /// Release metadata and image download.
 pub trait ReleaseSource {
+    /// Check that the Home Assistant version service can be reached.
+    async fn check_connection(&self) -> Result<()>;
+
     /// Fetch the device manifest (list of supported boards).
     async fn get_device_manifest(&self) -> Result<DeviceManifest>;
 
@@ -88,10 +91,11 @@ pub trait ReleaseSource {
 
 /// Block-device enumeration and raw image writing.
 ///
-/// `list_devices` returns every block device the platform reports, internal
-/// disks included, and `write_image` writes to whatever device id it is given.
-/// Neither checks that the target is safe to overwrite, that is the caller's
-/// responsibility.
+/// On Linux, enumeration excludes read-only disks and disks backing system
+/// mounts, active swap, or active storage. The writer repeats these checks before
+/// unmounting and opening the device. Callers must choose an eligible target
+/// and capture its identity; real writers re-check that identity, including a
+/// known hardware serial, before writing.
 pub trait DeviceBackend {
     /// Check process privileges before preparing an image, without opening a drive.
     /// Defaults to success for backends that authorize access during `write_image`.
@@ -99,16 +103,18 @@ pub trait DeviceBackend {
         Ok(())
     }
 
-    /// List all block devices on the system.
+    /// List block devices, subject to platform-specific filtering.
     async fn list_devices(&self) -> Result<Vec<BlockDevice>>;
 
     /// Write an image to the device with this id, reporting progress.
     ///
-    /// Performs no identity or removability check of its own.
+    /// Re-checks the expected identity. Platform safety checks do not replace
+    /// caller validation of removability.
     async fn write_image<P: ProgressCallback>(
         &self,
         image_path: &Path,
         device_id: &str,
+        expected: &ExpectedDevice,
         verify: bool,
         progress_callback: &P,
     ) -> Result<()>;
@@ -121,6 +127,13 @@ pub trait ProxmoxBackend {
 
     /// List cluster nodes.
     async fn list_nodes(&self, session: &ProxmoxSession) -> Result<Vec<ProxmoxNode>>;
+
+    /// List the node's bridges, including eligible SDN VNets.
+    async fn list_bridges(
+        &self,
+        session: &ProxmoxSession,
+        node: &str,
+    ) -> Result<Vec<ProxmoxBridge>>;
 
     /// List storage available on a node.
     async fn list_storage(

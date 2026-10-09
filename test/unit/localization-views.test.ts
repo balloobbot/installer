@@ -67,32 +67,29 @@ describe("localized view contracts", () => {
 
   it("uses whole unnamed-device success sentences and preserves named-device text", () => {
     const element = view("success-view");
-    expect(
-      output(element).querySelector(".subtitle")?.textContent?.trim()
-    ).to.equal("Home Assistant has been installed on your device");
-    expect(
-      output(element).querySelectorAll(".step-text")[1]?.textContent?.trim()
-    ).to.equal("Insert it into your device and power it on");
-    replace("sbc.success_installed_unknown_device", "Installed fixture.");
-    replace("sbc.success_insert_unknown_device", "Insert fixture.");
-    expect(
-      output(element).querySelector(".subtitle")?.textContent?.trim()
-    ).to.equal("Installed fixture.");
-    expect(
-      output(element).querySelectorAll(".step-text")[1]?.textContent?.trim()
-    ).to.equal("Insert fixture.");
+    const insertStep = () =>
+      (
+        output(element).querySelector("install-success") as unknown as {
+          steps: unknown[];
+        }
+      ).steps[1];
+    expect(insertStep()).to.equal(
+      "Insert the written storage into your device."
+    );
+    replace(
+      "views.sbc.success_view.insert_the_written_storage_unknown_device",
+      "Insert fixture."
+    );
+    expect(insertStep()).to.equal("Insert fixture.");
     Object.assign(element, {
       _wizardState: {
         ...wizardState.getState(),
         selections: { deviceName: "Raspberry Pi 5" },
       },
     });
-    expect(
-      output(element).querySelector(".subtitle")?.textContent?.trim()
-    ).to.equal("Home Assistant has been installed on your Raspberry Pi 5");
-    expect(
-      output(element).querySelectorAll(".step-text")[1]?.textContent?.trim()
-    ).to.equal("Insert it into Raspberry Pi 5 and power it on");
+    expect(insertStep()).to.equal(
+      "Insert the written storage into Raspberry Pi 5."
+    );
   });
 
   for (const tag of [
@@ -105,6 +102,13 @@ describe("localized view contracts", () => {
         _loadInfo(): Promise<void>;
         _loadHaosVersion(): Promise<void>;
       };
+      // The board release lookup needs a selected board to ask for.
+      Object.assign(element, {
+        _wizardState: {
+          ...wizardState.getState(),
+          selections: { deviceConfig: { board: "rpi5-64" } },
+        },
+      });
       expect(output(element).textContent).to.contain("Loading...");
       mockTauriIpc((command) => {
         expect(command).to.equal("get_haos_release");
@@ -145,20 +149,18 @@ describe("localized view contracts", () => {
     ).to.equal("Unknown-target warning fixture.");
   });
 
-  for (const tag of ["proxmox-progress-view", "utm-progress-view"]) {
-    it(`${tag} gets its pending ETA from the catalog`, () => {
-      replace("views.sbc.progress_view.calculating", "Pending ETA fixture");
-      const content = output(
-        view(tag, {
-          _stage: "downloading",
-          _totalBytes: 1024,
-          _bytesProcessed: 0,
-        })
-      );
-      expect(content.textContent).to.contain("Pending ETA fixture");
-      expect(content.textContent).not.to.contain("Calculating...");
-    });
-  }
+  it("install-progress gets its pending ETA from the catalog", () => {
+    replace("views.sbc.progress_view.calculating", "Pending ETA fixture");
+    const content = output(
+      view("install-progress", {
+        stage: "downloading",
+        totalBytes: 1024,
+        bytesProcessed: 0,
+      })
+    );
+    expect(content.textContent).to.contain("Pending ETA fixture");
+    expect(content.textContent).not.to.contain("Calculating...");
+  });
 
   it("lets the installed-version catalog own spacing, wrapping, and order", () => {
     replace("utm.installed_with_version", "{version}: installed fixture");
@@ -186,61 +188,51 @@ describe("localized view contracts", () => {
     replace("vm.disk_storage", "Disk fixture");
     const utm = output(view("utm-configure-view"));
     expect(
-      utm.querySelector(".name-input")?.getAttribute("placeholder")
+      utm.querySelector("wa-input[placeholder]")?.getAttribute("placeholder")
     ).to.equal(DEFAULT_UTM_VM_NAME);
     for (const tag of ["utm-confirm-view", "proxmox-confirm-view"]) {
       const content = output(view(tag));
       expect(content.textContent).to.contain("Disk fixture");
       expect(content.textContent).not.to.contain("Pool fixture");
     }
-    expect(
-      output(view("proxmox-configure-view", { _loading: false })).textContent
-    ).to.contain("Pool fixture");
+    const labels = Array.from(
+      output(
+        view("proxmox-configure-view", { _loading: false })
+      ).querySelectorAll("[label]"),
+      (field) => field.getAttribute("label")
+    );
+    expect(labels).to.include("Pool fixture");
+    expect(labels).not.to.include("Disk fixture");
   });
 
-  for (const tag of [
-    "progress-view",
-    "proxmox-progress-view",
-    "utm-progress-view",
-  ]) {
-    for (const [seconds, phrase] of [
-      [59, "Less than a minute"],
-      [60, "About 1 minute"],
-      [3599, "About 60 minutes"],
-      [3600, "About 1h 0m"],
-    ] as const) {
-      it(`${tag} preserves the ${seconds}-second ETA boundary`, () => {
-        Date.now = () => 10000;
-        const element = view(tag, {
-          _stageStartTime: 9000,
-          _stageStartBytes: 0,
-          _bytesProcessed: 1,
-          _totalBytes: seconds + 1,
-          _progress: {
-            stage: "downloading",
-            progress: 1,
-            bytes_processed: 1,
-            total_bytes: seconds + 1,
-            message: "",
-          },
-        }) as unknown as { _calculateEta(): string | null };
-        expect(element._calculateEta()).to.equal(
-          phrase + (tag === "progress-view" ? "" : " remaining")
-        );
-      });
-    }
+  for (const [seconds, phrase] of [
+    [59, "Less than a minute remaining"],
+    [60, "About 1 minute remaining"],
+    [3599, "About 60 minutes remaining"],
+    [3600, "About 1h 0m remaining"],
+  ] as const) {
+    it(`install-progress preserves the ${seconds}-second ETA boundary`, () => {
+      Date.now = () => 10000;
+      const element = view("install-progress", {
+        stageStartTime: 9000,
+        stageStartBytes: 0,
+        bytesProcessed: 1,
+        totalBytes: seconds + 1,
+      }) as unknown as { _calculateEta(): string | null };
+      expect(element._calculateEta()).to.equal(phrase);
+    });
   }
 
-  it("uses regional Intl grouping in actual size and VM formatters without changing units", () => {
+  it("uses regional Intl grouping in VM formatters without changing size units", () => {
     setLanguage(["en-IN"]);
-    const drive = view("drive-card", { driveSize: 123456 * 1024 ** 4 });
+    const drive = view("drive-card", { driveSize: 1.5 * 1000 ** 4 });
     expect(output(drive).querySelector(".size")?.textContent).to.equal(
-      "1,23,456.0 TB"
+      "1.5 TB"
     );
     const confirmation = view("confirmation-view") as unknown as {
       _formatSize(bytes: number): string;
     };
-    expect(confirmation._formatSize(1.25 * 1024 ** 4)).to.equal("1.3 TB");
+    expect(confirmation._formatSize(1.25 * 1000 ** 4)).to.equal("1.2 TB");
     for (const tag of [
       "utm-configure-view",
       "proxmox-configure-view",
@@ -258,31 +250,16 @@ describe("localized view contracts", () => {
     }
   });
 
-  for (const tag of [
-    "progress-view",
-    "proxmox-progress-view",
-    "utm-progress-view",
-  ]) {
-    it(`${tag} formats the actual rendered percentage`, () => {
-      setLanguage(["en-IN"]);
-      const element = view(tag, {
-        _stage: "downloading",
-        _totalBytes: 100,
-        _bytesProcessed: 12.5,
-        _progress:
-          tag === "progress-view"
-            ? {
-                stage: "downloading",
-                progress: 12.5,
-                bytes_processed: 12.5,
-                total_bytes: 100,
-                message: "",
-              }
-            : 12.5,
-      });
-      expect(
-        output(element).querySelector(".percentage")?.textContent?.trim()
-      ).to.equal("12.5%");
+  it("install-progress formats the actual rendered percentage", () => {
+    setLanguage(["en-IN"]);
+    const element = view("install-progress", {
+      stage: "downloading",
+      totalBytes: 100,
+      bytesProcessed: 12.5,
+      progress: 12.5,
     });
-  }
+    expect(
+      output(element).querySelector(".percentage")?.textContent?.trim()
+    ).to.equal("12.5%");
+  });
 });

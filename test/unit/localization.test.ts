@@ -47,11 +47,17 @@ describe("localization", () => {
 
   it("formats ICU plural durations without changing the existing wording", () => {
     expect(
-      localize("views.sbc.progress_view.about_value_minutevalue", { value0: 1 })
-    ).to.equal("About 1 minute");
+      localize(
+        "views.proxmox.proxmox_progress_view.about_value_minutevalue_remaining",
+        { value0: 1 }
+      )
+    ).to.equal("About 1 minute remaining");
     expect(
-      localize("views.sbc.progress_view.about_value_minutevalue", { value0: 2 })
-    ).to.equal("About 2 minutes");
+      localize(
+        "views.proxmox.proxmox_progress_view.about_value_minutevalue_remaining",
+        { value0: 2 }
+      )
+    ).to.equal("About 2 minutes remaining");
     expect(
       localize(
         "views.proxmox.proxmox_progress_view.about_valueh_valuem_remaining",
@@ -60,11 +66,11 @@ describe("localization", () => {
     ).to.equal("About 1h 30m remaining");
   });
 
-  it("preserves the existing binary byte basis, unit labels, and rounding", () => {
+  it("preserves the existing decimal byte basis, unit labels, and flooring", () => {
     expect(formatBytes(0)).to.equal("0 B");
-    expect(formatBytes(1024)).to.equal("1 KB");
-    expect(formatBytes(1587)).to.equal("1.5 KB");
-    expect(formatBytes(1024 ** 3)).to.equal("1 GB");
+    expect(formatBytes(1000)).to.equal("1 KB");
+    expect(formatBytes(1599)).to.equal("1.5 KB");
+    expect(formatBytes(1000 ** 3)).to.equal("1 GB");
     expect(
       formatNumber(Number((1.25).toFixed(1)), {
         minimumFractionDigits: 1,

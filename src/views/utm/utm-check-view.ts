@@ -1,5 +1,15 @@
 import { localize, localizeContent } from "../../localization/localize.js";
+import {
+  installerError,
+  renderErrorHelp,
+  type InstallerError,
+} from "../../utils/installer-error.js";
 import { LitElement, html, css } from "lit";
+import {
+  ViewAccessibility,
+  reducedMotionStyles,
+} from "../../utils/view-accessibility.js";
+import { InstallDiagnostics } from "../../utils/diagnostics.js";
 import { customElement, state } from "lit/decorators.js";
 import { checkUtmStatus } from "../../api/commands.js";
 import type { UtmStatus } from "../../api/types.js";
@@ -7,6 +17,7 @@ import { wizardState } from "../../state/wizard-state.js";
 import { openExternalUrl } from "../../utils/external-url.js";
 import "@home-assistant/webawesome/dist/components/button/button.js";
 import "../../components/ha-svg-icon.js";
+import "../../components/casita-mascot.js";
 
 // mdi:download
 const mdiDownload = "M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z";
@@ -16,7 +27,9 @@ const mdiRefresh =
 
 @customElement("utm-check-view")
 export class UtmCheckView extends LitElement {
+  protected readonly _accessibility = new ViewAccessibility(this);
   static styles = css`
+    ${reducedMotionStyles}
     :host {
       display: flex;
       flex-direction: column;
@@ -59,9 +72,9 @@ export class UtmCheckView extends LitElement {
       }
     }
 
-    .utm-logo {
-      width: 56px;
-      height: 56px;
+    casita-mascot {
+      width: 96px;
+      height: 96px;
     }
 
     .status-row {
@@ -162,7 +175,7 @@ export class UtmCheckView extends LitElement {
     .warning-title {
       font-size: 0.875rem;
       font-weight: 500;
-      color: #e65100;
+      color: var(--ha-text-color, #212121);
       margin: 0;
     }
 
@@ -174,7 +187,7 @@ export class UtmCheckView extends LitElement {
 
     .warning-description {
       font-size: 0.8125rem;
-      color: var(--ha-secondary-text-color, #727272);
+      color: var(--ha-text-color, #212121);
       margin: 0;
     }
 
@@ -183,7 +196,7 @@ export class UtmCheckView extends LitElement {
       padding: 0;
       margin: 0;
       font-size: 0.8125rem;
-      color: var(--ha-secondary-text-color, #727272);
+      color: var(--ha-text-color, #212121);
     }
 
     .warning-list li {
@@ -211,7 +224,7 @@ export class UtmCheckView extends LitElement {
   private _utmStatus: UtmStatus | null = null;
 
   @state()
-  private _error: string | null = null;
+  private _error: InstallerError | null = null;
 
   connectedCallback() {
     super.connectedCallback();
@@ -229,10 +242,11 @@ export class UtmCheckView extends LitElement {
       // Store UTM installed status in wizard state
       wizardState.setSelection("utmInstalled", status.installed);
     } catch (error) {
-      this._error =
-        error instanceof Error
-          ? error.message
-          : localize("views.utm.utm_check_view.failed_to_check_utm_status");
+      if (this.isConnected) new InstallDiagnostics("utm").fail(error);
+      this._error = installerError(
+        error,
+        localize("views.utm.utm_check_view.failed_to_check_utm_status")
+      );
       wizardState.setSelection("utmInstalled", false);
     } finally {
       this._loading = false;
@@ -277,7 +291,15 @@ export class UtmCheckView extends LitElement {
       </div>
 
       <div class="status-card">
-        ${this._renderUtmLogo()}
+        <casita-mascot
+          mood=${this._loading
+            ? "loading"
+            : this._error
+              ? "problem"
+              : this._utmStatus?.installed
+                ? "happy"
+                : "sad"}
+        ></casita-mascot>
         ${this._loading
           ? this._renderLoading()
           : this._error
@@ -287,14 +309,6 @@ export class UtmCheckView extends LitElement {
               : this._renderNotInstalled()}
       </div>
     `;
-  }
-
-  private _renderUtmLogo() {
-    return html`<img
-      class="utm-logo"
-      src="/assets/icons/utm.svg"
-      alt=${localize("views.utm.utm_check_view.utm")}
-    />`;
   }
 
   private _renderLoading() {
@@ -314,7 +328,7 @@ export class UtmCheckView extends LitElement {
 
   private _renderError() {
     return html`
-      <div class="status-row">
+      <div class="status-row" role="alert">
         <div class="status-icon warning">
           <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
             <path
@@ -326,18 +340,23 @@ export class UtmCheckView extends LitElement {
           <p class="status-title">
             ${localize("views.utm.utm_check_view.error_checking_utm")}
           </p>
-          <p class="status-description">${this._error}</p>
+          <p class="status-description" style="overflow-wrap: anywhere;">
+            ${this._error?.message}
+          </p>
+          ${renderErrorHelp()}
         </div>
       </div>
-      <wa-button
-        variant="brand"
-        appearance="outlined"
-        @click=${this._checkStatus}
-      >
-        ${localizeContent("views.utm.utm_check_view.value_try_again", {
-          value0: this._renderRefreshIcon(),
-        })}
-      </wa-button>
+      ${this._error?.retryable
+        ? html`<wa-button
+            variant="brand"
+            appearance="outlined"
+            @click=${this._checkStatus}
+          >
+            ${localizeContent("views.utm.utm_check_view.value_try_again", {
+              value0: this._renderRefreshIcon(),
+            })}
+          </wa-button>`
+        : ""}
     `;
   }
 

@@ -1,15 +1,14 @@
-import {
-  formatNumber,
-  localize,
-  localizeContent,
-} from "../../localization/localize.js";
+import { localize, localizeContent } from "../../localization/localize.js";
 import { LitElement, html, css, nothing } from "lit";
+import { ViewAccessibility } from "../../utils/view-accessibility.js";
+import { logFrontendError } from "../../utils/diagnostics.js";
 import { customElement, state } from "lit/decorators.js";
 import { wizardState, type WizardState } from "../../state/wizard-state.js";
-import { getHaosRelease } from "../../api/commands.js";
+import { formatBytes, getHaosRelease } from "../../api/commands.js";
 
 @customElement("confirmation-view")
 export class ConfirmationView extends LitElement {
+  protected readonly _accessibility = new ViewAccessibility(this);
   static styles = css`
     :host {
       display: flex;
@@ -177,10 +176,12 @@ export class ConfirmationView extends LitElement {
 
   private async _loadHaosVersion() {
     try {
-      const release = await getHaosRelease();
+      const board = this._wizardState.selections.deviceConfig?.board;
+      if (!board) throw new Error("No board selected");
+      const release = await getHaosRelease(undefined, board);
       this._haosVersion = release.version;
     } catch (error) {
-      console.error("Failed to load HAOS version:", error);
+      logFrontendError(error);
       this._haosVersion = null;
     }
   }
@@ -302,19 +303,9 @@ export class ConfirmationView extends LitElement {
   }
 
   private _formatSize(bytes: number | undefined): string {
-    if (!bytes) return localize("views.sbc.confirmation_view.unknown_size");
-    const gb = bytes / (1024 * 1024 * 1024);
-    if (gb >= 1000) {
-      return localize("components.drive_card.value_tb", {
-        value0: formatNumber(Number((gb / 1024).toFixed(1)), {
-          minimumFractionDigits: 1,
-          maximumFractionDigits: 1,
-        }),
-      });
-    }
-    return localize("components.drive_card.value_gb", {
-      value0: formatNumber(Number(gb.toFixed(0)), { maximumFractionDigits: 0 }),
-    });
+    if (bytes === undefined)
+      return localize("views.sbc.confirmation_view.unknown_size");
+    return formatBytes(bytes);
   }
 
   private _renderBoardIcon() {

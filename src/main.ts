@@ -3,6 +3,9 @@
 
 import "@home-assistant/webawesome/dist/styles/themes/default.css";
 import { initializeLocalization } from "./localization/initialize.js";
+import { installErrorLogging } from "./utils/diagnostics.js";
+
+installErrorLogging();
 
 // Initialize before component modules capture labels; failure still loads the UI.
 void initializeLocalization()

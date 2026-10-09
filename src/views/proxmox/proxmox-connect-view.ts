@@ -1,5 +1,12 @@
+import {
+  installerError,
+  renderErrorHelp,
+  type InstallerError,
+} from "../../utils/installer-error.js";
 import { localize } from "../../localization/localize.js";
 import { LitElement, html, css } from "lit";
+import { ViewAccessibility } from "../../utils/view-accessibility.js";
+import { InstallDiagnostics } from "../../utils/diagnostics.js";
 import { customElement, state } from "lit/decorators.js";
 import { proxmoxConnect } from "../../api/commands.js";
 import { wizardState } from "../../state/wizard-state.js";
@@ -7,8 +14,11 @@ import "@home-assistant/webawesome/dist/components/callout/callout.js";
 import type WaInput from "@home-assistant/webawesome/dist/components/input/input.js";
 import "@home-assistant/webawesome/dist/components/input/input.js";
 
+const INVALID_INPUT = "invalid_input";
+
 @customElement("proxmox-connect-view")
 export class ProxmoxConnectView extends LitElement {
+  protected readonly _accessibility = new ViewAccessibility(this);
   static styles = css`
     :host {
       display: flex;
@@ -73,7 +83,7 @@ export class ProxmoxConnectView extends LitElement {
       align-items: center;
       justify-content: center;
       flex-shrink: 0;
-      background-color: #f44336;
+      background-color: var(--ha-error-fill, #b30532);
     }
 
     .status-icon svg {
@@ -95,7 +105,7 @@ export class ProxmoxConnectView extends LitElement {
 
     .status-description {
       font-size: 0.8125rem;
-      color: var(--ha-secondary-text-color, #727272);
+      color: var(--ha-error-color, #b30532);
       margin: 0.25rem 0 0 0;
     }
   `;
@@ -110,13 +120,16 @@ export class ProxmoxConnectView extends LitElement {
   private _password = "";
 
   @state()
+  private _totp = "";
+
+  @state()
   private _connecting = false;
 
   @state()
   private _connected = false;
 
   @state()
-  private _error: string | null = null;
+  private _error: InstallerError | null = null;
 
   connectedCallback() {
     super.connectedCallback();
@@ -139,8 +152,9 @@ export class ProxmoxConnectView extends LitElement {
     }
 
     if (!this._serverUrl || !this._username || !this._password) {
-      this._error = localize("proxmox.validation.required_fields");
-      return false;
+      return this._validationError(
+        localize("proxmox.validation.required_fields")
+      );
     }
 
     // Validate URL format - must be HTTPS for security
@@ -148,25 +162,27 @@ export class ProxmoxConnectView extends LitElement {
     try {
       const parsed = new URL(url);
       if (parsed.protocol !== "https:") {
-        this._error = localize("proxmox.validation.https_url");
-        return false;
+        return this._validationError(localize("proxmox.validation.https_url"));
       }
     } catch {
-      this._error = localize("proxmox.validation.valid_url");
-      return false;
+      return this._validationError(localize("proxmox.validation.valid_url"));
     }
 
     this._connecting = true;
     this._error = null;
+    const diagnostics = new InstallDiagnostics("proxmox");
+    diagnostics.advance("connecting");
 
     try {
       const session = await proxmoxConnect({
         server_url: url,
         username: this._username,
         password: this._password,
+        totp: this._totp.trim() || undefined,
       });
 
       this._connected = true;
+      diagnostics.advance("complete");
 
       // Store session in wizard state
       wizardState.setSelection("proxmoxSession", session);
@@ -174,19 +190,15 @@ export class ProxmoxConnectView extends LitElement {
       wizardState.setSelection("proxmoxConnected", true);
       return true;
     } catch (error) {
-      // Tauri invoke errors can be strings, Error objects, or other types
-      if (typeof error === "string") {
-        this._error = error;
-      } else if (error instanceof Error) {
-        this._error = error.message;
-      } else if (error && typeof error === "object" && "message" in error) {
-        this._error = String((error as { message: unknown }).message);
-      } else {
-        this._error = String(error) || localize("proxmox.connection_failed");
-      }
+      if (this.isConnected) diagnostics.fail(error);
+      this._error = installerError(
+        error,
+        localize("proxmox.connection_failed")
+      );
       wizardState.setSelection("proxmoxConnected", false);
       return false;
     } finally {
+      this._totp = "";
       this._connecting = false;
     }
   }
@@ -217,9 +229,30 @@ export class ProxmoxConnectView extends LitElement {
     this._resetConnection();
   }
 
+  private async _validationError(message: string): Promise<false> {
+    // A local input problem: no installation help or report link needed
+    this._error = {
+      code: INVALID_INPUT,
+      message,
+      retryable: false,
+      details: {},
+    };
+    await this.updateComplete;
+    // An identical validation message does not trigger another Lit update.
+    if (this.isConnected) {
+      this.renderRoot.querySelector<HTMLElement>('[role="alert"]')?.focus();
+    }
+    return false;
+  }
+
   private _onPasswordChange(e: Event) {
     const input = e.target as WaInput;
     this._password = input.value ?? "";
+    this._resetConnection();
+  }
+
+  private _onTotpChange(e: Event) {
+    this._totp = (e.target as WaInput).value ?? "";
     this._resetConnection();
   }
 
@@ -312,6 +345,20 @@ export class ProxmoxConnectView extends LitElement {
           ?disabled=${this._connecting}
         ></wa-input>
 
+        <wa-input
+          type="text"
+          input-id="totp"
+          label=${localize(
+            "views.proxmox.proxmox_connect_view.authenticator_app_code_optional"
+          )}
+          autocomplete="one-time-code"
+          inputmode="numeric"
+          .value=${this._totp}
+          @input=${this._onTotpChange}
+          @keydown=${this._onKeyDown}
+          ?disabled=${this._connecting}
+        ></wa-input>
+
         <wa-callout variant="neutral" appearance="plain" size="s">
           ${localize(
             "views.proxmox.proxmox_connect_view.proxmox_uses_a_self_signed_certificate_by_default_so_the_installer_accepts_"
@@ -323,7 +370,7 @@ export class ProxmoxConnectView extends LitElement {
 
   private _renderError() {
     return html`
-      <div class="status-row">
+      <div class="status-row" role="alert">
         <div class="status-icon">
           <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
             <path
@@ -335,7 +382,10 @@ export class ProxmoxConnectView extends LitElement {
           <p class="status-title">
             ${localize("views.proxmox.proxmox_connect_view.connection_failed")}
           </p>
-          <p class="status-description">${this._error}</p>
+          <p class="status-description" style="overflow-wrap: anywhere;">
+            ${this._error?.message}
+          </p>
+          ${this._error?.code === INVALID_INPUT ? "" : renderErrorHelp()}
         </div>
       </div>
     `;

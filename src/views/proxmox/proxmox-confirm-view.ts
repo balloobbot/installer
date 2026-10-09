@@ -4,6 +4,8 @@ import {
   localizeContent,
 } from "../../localization/localize.js";
 import { LitElement, html, css } from "lit";
+import { ViewAccessibility } from "../../utils/view-accessibility.js";
+import { logFrontendError } from "../../utils/diagnostics.js";
 import { customElement, state } from "lit/decorators.js";
 import { wizardState, type WizardState } from "../../state/wizard-state.js";
 import {
@@ -19,6 +21,7 @@ import { getHaosRelease } from "../../api/commands.js";
 
 @customElement("proxmox-confirm-view")
 export class ProxmoxConfirmView extends LitElement {
+  protected readonly _accessibility = new ViewAccessibility(this);
   static styles = css`
     :host {
       display: flex;
@@ -153,10 +156,10 @@ export class ProxmoxConfirmView extends LitElement {
 
   private async _loadInfo() {
     try {
-      const release = await getHaosRelease();
+      const release = await getHaosRelease(undefined, "ova");
       this._haosVersion = release.version;
     } catch (error) {
-      console.error("Failed to load info:", error);
+      logFrontendError(error);
       this._haosVersion = null;
     }
   }
@@ -204,6 +207,12 @@ export class ProxmoxConfirmView extends LitElement {
               ${localizeContent(
                 "views.proxmox.proxmox_confirm_view.storage_value",
                 { value0: storage }
+              )}
+            </p>
+            <p class="summary-detail">
+              ${localize(
+                "views.proxmox.proxmox_confirm_view.network_bridge_value",
+                { value0: selections.proxmoxBridge }
               )}
             </p>
           </div>
