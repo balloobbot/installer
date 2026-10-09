@@ -38,7 +38,8 @@ pub async fn write_image<P: ProgressCallback>(
     check_identity(&super::device::list_devices().await?, device_id, expected)?;
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let opened = device.metadata()?;
-    let current = std::fs::metadata(device_id)?;
+    // Unplugged between the checks: report the disconnect, not a missing path
+    let current = std::fs::metadata(device_id).map_err(device_io_error)?;
     if !opened.file_type().is_block_device() || opened.rdev() != current.rdev() {
         return Err(Error::DriveDisconnected);
     }

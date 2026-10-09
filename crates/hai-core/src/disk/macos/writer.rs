@@ -161,7 +161,9 @@ fn write_and_verify(
     )?;
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let opened = device.metadata()?;
-    let current = std::fs::metadata(device_path)?;
+    // Unplugged between the checks: report the disconnect, not a missing path
+    let current =
+        std::fs::metadata(device_path).map_err(|e| map_device_io_error(e, device_path))?;
     if !opened.file_type().is_char_device() || opened.rdev() != current.rdev() {
         return Err(Error::DriveDisconnected);
     }
