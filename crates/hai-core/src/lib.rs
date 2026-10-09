@@ -144,12 +144,27 @@ pub trait ProxmoxBackend {
         node: &str,
     ) -> Result<Vec<ProxmoxBridge>>;
 
-    /// List storage available on a node.
+    /// List storage available on a node, including its enabled content types.
     async fn list_storage(
         &self,
         session: &ProxmoxSession,
         node: &str,
     ) -> Result<Vec<ProxmoxStorage>>;
+
+    /// Enable import on an active directory storage after explicit user consent.
+    /// Returns true if changed, false if already enabled. Requires configuration
+    /// read access and Datastore.Allocate on /storage to change it. The setting
+    /// is cluster-wide and remains enabled; installation never calls this helper.
+    async fn enable_storage_import(
+        &self,
+        _session: &ProxmoxSession,
+        _node: &str,
+        _storage: &str,
+    ) -> Result<bool> {
+        Err(Error::ProxmoxApi(
+            "This backend does not support enabling storage import".to_string(),
+        ))
+    }
 
     /// Get the next free VM id.
     async fn get_next_vm_id(&self, session: &ProxmoxSession) -> Result<u32>;

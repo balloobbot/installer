@@ -561,6 +561,125 @@ async fn list_storage(session: &ProxmoxSession, node: &str) -> Result<Vec<Proxmo
     Ok(storage)
 }
 
+/// Explicitly enable import on the selected directory storage. Never called during installation.
+async fn enable_storage_import(
+    session: &ProxmoxSession,
+    node: &str,
+    storage: &str,
+) -> Result<bool> {
+    #[derive(serde::Deserialize)]
+    struct StorageConfig {
+        #[serde(rename = "type")]
+        storage_type: String,
+        content: String,
+        digest: String,
+    }
+
+    let client = create_client(session, 30)?;
+    let url = format!(
+        "{}/api2/json/storage/{}",
+        session.server_url.trim_end_matches('/'),
+        urlencoding::encode(storage)
+    );
+    let response = client
+        .get(&url)
+        .header("Cookie", format!("PVEAuthCookie={}", session.ticket))
+        .send()
+        .await
+        .map_err(|e| request_error(e, "Failed to read storage configuration"))?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(Error::ProxmoxSessionExpired);
+    }
+    // PVE only shows a storage's configuration to users who may also change it.
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        return Err(Error::ProxmoxActionRequired(format!(
+            "Your Proxmox user is missing Datastore.Allocate on /storage/{}.",
+            storage
+        )));
+    }
+    if !response.status().is_success() {
+        return Err(Error::ProxmoxApi(format!(
+            "Failed to read storage configuration: {}",
+            response.status()
+        )));
+    }
+
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| request_error(e, "Failed to parse storage configuration"))?;
+    let config: StorageConfig = serde_json::from_value(json["data"].clone())
+        .map_err(|e| Error::ProxmoxApi(format!("Invalid storage configuration: {}", e)))?;
+    if config.digest.len() != 40 || !config.digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Error::ProxmoxApi(
+            "Invalid storage configuration digest".to_string(),
+        ));
+    }
+    if config.content.split(',').any(|part| part.trim().is_empty()) {
+        return Err(Error::ProxmoxApi(
+            "Invalid storage configuration content".to_string(),
+        ));
+    }
+
+    // Read availability after the configuration. A later configuration change is
+    // rejected atomically by PVE's digest check when processing the PUT.
+    let available = list_storage(session, node).await?;
+    if config.storage_type != "dir"
+        || !available
+            .iter()
+            .any(|entry| entry.name == storage && entry.active && entry.storage_type == "dir")
+    {
+        return Err(Error::ProxmoxActionRequired(format!(
+            "Storage '{}' must be an active directory storage on node '{}'.",
+            storage, node
+        )));
+    }
+    if config
+        .content
+        .split(',')
+        .any(|part| part.trim() == "import")
+    {
+        return Ok(false);
+    }
+
+    ensure_privileges(
+        &fetch_privileges(session, "/storage").await?,
+        "/storage",
+        &["Datastore.Allocate"],
+    )?;
+
+    // Update only content; paths, node restrictions, and all other options stay intact.
+    // PVE encodes an empty content set as "none", which cannot be combined with import.
+    let content = if config.content == "none" {
+        "import".to_string()
+    } else {
+        format!("{},import", config.content)
+    };
+    let response = client
+        .put(&url)
+        .header("Cookie", format!("PVEAuthCookie={}", session.ticket))
+        .header("CSRFPreventionToken", &session.csrf_token)
+        .form(&[("content", content), ("digest", config.digest)])
+        .send()
+        .await
+        .map_err(|e| request_error(e, "Failed to enable storage import"))?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(Error::ProxmoxSessionExpired);
+    }
+    if !response.status().is_success() {
+        // A changed digest or revoked permission both land here; the response
+        // body is the server's, so the guidance stays installer-authored.
+        return Err(Error::ProxmoxActionRequired(format!(
+            "Proxmox did not enable Import on storage '{}'. Refresh storage and try again; its configuration or your permissions may have changed.",
+            storage
+        )));
+    }
+
+    // This synchronous endpoint writes configuration before returning success.
+    // Its unused response body must not erase attribution of an accepted change.
+    Ok(true)
+}
+
 /// Pick the first active storage that accepts `import` content and has room for the upload.
 fn select_import_storage(storage_list: &[ProxmoxStorage], required_bytes: u64) -> Result<String> {
     let mut too_small = Vec::new();
@@ -1739,6 +1858,15 @@ impl ProxmoxBackend for Backend {
         node: &str,
     ) -> Result<Vec<ProxmoxStorage>> {
         list_storage(session, node).await
+    }
+
+    async fn enable_storage_import(
+        &self,
+        session: &ProxmoxSession,
+        node: &str,
+        storage: &str,
+    ) -> Result<bool> {
+        enable_storage_import(session, node, storage).await
     }
 
     async fn get_next_vm_id(&self, session: &ProxmoxSession) -> Result<u32> {
@@ -3058,6 +3186,279 @@ mod tests {
                 .with_body(serde_json::json!({ "data": { path: granted } }).to_string())
                 .create_async()
                 .await
+        }
+
+        async fn mock_import_config(
+            server: &mut mockito::ServerGuard,
+            data: serde_json::Value,
+        ) -> mockito::Mock {
+            server
+                .mock("GET", "/api2/json/storage/local")
+                .match_header("Cookie", "PVEAuthCookie=test-ticket")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(serde_json::json!({ "data": data }).to_string())
+                .create_async()
+                .await
+        }
+
+        fn import_config(content: &str) -> serde_json::Value {
+            serde_json::json!({
+                "type": "dir", "content": content,
+                "digest": "0123456789abcdef0123456789abcdef01234567",
+                "path": "/var/lib/vz", "nodes": "pve,pve2", "shared": 0,
+                "prune-backups": "keep-last=3"
+            })
+        }
+
+        async fn mock_import_availability(
+            server: &mut mockito::ServerGuard,
+            entries: serde_json::Value,
+        ) -> mockito::Mock {
+            server
+                .mock("GET", "/api2/json/nodes/pve/storage")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(serde_json::json!({ "data": entries }).to_string())
+                .create_async()
+                .await
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn test_enable_storage_import_preserves_config_and_guards_update() {
+            let mut outcomes = Vec::new();
+            for (status, body) in [
+                (200, r#"{"data":null}"#),
+                (200, r#"{"data":{"storage":"local","type":"dir"}}"#),
+                (200, ""),
+                (200, "not JSON"),
+                (200, r#"{"data":"unexpected shape"}"#),
+                (500, r#"{"message":"detected modified configuration"}"#),
+                (403, r#"{"message":"permission check failed"}"#),
+                (401, r#"{"message":"ticket expired"}"#),
+                (200, r#"{"message":"unexpected response"}"#),
+            ] {
+                let mut server = Server::new_async().await;
+                let config =
+                    mock_import_config(&mut server, import_config("images,iso,backup,snippets"))
+                        .await;
+                let available = mock_import_availability(
+                    &mut server,
+                    serde_json::json!([
+                        {"storage":"local", "type":"dir", "active":1}
+                    ]),
+                )
+                .await;
+                let permission =
+                    mock_privileges(&mut server, "/storage", &["Datastore.Allocate"]).await;
+                let update = server.mock("PUT", "/api2/json/storage/local")
+                    .match_header("Cookie", "PVEAuthCookie=test-ticket")
+                    .match_header("CSRFPreventionToken", "test-csrf")
+                    // Exact body also proves unrelated configuration is not rewritten.
+                    .match_body("content=images%2Ciso%2Cbackup%2Csnippets%2Cimport&digest=0123456789abcdef0123456789abcdef01234567")
+                    .with_status(status).with_body(body).expect(1).create_async().await;
+                let result = enable_storage_import(&test_session(&server), "pve", "local").await;
+                outcomes.push((status, body, result.as_ref().is_ok_and(|changed| *changed)));
+                if status == 401 {
+                    assert!(matches!(result.unwrap_err(), Error::ProxmoxSessionExpired));
+                } else if status != 200 {
+                    assert!(result.unwrap_err().to_string().contains("Refresh storage"));
+                }
+                config.assert_async().await;
+                available.assert_async().await;
+                permission.assert_async().await;
+                update.assert_async().await;
+            }
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|(status, _, changed)| *changed == (*status == 200)),
+                "unexpected mutation attribution: {outcomes:?}"
+            );
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn test_enable_storage_import_already_enabled_does_not_write() {
+            let mut server = Server::new_async().await;
+            let config = mock_import_config(&mut server, import_config("iso,import,backup")).await;
+            let available = mock_import_availability(
+                &mut server,
+                serde_json::json!([
+                    {"storage":"local", "type":"dir", "active":1}
+                ]),
+            )
+            .await;
+            let update = server
+                .mock("PUT", "/api2/json/storage/local")
+                .expect(0)
+                .create_async()
+                .await;
+            assert!(
+                !enable_storage_import(&test_session(&server), "pve", "local")
+                    .await
+                    .unwrap()
+            );
+            config.assert_async().await;
+            available.assert_async().await;
+            update.assert_async().await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn test_enable_storage_import_replaces_none_content_marker() {
+            let mut server = Server::new_async().await;
+            let config = mock_import_config(&mut server, import_config("none")).await;
+            let available = mock_import_availability(
+                &mut server,
+                serde_json::json!([
+                    {"storage":"local", "type":"dir", "active":1}
+                ]),
+            )
+            .await;
+            let permission =
+                mock_privileges(&mut server, "/storage", &["Datastore.Allocate"]).await;
+            let update = server
+                .mock("PUT", "/api2/json/storage/local")
+                .match_body("content=import&digest=0123456789abcdef0123456789abcdef01234567")
+                .with_status(200)
+                .with_body(r#"{"data":null}"#)
+                .create_async()
+                .await;
+            assert!(
+                enable_storage_import(&test_session(&server), "pve", "local")
+                    .await
+                    .unwrap()
+            );
+            config.assert_async().await;
+            available.assert_async().await;
+            permission.assert_async().await;
+            update.assert_async().await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn test_enable_storage_import_rejects_unsuitable_node_storage() {
+            for entries in [
+                serde_json::json!([]),
+                serde_json::json!([{"storage":"local", "type":"dir", "active":0}]),
+                serde_json::json!([{"storage":"local", "type":"lvmthin", "active":1}]),
+                serde_json::json!([{"storage":"other", "type":"dir", "active":1}]),
+            ] {
+                let mut server = Server::new_async().await;
+                let config = mock_import_config(&mut server, import_config("iso")).await;
+                let available = mock_import_availability(&mut server, entries).await;
+                let update = server
+                    .mock("PUT", "/api2/json/storage/local")
+                    .expect(0)
+                    .create_async()
+                    .await;
+                let error = enable_storage_import(&test_session(&server), "pve", "local")
+                    .await
+                    .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("active directory storage on node 'pve'"));
+                config.assert_async().await;
+                available.assert_async().await;
+                update.assert_async().await;
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn test_enable_storage_import_requires_global_configuration_permission() {
+            let mut server = Server::new_async().await;
+            let config = mock_import_config(&mut server, import_config("iso")).await;
+            let available = mock_import_availability(
+                &mut server,
+                serde_json::json!([
+                    {"storage":"local", "type":"dir", "active":1}
+                ]),
+            )
+            .await;
+            let permission = mock_privileges(
+                &mut server,
+                "/storage",
+                &["Datastore.AllocateTemplate", "Datastore.Audit"],
+            )
+            .await;
+            let update = server
+                .mock("PUT", "/api2/json/storage/local")
+                .expect(0)
+                .create_async()
+                .await;
+            let error = enable_storage_import(&test_session(&server), "pve", "local")
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("Datastore.Allocate on /storage"));
+            config.assert_async().await;
+            available.assert_async().await;
+            permission.assert_async().await;
+            update.assert_async().await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn test_enable_storage_import_rejects_invalid_config_without_writing() {
+            let mut invalid_configs = vec![serde_json::Value::Null, serde_json::json!({})];
+            for (field, value) in [
+                ("digest", serde_json::json!("")),
+                ("digest", serde_json::json!("bad")),
+                ("content", serde_json::json!(null)),
+                ("content", serde_json::json!("")),
+                ("content", serde_json::json!("iso,,backup")),
+            ] {
+                let mut config = import_config("iso");
+                config[field] = value;
+                invalid_configs.push(config);
+            }
+            for invalid in invalid_configs {
+                let mut server = Server::new_async().await;
+                let config = mock_import_config(&mut server, invalid).await;
+                let update = server
+                    .mock("PUT", "/api2/json/storage/local")
+                    .expect(0)
+                    .create_async()
+                    .await;
+                let error = enable_storage_import(&test_session(&server), "pve", "local")
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("Invalid storage configuration"));
+                config.assert_async().await;
+                update.assert_async().await;
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn test_enable_storage_import_read_denied_or_session_expired() {
+            for status in [401, 403, 404, 500] {
+                let mut server = Server::new_async().await;
+                let config = server
+                    .mock("GET", "/api2/json/storage/local")
+                    .with_status(status)
+                    .create_async()
+                    .await;
+                let update = server
+                    .mock("PUT", "/api2/json/storage/local")
+                    .expect(0)
+                    .create_async()
+                    .await;
+                let error = enable_storage_import(&test_session(&server), "pve", "local")
+                    .await
+                    .unwrap_err();
+                match status {
+                    401 => assert!(matches!(error, Error::ProxmoxSessionExpired)),
+                    403 => assert!(error
+                        .to_string()
+                        .contains("missing Datastore.Allocate on /storage/local")),
+                    _ => assert!(error.to_string().contains(&status.to_string())),
+                }
+                config.assert_async().await;
+                update.assert_async().await;
+            }
         }
 
         #[tokio::test]

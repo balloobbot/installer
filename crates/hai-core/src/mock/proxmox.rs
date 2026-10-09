@@ -87,6 +87,25 @@ impl ProxmoxBackend for BackendMock {
         }])
     }
 
+    async fn enable_storage_import(
+        &self,
+        session: &ProxmoxSession,
+        node: &str,
+        storage: &str,
+    ) -> Result<bool> {
+        if self.list_storage(session, node).await?.iter().any(|entry| {
+            entry.name == storage
+                && entry.active
+                && entry.storage_type == "dir"
+                && entry.content.iter().any(|content| content == "import")
+        }) {
+            return Ok(false);
+        }
+        Err(crate::Error::ProxmoxApi(
+            "No suitable mock import storage".to_string(),
+        ))
+    }
+
     async fn get_next_vm_id(&self, _session: &ProxmoxSession) -> Result<u32> {
         Ok(100)
     }
