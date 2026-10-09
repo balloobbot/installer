@@ -500,7 +500,7 @@ async fn ensure_bridge_available(
         .vlan_tag
         .is_some_and(|tag| !(1..=4094).contains(&tag))
     {
-        return Err(Error::ProxmoxApi(
+        return Err(Error::ProxmoxActionRequired(
             "VLAN tag must be between 1 and 4094.".to_string(),
         ));
     }
@@ -967,7 +967,8 @@ async fn ensure_user_can_create_vm(
 async fn ensure_bridge_access(session: &ProxmoxSession, config: &ProxmoxVmConfig) -> Result<()> {
     let bridge = ensure_bridge_available(session, config).await?;
     if config.vlan_tag.is_some() && !bridge.vlan_aware {
-        return Err(Error::ProxmoxApi(format!(
+        // Installer-authored guidance, shown as is instead of a generic API error
+        return Err(Error::ProxmoxActionRequired(format!(
             "Network '{}' does not report VLAN tag support. Select a VLAN-aware bridge or remove the VLAN tag.",
             bridge.name
         )));
@@ -3218,7 +3219,11 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
-                assert!(error.to_string().contains("between 1 and 4094"));
+                // Shown to the user as is, not replaced by generic API guidance
+                assert!(
+                    matches!(&error, Error::ProxmoxActionRequired(message) if message.contains("between 1 and 4094")),
+                    "{error}"
+                );
                 assert!(source_unused);
                 network.assert_async().await;
                 create.assert_async().await;
