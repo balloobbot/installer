@@ -7,7 +7,6 @@ export type HaHardwareId = "green" | "yellow-cm4" | "yellow-cm5" | "blue";
 export interface HaHardwareInstaller {
   /** Board the backend resolves to its pinned installer image. */
   board: "green-installer" | "yellow-installer";
-  downloadUrl: string;
   /** Release date of the pinned image, shown as its version. */
   released: Date;
 }
@@ -29,8 +28,6 @@ export interface HaHardware {
  */
 const GREEN_INSTALLER: HaHardwareInstaller = {
   board: "green-installer",
-  downloadUrl:
-    "https://github.com/NabuCasa/buildroot-installer/releases/download/green-installer-20240410/green-installer-20240410.img.xz",
   // A calendar date, not an instant: local midnight shows this day in every
   // time zone, where a fixed UTC time moves a day in some of them.
   released: new Date(2024, 3, 10),
@@ -38,8 +35,6 @@ const GREEN_INSTALLER: HaHardwareInstaller = {
 
 const YELLOW_INSTALLER: HaHardwareInstaller = {
   board: "yellow-installer",
-  downloadUrl:
-    "https://github.com/NabuCasa/buildroot-installer/releases/download/yellow-installer-20231025/yellow-installer-20231025.img.xz",
   released: new Date(2023, 9, 25),
 };
 
@@ -97,7 +92,6 @@ export function haHardwareName(id: HaHardwareId): string {
 export function installerConfig(installer: HaHardwareInstaller): HaosConfig {
   return {
     board: installer.board,
-    download_url: installer.downloadUrl,
     minimum_storage_bytes: INSTALLER_STORAGE_BYTES,
     recommended_storage_bytes: INSTALLER_STORAGE_BYTES,
   };

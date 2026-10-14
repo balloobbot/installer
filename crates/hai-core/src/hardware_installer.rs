@@ -48,7 +48,6 @@ impl HardwareInstaller {
     pub fn storage(&self) -> HaosConfig {
         HaosConfig {
             board: self.board.to_string(),
-            download_url: self.download_url.to_string(),
             minimum_storage_bytes: INSTALLER_STORAGE_BYTES,
             recommended_storage_bytes: INSTALLER_STORAGE_BYTES,
         }

@@ -283,7 +283,6 @@ describe("app-shell", () => {
     wizardState.setSelection("haHardware", "green");
     wizardState.setSelection("deviceConfig", {
       board: "green-installer",
-      download_url: "unused",
       minimum_storage_bytes: 1_000_000_000,
       recommended_storage_bytes: 1_000_000_000,
     });
