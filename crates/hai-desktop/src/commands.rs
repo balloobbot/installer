@@ -4,6 +4,7 @@
 //! It handles the bridge between Tauri's Channel<T> and hai-core's ProgressCallback trait.
 
 use crate::backend::Backend;
+use crate::close_guard::running_job;
 use crate::command_error::CommandError;
 use crate::diagnostics::Operation;
 use crate::flash_state::FlashState;
@@ -175,6 +176,7 @@ pub async fn flash_image(
 ) -> Result<FlashResult, CommandError> {
     state
         .run(async move {
+            let _running = running_job();
             let callback = TauriProgressCallback::new(&progress_channel, "flash");
             callback
                 .operation
@@ -371,6 +373,7 @@ pub async fn download_utm_image(
     progress_channel: Channel<FlashProgress>,
     pending: tauri::State<'_, PendingUtmImages>,
 ) -> Result<String, CommandError> {
+    let _running = running_job();
     let callback = TauriProgressCallback::new(&progress_channel, "utm_download");
 
     // Verify UTM is available before doing any work.
@@ -467,6 +470,7 @@ pub async fn create_utm_vm(
     config: hai_core::UtmVmConfig,
     pending: tauri::State<'_, PendingUtmImages>,
 ) -> Result<String, CommandError> {
+    let _running = running_job();
     Operation::new("utm_create").finish(run_utm_creation(&Backend, &config, &pending).await)
 }
 
@@ -643,6 +647,7 @@ pub async fn proxmox_create_vm(
     config: ProxmoxVmConfig,
     progress_channel: Channel<FlashProgress>,
 ) -> Result<ProxmoxVmResult, CommandError> {
+    let _running = running_job();
     let callback = TauriProgressCallback::new(&progress_channel, "proxmox_install");
     // Fully qualified: `create_vm` is defined on both ProxmoxBackend and UtmBackend.
     callback.operation.finish(
