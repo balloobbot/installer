@@ -175,6 +175,7 @@ describe("Home Assistant hardware views", () => {
           "recovery button",
           "bridge JP2",
           "Only the red LED",
+          "remove the JP2 bridge",
           "sudo ./rpiboot -d mass-storage-gadget64",
           "rpiboot-CM4-CM5 - Mass Storage Gadget",
           "Rosetta",
