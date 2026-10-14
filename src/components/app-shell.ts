@@ -40,6 +40,7 @@ import {
 } from "../state/wizard-state.js";
 import { listBlockDevices, onCloseBlocked, quitAnyway } from "../api/index.js";
 import { findDrive, readDriveSelection } from "../utils/drive-selection.js";
+import { logFrontendError } from "../utils/diagnostics.js";
 import { openExternalUrl } from "../utils/external-url.js";
 
 export type ViewName =
@@ -119,6 +120,9 @@ export class AppShell extends LitElement {
     // The backend holds back closing the app while an installation runs
     this._stopCloseListener = onCloseBlocked(() => {
       this._showQuitDialog = true;
+    }).catch((error: unknown) => {
+      logFrontendError(error);
+      return () => {};
     });
   }
 
