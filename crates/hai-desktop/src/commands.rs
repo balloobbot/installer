@@ -810,6 +810,7 @@ mod tests {
         crate::diagnostics::clear_test_log_tail();
         let app = tauri::test::mock_app();
         app.manage(PendingUtmImages::default());
+        app.manage(crate::install_jobs::InstallJobs::default());
         let channel = Channel::new(|_| {
             let tail = crate::diagnostics::test_log_tail();
             assert!(!tail
@@ -817,7 +818,9 @@ mod tests {
                 .any(|line| line.contains("rust utm_download") && line.contains(" success ")));
             Ok(())
         });
-        let path = download_utm_image(channel, app.state()).await.unwrap();
+        let path = download_utm_image("attempt".into(), channel, app.state(), app.state())
+            .await
+            .unwrap();
         let tail = crate::diagnostics::test_log_tail();
         assert_eq!(
             tail.iter()

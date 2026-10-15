@@ -1319,9 +1319,12 @@ async fn upload_image_to_proxmox<P: ProgressCallback>(
         tokio::select! {
             biased;
             _ = cancel_check.tick() => {
-                if progress_callback.is_cancelled() {
-                    // Dropping the request closes the connection, and Proxmox
-                    // throws the partial upload away
+                // Dropping the request closes the connection, and Proxmox
+                // throws a partial upload away. Once the whole body is out,
+                // Proxmox may already be storing it, and closing the socket
+                // won't undo that: wait for the answer, so the caller can
+                // delete the image again.
+                if progress_callback.is_cancelled() && *progress_rx.borrow() < file_size {
                     return Err(Error::Cancelled);
                 }
             }
@@ -1790,10 +1793,14 @@ async fn discard_upload_if_stopped<P: ProgressCallback>(
         return Ok(());
     }
 
-    // Best effort: the stop is what the user asked for, a failed cleanup
-    // must not turn it into an error
+    // The stop holds either way, but a left-behind image is the user's to
+    // clean up, so name it rather than claim nothing was created
     if let Err(error) = delete_import_image(session, node, storage_name, image_filename).await {
         eprintln!("Temporary import cleanup after a stop failed: {error}");
+        return Err(Error::ProxmoxActionRequired(format!(
+            "Installation stopped, but the uploaded image could not be removed. \
+             Delete {storage_name}:import/{image_filename} from node {node} in Proxmox."
+        )));
     }
     Err(Error::Cancelled)
 }
@@ -1807,8 +1814,9 @@ fn stop_if_cancelled<P: ProgressCallback>(progress_callback: &P) -> Result<()> {
 
 /// Create and start a Home Assistant VM on Proxmox.
 ///
-/// A stop is honored until the VM is about to be created, and never leaves
-/// anything behind on Proxmox. Once creation starts, it runs to the end.
+/// A stop is honored until the VM is about to be created. It deletes the
+/// uploaded image again, and when that fails, the error names the image to
+/// delete by hand. Once creation starts, it runs to the end.
 async fn create_vm<B: ReleaseSource, P: ProgressCallback>(
     backend: &B,
     session: &ProxmoxSession,
@@ -5103,7 +5111,7 @@ mod tests {
             untouched.assert_async().await;
             untouched.remove_async().await;
 
-            // A failed cleanup still ends as the stop the user asked for
+            // A failed cleanup still stops, but names what was left behind
             let delete = server
                 .mock(
                     "DELETE",
@@ -5119,8 +5127,111 @@ mod tests {
                 discard_upload_if_stopped(&session, "pve", "local-import", "hai.qcow2", &progress)
                     .await
                     .unwrap_err();
+            let Error::ProxmoxActionRequired(message) = error else {
+                panic!("expected a cleanup warning, got {error:?}");
+            };
+            assert!(
+                message.contains("local-import:import/hai.qcow2"),
+                "{message}"
+            );
+            assert!(message.contains("node pve"), "{message}");
+            delete.assert_async().await;
+            delete.remove_async().await;
+
+            // A cleanup that works ends as a plain stop
+            let delete = server
+                .mock(
+                    "DELETE",
+                    "/api2/json/nodes/pve/storage/local-import/content/local-import%3Aimport%2Fhai.qcow2",
+                )
+                .with_body(r#"{"data":"UPID:pve:00000001:00000002:00000003:imgdel:root@pam:"}"#)
+                .create_async()
+                .await;
+            let task = server
+                .mock(
+                    "GET",
+                    "/api2/json/nodes/pve/tasks/UPID%3Apve%3A00000001%3A00000002%3A00000003%3Aimgdel%3Aroot%40pam%3A/status",
+                )
+                .with_body(r#"{"data":{"status":"stopped","exitstatus":"OK"}}"#)
+                .create_async()
+                .await;
+            let error =
+                discard_upload_if_stopped(&session, "pve", "local-import", "hai.qcow2", &progress)
+                    .await
+                    .unwrap_err();
             assert!(matches!(error, Error::Cancelled), "{error:?}");
             delete.assert_async().await;
+            task.assert_async().await;
+        }
+
+        #[tokio::test]
+        async fn stop_after_the_body_is_sent_waits_for_proxmox() {
+            use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let session = ProxmoxSession {
+                certificate_sha256: None,
+                server_url: format!("http://{}", listener.local_addr().unwrap()),
+                ticket: "test-ticket".into(),
+                csrf_token: "test-csrf".into(),
+            };
+            let temp_dir = tempfile::tempdir().unwrap();
+            let path = temp_dir.path().join("hai.qcow2");
+            std::fs::write(&path, vec![0; 1024 * 1024]).unwrap();
+            let progress = StoppableProgress::default();
+
+            let server = async {
+                let mut task_polled = false;
+                while !task_polled {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let mut socket = tokio::io::BufReader::new(socket);
+                    let mut request_line = String::new();
+                    socket.read_line(&mut request_line).await.unwrap();
+                    let mut content_length = 0;
+                    loop {
+                        let mut header = String::new();
+                        socket.read_line(&mut header).await.unwrap();
+                        if header == "\r\n" {
+                            break;
+                        }
+                        if let Some(length) =
+                            header.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            content_length = length.trim().parse().unwrap();
+                        }
+                    }
+
+                    let body = if request_line.starts_with("POST") {
+                        // Proxmox has the whole image and starts storing it;
+                        // the stop lands well before its answer does
+                        let mut upload = vec![0; content_length];
+                        socket.read_exact(&mut upload).await.unwrap();
+                        progress
+                            .stopped
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                        r#"{"data":"UPID:pve:00000001:00000002:00000003:imgcopy:root@pam:"}"#
+                    } else {
+                        assert!(request_line.contains("imgcopy"), "{request_line}");
+                        task_polled = true;
+                        r#"{"data":{"status":"stopped","exitstatus":"OK"}}"#
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+            };
+
+            // The upload must wait for Proxmox, so the image can be deleted
+            let upload = upload_image_to_proxmox(&session, "pve", &path, &progress, "local-import");
+            let (_, result) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(server, upload)
+            })
+            .await
+            .expect("the upload must finish once Proxmox answers");
+            assert_eq!(result.unwrap(), "hai.qcow2");
         }
 
         #[tokio::test]
@@ -5150,10 +5261,12 @@ mod tests {
                     received += socket.read(&mut buffer).await.unwrap();
                 }
 
-                // Stall without ever answering; only the stop can end this
+                // Stall without ever answering; only the stop can end this.
+                // Reading nothing for a while keeps most of the body unsent.
                 progress
                     .stopped
                     .store(true, std::sync::atomic::Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 while socket.read(&mut buffer).await.unwrap_or(0) > 0 {}
             };
             let upload = upload_image_to_proxmox(&session, "pve", &path, &progress, "local");
