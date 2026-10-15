@@ -8,12 +8,15 @@ use crate::command_error::CommandError;
 use crate::diagnostics::Operation;
 use crate::flash_state::FlashState;
 use hai_core::download::TemporaryImage;
+use hai_core::keep_awake::KeepAwake;
 use hai_core::{
     BlockDevice, DeviceBackend, DeviceManifest, ExpectedDevice, FlashProgress, FlashRequest,
     FlashResult, FlashStage, HaosRelease, HostBackend, ImageFormat, ProgressCallback,
     ProxmoxBackend, ProxmoxBridge, ProxmoxCredentials, ProxmoxNode, ProxmoxSession, ProxmoxStorage,
     ProxmoxVmConfig, ProxmoxVmResult, ReleaseSource, SystemInfo, UtmBackend, VmStatusInfo,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tauri::ipc::Channel;
 
 #[derive(Default)]
@@ -33,6 +36,7 @@ impl PendingUtmImages {
 struct TauriProgressCallback<'a> {
     channel: &'a Channel<FlashProgress>,
     operation: Operation,
+    cancelled: Option<Arc<AtomicBool>>,
 }
 
 impl<'a> TauriProgressCallback<'a> {
@@ -40,7 +44,14 @@ impl<'a> TauriProgressCallback<'a> {
         Self {
             channel,
             operation: Operation::new(name),
+            cancelled: None,
         }
+    }
+
+    /// Let the operation stop once `cancelled` is set.
+    fn cancellable(mut self, cancelled: Arc<AtomicBool>) -> Self {
+        self.cancelled = Some(cancelled);
+        self
     }
 }
 
@@ -65,6 +76,21 @@ impl<'a> ProgressCallback for TauriProgressCallback<'a> {
         self.operation.stage(stage);
         let _ = self.channel.send(progress);
     }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+    }
+}
+
+/// Keep the computer awake while a long job runs. Not getting that is only
+/// logged: the job itself works fine as long as the computer stays awake.
+async fn keep_awake(reason: &str) -> Option<KeepAwake> {
+    KeepAwake::acquire(reason)
+        .await
+        .inspect_err(|_| crate::diagnostics::warning("keep_awake_unavailable"))
+        .ok()
 }
 
 // =============================================================================
@@ -165,17 +191,35 @@ fn find_flash_target<'a>(
 #[tauri::command]
 pub async fn flash_image(
     request: FlashRequest,
+    attempt: String,
     progress_channel: Channel<FlashProgress>,
     state: tauri::State<'_, FlashState>,
 ) -> Result<FlashResult, CommandError> {
     state
-        .run(async move {
-            let callback = TauriProgressCallback::new(&progress_channel, "flash");
+        .run(attempt, |cancelled| async move {
+            let _awake = keep_awake("Writing Home Assistant to a drive").await;
+            let callback =
+                TauriProgressCallback::new(&progress_channel, "flash").cancellable(cancelled);
             callback
                 .operation
                 .finish(run_flash(&Backend, &request, &callback).await)
         })
         .await
+}
+
+/// Stop the flash started as `attempt`. `flash_image` then fails with
+/// `cancelled` once nothing touches the drive anymore.
+#[tauri::command]
+pub fn cancel_flash(attempt: String, state: tauri::State<'_, FlashState>) {
+    state.cancel(&attempt);
+}
+
+/// Stop between steps when the user cancelled.
+fn check_cancelled<P: ProgressCallback>(callback: &P) -> Result<(), CommandError> {
+    if callback.is_cancelled() {
+        return Err(hai_core::Error::Cancelled.into());
+    }
+    Ok(())
 }
 
 /// Download, extract, and write the image for `request`.
@@ -253,6 +297,7 @@ where
     // Extract the image
     let extracted_path = temporary_image.path();
 
+    check_cancelled(callback)?;
     backend
         .extract_temporary_image(&temporary_image, callback)
         .await
@@ -274,6 +319,9 @@ where
     )?;
 
     hai_core::disk::ensure_image_fits(image_size, device.size)?;
+
+    // Last point where the drive is still untouched
+    check_cancelled(callback)?;
 
     // Write to device
     backend
@@ -377,6 +425,7 @@ pub async fn download_utm_image(
     progress_channel: Channel<FlashProgress>,
     pending: tauri::State<'_, PendingUtmImages>,
 ) -> Result<String, CommandError> {
+    let _awake = keep_awake("Downloading Home Assistant").await;
     let callback = TauriProgressCallback::new(&progress_channel, "utm_download");
 
     // Verify UTM is available before doing any work.
@@ -473,6 +522,7 @@ pub async fn create_utm_vm(
     config: hai_core::UtmVmConfig,
     pending: tauri::State<'_, PendingUtmImages>,
 ) -> Result<String, CommandError> {
+    let _awake = keep_awake("Creating the Home Assistant virtual machine").await;
     Operation::new("utm_create").finish(run_utm_creation(&Backend, &config, &pending).await)
 }
 
@@ -649,6 +699,7 @@ pub async fn proxmox_create_vm(
     config: ProxmoxVmConfig,
     progress_channel: Channel<FlashProgress>,
 ) -> Result<ProxmoxVmResult, CommandError> {
+    let _awake = keep_awake("Installing Home Assistant on Proxmox").await;
     let callback = TauriProgressCallback::new(&progress_channel, "proxmox_install");
     // Fully qualified: `create_vm` is defined on both ProxmoxBackend and UtmBackend.
     callback.operation.finish(
@@ -1913,6 +1964,26 @@ mod mock_tests {
         }
     }
 
+    /// Cancels as soon as extraction starts, and records every stage seen.
+    #[derive(Default)]
+    struct CancelDuringExtraction {
+        cancelled: AtomicBool,
+        stages: std::sync::Mutex<Vec<FlashStage>>,
+    }
+
+    impl ProgressCallback for CancelDuringExtraction {
+        fn on_progress(&self, progress: FlashProgress) {
+            if progress.stage == FlashStage::Extracting {
+                self.cancelled.store(true, Ordering::Release);
+            }
+            self.stages.lock().unwrap().push(progress.stage);
+        }
+
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::Acquire)
+        }
+    }
+
     #[tokio::test]
     #[serial] // all share the mock cache directory
     async fn run_flash_writes_the_pinned_installer_without_a_release_lookup() {
@@ -1931,6 +2002,27 @@ mod mock_tests {
             assert_eq!(image.digest.as_deref(), Some(installer.digest));
             assert_eq!(image.format, ImageFormat::Raw);
         }
+    }
+
+    #[tokio::test]
+    #[serial] // all share the mock cache directory
+    async fn run_flash_cancelled_before_writing_never_touches_the_drive() {
+        let callback = CancelDuringExtraction::default();
+
+        let error = run_flash(
+            &BackendMock,
+            &request("mock-sd-card-32gb", "rpi5-64").await,
+            &callback,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, "cancelled");
+        assert!(!callback
+            .stages
+            .lock()
+            .unwrap()
+            .contains(&FlashStage::Writing));
     }
 
     #[tokio::test]
