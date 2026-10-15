@@ -9,6 +9,7 @@ use crate::diagnostics::Operation;
 use crate::flash_state::FlashState;
 use crate::install_jobs::InstallJobs;
 use hai_core::download::TemporaryImage;
+use hai_core::keep_awake::KeepAwake;
 use hai_core::{
     BlockDevice, DeviceBackend, DeviceManifest, ExpectedDevice, FlashProgress, FlashRequest,
     FlashResult, FlashStage, HaosRelease, HostBackend, ImageFormat, ProgressCallback,
@@ -82,6 +83,15 @@ impl<'a> ProgressCallback for TauriProgressCallback<'a> {
             .as_ref()
             .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
     }
+}
+
+/// Keep the computer awake while a long job runs. Not getting that is only
+/// logged: the job itself works fine as long as the computer stays awake.
+async fn keep_awake(reason: &str) -> Option<KeepAwake> {
+    KeepAwake::acquire(reason)
+        .await
+        .inspect_err(|_| crate::diagnostics::warning("keep_awake_unavailable"))
+        .ok()
 }
 
 // =============================================================================
@@ -193,6 +203,7 @@ pub async fn flash_image(
 ) -> Result<FlashResult, CommandError> {
     state
         .run(attempt, |cancelled| async move {
+            let _awake = keep_awake("Writing Home Assistant to a drive").await;
             let callback =
                 TauriProgressCallback::new(&progress_channel, "flash").cancellable(cancelled);
             callback
@@ -412,6 +423,7 @@ pub async fn download_utm_image(
     jobs: tauri::State<'_, InstallJobs>,
 ) -> Result<String, CommandError> {
     let job = jobs.begin(attempt);
+    let _awake = keep_awake("Downloading Home Assistant").await;
     let callback =
         TauriProgressCallback::new(&progress_channel, "utm_download").cancellable(job.cancelled());
 
@@ -509,6 +521,7 @@ pub async fn create_utm_vm(
     config: hai_core::UtmVmConfig,
     pending: tauri::State<'_, PendingUtmImages>,
 ) -> Result<String, CommandError> {
+    let _awake = keep_awake("Creating the Home Assistant virtual machine").await;
     Operation::new("utm_create").finish(run_utm_creation(&Backend, &config, &pending).await)
 }
 
@@ -688,6 +701,7 @@ pub async fn proxmox_create_vm(
     jobs: tauri::State<'_, InstallJobs>,
 ) -> Result<ProxmoxVmResult, CommandError> {
     let job = jobs.begin(attempt);
+    let _awake = keep_awake("Installing Home Assistant on Proxmox").await;
     let callback = TauriProgressCallback::new(&progress_channel, "proxmox_install")
         .cancellable(job.cancelled());
     // Fully qualified: `create_vm` is defined on both ProxmoxBackend and UtmBackend.
@@ -841,8 +855,11 @@ mod tests {
 
         let app = tauri::test::mock_app();
         app.manage(PendingUtmImages::default());
+        app.manage(InstallJobs::default());
         let channel = Channel::new(|_| panic!("An unsupported UTM download must not start"));
-        let error = download_utm_image(channel, app.state()).await.unwrap_err();
+        let error = download_utm_image("attempt".into(), channel, app.state(), app.state())
+            .await
+            .unwrap_err();
         assert_eq!(error.code, "unsupported_platform");
         // The log category is the same fixed code the view receives
         let tail = crate::diagnostics::test_log_tail();
@@ -1992,9 +2009,15 @@ mod mock_tests {
         // detection; run_utm_download_returns_extracted_image covers that board.
         let app = tauri::test::mock_app();
         app.manage(PendingUtmImages::default());
-        let path = download_utm_image(Channel::new(|_| Ok(())), app.state())
-            .await
-            .unwrap();
+        app.manage(InstallJobs::default());
+        let path = download_utm_image(
+            "attempt".into(),
+            Channel::new(|_| Ok(())),
+            app.state(),
+            app.state(),
+        )
+        .await
+        .unwrap();
         assert!(std::path::Path::new(&path).exists());
         assert!(path.ends_with(".qcow2"));
         assert!(app
