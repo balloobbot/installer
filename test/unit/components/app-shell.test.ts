@@ -26,6 +26,7 @@ interface WizardShell extends HTMLElement {
   nextLabel: string;
   nextDisabled: boolean;
   hideFooter: boolean;
+  hideNext: boolean;
 }
 
 interface ErrorFlags {
@@ -100,12 +101,13 @@ describe("app-shell", () => {
     el = await fixture<AppShell>(html`<app-shell></app-shell>`);
   });
 
-  afterEach(() => {
-    restoreTauriIpc();
+  afterEach(async () => {
     // A mock flash keeps running after teardown. The detached tree still has
     // app-shell as an ancestor, so drop the wizard subtree: otherwise a late
     // "complete" would advance the shared wizard state under a later test.
     el.shadowRoot?.querySelector("wizard-shell")?.remove();
+    el.remove();
+    await settle();
     wizardState.reset();
     restoreTauriIpc();
   });
@@ -406,6 +408,72 @@ describe("app-shell", () => {
     });
   });
 
+  // Browser-only mode runs the simulated flash, which honors a stop too
+  describe("cancelling a running flash", () => {
+    const stopDialogOf = (el: AppShell) =>
+      el.shadowRoot!.querySelector("#stop-installation-dialog") as InfoDialog;
+
+    beforeEach(async () => {
+      await enterSbcFlow(el);
+      selectTargets();
+      await goToStep(el, "flash");
+    });
+
+    it("asks first, and Keep installing carries on", async () => {
+      expect(shellOf(el).hideFooter).to.be.false;
+      expect(shellOf(el).hideNext).to.be.true;
+
+      fire(shellOf(el), "wizard-cancel");
+      await el.updateComplete;
+      expect(stopDialogOf(el).open).to.be.true;
+
+      fire(stopDialogOf(el), "dialog-secondary");
+      await el.updateComplete;
+      expect(stopDialogOf(el).open).to.be.false;
+      expect(wizardState.currentStep?.id).to.equal("flash");
+      expect(shellOf(el).hideFooter).to.be.false;
+    });
+
+    it("stops the flash and offers to install again", async () => {
+      fire(shellOf(el), "wizard-cancel");
+      await el.updateComplete;
+      fire(stopDialogOf(el), "dialog-primary");
+      await el.updateComplete;
+      // No buttons while the flash winds down
+      expect(shellOf(el).hideFooter).to.be.true;
+
+      await waitUntil(() => shellOf(el).nextLabel === "Try again");
+      expect(shellOf(el).hideFooter).to.be.false;
+      expect(wizardState.currentStep?.id).to.equal("flash");
+      expect(el.shadowRoot!.querySelector("progress-view")!.hasError).to.be
+        .true;
+    });
+  });
+
+  it("brings Cancel back when the stop request fails", async () => {
+    await enterSbcFlow(el);
+    selectTargets();
+    mockTauriIpc((cmd) => {
+      if (cmd === "cancel_flash")
+        return Promise.reject(new Error("IPC unavailable"));
+      // The flash keeps running
+      return new Promise(() => {});
+    });
+    await goToStep(el, "flash");
+
+    fire(shellOf(el), "wizard-cancel");
+    await el.updateComplete;
+    fire(
+      el.shadowRoot!.querySelector("#stop-installation-dialog")!,
+      "dialog-primary"
+    );
+    await settle();
+    await el.updateComplete;
+
+    expect(shellOf(el).hideFooter).to.be.false;
+    expect(wizardState.currentStep?.id).to.equal("flash");
+  });
+
   // These flags reveal Cancel and "Try again" on the progress steps. Left
   // set, they would show over the next run's live write.
   describe("error state between runs", () => {
@@ -430,7 +498,9 @@ describe("app-shell", () => {
       });
       await el.updateComplete;
 
-      expect(shellOf(el).hideFooter).to.be.true;
+      // The live write offers Cancel only, no stale "Try again"
+      expect(shellOf(el).hideFooter).to.be.false;
+      expect(shellOf(el).hideNext).to.be.true;
     });
 
     it("is cleared for every flow when a new path is chosen", async () => {
@@ -451,7 +521,7 @@ describe("app-shell", () => {
     let calls: string[];
 
     const quitDialogOf = (el: AppShell) =>
-      el.shadowRoot!.querySelector("info-dialog") as InfoDialog;
+      el.shadowRoot!.querySelector("#quit-dialog") as InfoDialog;
 
     beforeEach(async () => {
       calls = [];
@@ -498,6 +568,8 @@ describe("app-shell", () => {
 
     it("logs, rather than throws, when it can't listen for close requests", async () => {
       const logged: unknown[] = [];
+      el.remove();
+      await settle();
       restoreTauriIpc();
       mockTauriIpc(
         (cmd, args) => {

@@ -25,18 +25,55 @@ function mockFlash() {
   wizardState.setSelection("deviceConfig", MOCK_MANIFEST.devices[0].haos);
   const attempts: Array<{
     request: FlashRequest;
+    attempt: string;
     progressChannel: Channel<FlashProgress>;
     result: ReturnType<typeof deferred<FlashResult>>;
   }> = [];
+  const cancels: Array<{
+    attempt: string;
+    result: ReturnType<typeof deferred<void>>;
+  }> = [];
+  let rejectCancel = false;
+  let holdCancel = false;
   mockTauriIpc((cmd, args) => {
+    if (cmd === "cancel_flash") {
+      const result = deferred<void>();
+      cancels.push({ ...(args as { attempt: string }), result });
+      if (rejectCancel) result.reject(new Error("IPC unavailable"));
+      else if (!holdCancel) result.resolve();
+      return result.promise;
+    }
     expect(cmd).to.equal("flash_image");
     const result = deferred<FlashResult>();
     attempts.push({ ...(args as (typeof attempts)[number]), result });
     return result.promise;
   });
   const el = fixtureSync<ProgressView>(html`<progress-view></progress-view>`);
-  return { el, attempts };
+  return {
+    el,
+    attempts,
+    cancels,
+    failCancel: () => {
+      rejectCancel = true;
+    },
+    holdCancel: () => {
+      holdCancel = true;
+    },
+  };
 }
+
+function errorMessage(el: ProgressView) {
+  return el
+    .shadowRoot!.querySelector("install-progress")!
+    .shadowRoot!.querySelector(".error-message")!.textContent;
+}
+
+const cancelled = {
+  code: "cancelled",
+  message: "Installation was cancelled.",
+  retryable: true,
+  details: {},
+};
 
 describe("progress-view", () => {
   beforeEach(() => {
@@ -140,6 +177,120 @@ describe("progress-view", () => {
     await settle();
     expect(completed).to.equal(1);
     expect(errors).to.equal(1);
+  });
+
+  describe("stopping", () => {
+    for (const { stage, message } of [
+      { stage: "extracting", message: "Nothing was written to the drive" },
+      { stage: "writing", message: "The drive is not ready to use" },
+      { stage: "verifying", message: "The drive is not ready to use" },
+    ] as const) {
+      it(`says what a stop during ${stage} left behind`, async () => {
+        const { el, attempts, cancels } = mockFlash();
+        attempts[0].progressChannel.onmessage({
+          stage,
+          progress: 50,
+          bytes_processed: 1024,
+          total_bytes: 2048,
+          message: "Busy",
+        });
+        await settle();
+
+        el.stop();
+        await settle();
+        expect(cancels.map(({ attempt }) => attempt)).to.deep.equal([
+          attempts[0].attempt,
+        ]);
+        expect(
+          el.shadowRoot!.querySelector("install-progress")!.stageTitle
+        ).to.equal("Stopping...");
+
+        attempts[0].result.reject(cancelled);
+        await settle();
+        expect(el.hasError).to.be.true;
+        expect(errorMessage(el)).to.contain(message);
+
+        // Stopped is not broken: the same install can start again, as a
+        // new attempt that the old stop cannot reach
+        el.retry();
+        await settle();
+        expect(attempts).to.have.length(2);
+        expect(attempts[1].attempt).to.not.equal(attempts[0].attempt);
+      });
+    }
+
+    it("keeps the generic message for a cancel the user did not ask for here", async () => {
+      // Like closing the macOS password prompt
+      const { el, attempts, cancels } = mockFlash();
+      attempts[0].result.reject(cancelled);
+      await settle();
+
+      expect(cancels).to.have.length(0);
+      expect(errorMessage(el)).to.contain("Installation was cancelled.");
+    });
+
+    it("keeps flashing and says so when the stop request fails", async () => {
+      const { el, attempts, failCancel } = mockFlash();
+      let stopFailures = 0;
+      el.addEventListener("flash-stop-failed", () => stopFailures++);
+      failCancel();
+
+      el.stop();
+      await settle();
+      expect(stopFailures).to.equal(1);
+      expect(
+        el.shadowRoot!.querySelector("install-progress")!.stageTitle
+      ).to.not.equal("Stopping...");
+      expect(el.hasError).to.be.false;
+      expect(attempts).to.have.length(1);
+    });
+
+    it("ignores a late stop failure from an earlier attempt", async () => {
+      const { el, attempts, cancels, holdCancel } = mockFlash();
+      let stopFailures = 0;
+      el.addEventListener("flash-stop-failed", () => stopFailures++);
+      holdCancel();
+      const writing: FlashProgress = {
+        stage: "writing",
+        progress: 50,
+        bytes_processed: 1024,
+        total_bytes: 2048,
+        message: "Writing",
+      };
+
+      // The first stop request hangs while that flash fails on its own
+      el.stop();
+      attempts[0].result.reject({ ...cancelled, code: "device_busy" });
+      await settle();
+
+      el.retry();
+      await settle();
+      attempts[1].progressChannel.onmessage(writing);
+      el.stop();
+      await settle();
+
+      cancels[0].result.reject(new Error("IPC unavailable"));
+      await settle();
+      expect(stopFailures).to.equal(0);
+      expect(
+        el.shadowRoot!.querySelector("install-progress")!.stageTitle
+      ).to.equal("Stopping...");
+
+      cancels[1].result.resolve();
+      attempts[1].result.reject(cancelled);
+      await settle();
+      expect(errorMessage(el)).to.contain("The drive is not ready to use");
+    });
+
+    it("does nothing once the flash has ended", async () => {
+      const { el, attempts, cancels } = mockFlash();
+      attempts[0].result.reject(cancelled);
+      await settle();
+
+      el.stop();
+      await settle();
+      expect(cancels).to.have.length(0);
+    });
   });
 
   it("does not retry a disconnected drive in place", async () => {

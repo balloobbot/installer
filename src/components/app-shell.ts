@@ -108,6 +108,12 @@ export class AppShell extends LitElement {
   @state()
   private _showQuitDialog = false;
 
+  @state()
+  private _showStopDialog = false;
+
+  @state()
+  private _stoppingFlash = false;
+
   private _unsubscribe?: () => void;
   private _stopCloseListener?: Promise<() => void>;
   private _pendingFlow?: WizardFlow;
@@ -153,6 +159,7 @@ export class AppShell extends LitElement {
         @dialog-confirm=${this._onDialogConfirm}
       ></confirm-dialog>
       <info-dialog
+        id="quit-dialog"
         ?open=${this._showQuitDialog}
         .title=${localize("components.app_shell.quit_while_installing_title")}
         .message=${localize(
@@ -162,6 +169,16 @@ export class AppShell extends LitElement {
         .secondaryLabel=${localize("components.app_shell.keep_installing")}
         primaryVariant="danger"
         @dialog-primary=${this._onQuitAnyway}
+        @dialog-secondary=${this._onKeepAppOpen}
+      ></info-dialog>
+      <info-dialog
+        id="stop-installation-dialog"
+        ?open=${this._showStopDialog}
+        .title=${localize("components.app_shell.stop_installation_title")}
+        .message=${localize("components.app_shell.stop_installation_message")}
+        .primaryLabel=${localize("components.app_shell.stop_installation")}
+        .secondaryLabel=${localize("components.app_shell.keep_installing")}
+        @dialog-primary=${this._onStopInstallation}
         @dialog-secondary=${this._onKeepInstalling}
       ></info-dialog>
     `;
@@ -202,9 +219,12 @@ export class AppShell extends LitElement {
     const nextDisabled = this._isNextDisabled(flow, currentStep?.id);
     const nextLabel = this._getNextLabel(currentStep?.id);
 
+    // A running flash keeps only Cancel, until it is stopping
+    const flashRunning = currentStep?.id === "flash" && !this._flashError;
+
     // Determine when to hide footer (during active processes)
     const hideFooter =
-      (currentStep?.id === "flash" && !this._flashError) ||
+      (flashRunning && this._stoppingFlash) ||
       (flow === "vm" &&
         currentStep?.id === "install" &&
         !this._utmInstallError) ||
@@ -221,6 +241,7 @@ export class AppShell extends LitElement {
 
     // Determine when to hide next button
     const hideNext =
+      flashRunning ||
       currentStep?.id === "method" ||
       (currentStep?.id === "install" &&
         (this._flashError ||
@@ -245,6 +266,7 @@ export class AppShell extends LitElement {
         @wizard-next=${this._onWizardNext}
         @flash-complete=${this._onFlashComplete}
         @flash-error=${this._onFlashError}
+        @flash-stop-failed=${this._onFlashStopFailed}
       >
         ${this._renderWizardStep(flow, currentStep?.id)}
       </wizard-shell>
@@ -464,6 +486,12 @@ export class AppShell extends LitElement {
   }
 
   private _onWizardCancel() {
+    // A running flash is stopped first, never just left behind
+    if (wizardState.currentStep?.id === "flash" && !this._flashError) {
+      this._showStopDialog = true;
+      return;
+    }
+
     this._resetErrorState();
     wizardState.reset();
     this._currentView = "welcome";
@@ -471,6 +499,7 @@ export class AppShell extends LitElement {
 
   /** A stale error flag would show Cancel/"Try again" over the next live write. */
   private _resetErrorState() {
+    this._stoppingFlash = false;
     this._flashError = false;
     this._utmInstallError = false;
     this._proxmoxInstallError = false;
@@ -639,7 +668,7 @@ export class AppShell extends LitElement {
     }
   }
 
-  private _onKeepInstalling() {
+  private _onKeepAppOpen() {
     this._showQuitDialog = false;
   }
 
@@ -689,13 +718,40 @@ export class AppShell extends LitElement {
   }
 
   private _onFlashComplete() {
+    this._showStopDialog = false;
+    this._stoppingFlash = false;
     // Advance to success/done step after flash completes
     wizardState.nextStep();
   }
 
   private _onFlashError(event: CustomEvent<{ retryable?: boolean }>) {
+    this._showStopDialog = false;
+    this._stoppingFlash = false;
     this._installRetryable = event.detail?.retryable === true;
     this._flashError = true;
+  }
+
+  /** The stop request never reached the backend: the flash keeps going. */
+  private _onFlashStopFailed() {
+    this._stoppingFlash = false;
+  }
+
+  private _onKeepInstalling() {
+    this._showStopDialog = false;
+  }
+
+  private _onStopInstallation() {
+    this._showStopDialog = false;
+    // The flash may have ended while the dialog was open
+    if (wizardState.currentStep?.id !== "flash" || this._flashError) return;
+
+    const progressView = this.shadowRoot
+      ?.querySelector("wizard-shell")
+      ?.querySelector("progress-view");
+    if (!progressView) return;
+
+    this._stoppingFlash = true;
+    progressView.stop();
   }
 
   private _onUtmInstallComplete() {
