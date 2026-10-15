@@ -2,7 +2,7 @@ import {
   installerError,
   type InstallerError,
 } from "../../utils/installer-error.js";
-import { LitElement, html, css } from "lit";
+import { LitElement, html, css, type PropertyValues } from "lit";
 import { localize } from "../../localization/localize.js";
 import {
   InstallDiagnostics,
@@ -11,6 +11,7 @@ import {
 import { customElement, state } from "lit/decorators.js";
 import { wizardState, type WizardState } from "../../state/wizard-state.js";
 import {
+  cancelVmInstall,
   downloadUtmImage,
   discardUtmImage,
   createUtmVm,
@@ -45,6 +46,17 @@ type InstallStage =
   | "updating"
   | "complete"
   | "error";
+
+/** Past these, UTM creates the VM, and the install runs to the end */
+const STOPPABLE_STAGES: InstallStage[] = ["downloading", "extracting"];
+
+/** Shaped like the backend's rejection after a stop. */
+const STOPPED = {
+  code: "cancelled",
+  message: "Installation was cancelled.",
+  retryable: true,
+  details: {},
+};
 
 // Stages that have measurable progress (0-100%)
 const MEASURABLE_STAGES: InstallStage[] = ["downloading", "extracting"];
@@ -107,6 +119,19 @@ export class UtmProgressView extends LitElement {
   @state()
   private _isInstalling = false;
 
+  /** Whether the image download (and its extraction) runs */
+  @state()
+  private _downloading = false;
+
+  @state()
+  private _stopping = false;
+
+  /** Names the running download, so a late stop can never hit a retry. */
+  private _attempt = "";
+
+  /** What the shell last heard about `stoppable`. */
+  private _reportedStoppable?: boolean;
+
   private _stageStartTime: number | null = null;
   private _diagnostics?: InstallDiagnostics;
   private _stageStartBytes: number = 0;
@@ -116,6 +141,31 @@ export class UtmProgressView extends LitElement {
   /** Whether the install operation has failed */
   get hasError(): boolean {
     return this._error !== null;
+  }
+
+  /** Whether `stop` can still end the install before UTM creates anything */
+  get stoppable(): boolean {
+    return (
+      this._downloading &&
+      !this._stopping &&
+      STOPPABLE_STAGES.includes(this._stage)
+    );
+  }
+
+  /** Stop the install. It ends as a retryable `cancelled` error. */
+  stop(): void {
+    if (!this.stoppable) return;
+
+    this._stopping = true;
+    const attempt = this._attempt;
+    cancelVmInstall(attempt).catch((error: unknown) => {
+      logFrontendError(error);
+      // A late failure must not touch a retry that is stopping by now
+      if (attempt !== this._attempt || !this._downloading) return;
+
+      // The download keeps going; show it as such again
+      this._stopping = false;
+    });
   }
 
   /** Check if a stage uses indeterminate progress */
@@ -160,6 +210,21 @@ export class UtmProgressView extends LitElement {
     });
 
     void this._startInstall();
+  }
+
+  protected updated(changed: PropertyValues): void {
+    super.updated(changed);
+
+    // The shell offers the stop only while it can still work
+    if (this.stoppable === this._reportedStoppable) return;
+    this._reportedStoppable = this.stoppable;
+    this.dispatchEvent(
+      new CustomEvent("install-stoppable", {
+        detail: { stoppable: this.stoppable },
+        bubbles: true,
+        composed: true,
+      })
+    );
   }
 
   disconnectedCallback() {
@@ -212,6 +277,8 @@ export class UtmProgressView extends LitElement {
         const pending = selections.utmCreation;
         imagePath = pending ? undefined : await this._downloadImage(signal);
         throwIfCancelled(signal);
+        // A stop that landed as the download finished still holds back the VM
+        if (this._stopping) throw STOPPED;
         this._startStage("creating");
 
         const config: UtmVmConfig = {
@@ -274,7 +341,7 @@ export class UtmProgressView extends LitElement {
 
       this._diagnostics?.fail(error);
       this._stage = "error";
-      this._error = installerError(
+      const installer = installerError(
         error instanceof PollTimeoutError
           ? {
               code: "timeout",
@@ -287,6 +354,16 @@ export class UtmProgressView extends LitElement {
           "views.proxmox.proxmox_progress_view.failed_to_create_virtual_machine"
         )
       );
+      // Say what a stop left behind, rather than a generic "cancelled"
+      this._error =
+        this._stopping && installer.code === "cancelled"
+          ? {
+              ...installer,
+              message: localize(
+                "views.utm.utm_progress_view.stopped_nothing_created"
+              ),
+            }
+          : installer;
       this.dispatchEvent(
         new CustomEvent("install-error", {
           detail: { retryable: this._error.retryable },
@@ -299,6 +376,7 @@ export class UtmProgressView extends LitElement {
       if (this._abortController === controller) {
         this._isInstalling = false;
         this._abortController = undefined;
+        this._stopping = false;
       }
       if (imagePath) {
         try {
@@ -376,10 +454,20 @@ export class UtmProgressView extends LitElement {
     this._progress = 0;
     this._stageStartTime = Date.now();
     this._stageStartBytes = 0;
+    this._attempt = crypto.randomUUID();
+    this._downloading = true;
 
+    try {
+      return await this._reportDownload(signal);
+    } finally {
+      this._downloading = false;
+    }
+  }
+
+  private _reportDownload(signal: AbortSignal): Promise<string> {
     return downloadUtmImage((progress: FlashProgress) => {
-      // The download itself cannot be cancelled, but a detached view must
-      // stop reporting on it
+      // Only a stop ends the download early, but a detached view must stop
+      // reporting on it
       if (signal.aborted) return;
 
       // Track stage changes
@@ -394,7 +482,7 @@ export class UtmProgressView extends LitElement {
       this._progress = Math.round(progress.progress);
       this._bytesProcessed = progress.bytes_processed;
       this._totalBytes = progress.total_bytes;
-    });
+    }, this._attempt);
   }
 
   /**
@@ -444,7 +532,9 @@ export class UtmProgressView extends LitElement {
               : this._getStageDescription(id),
         }))}
         .stage=${stage}
-        .stageTitle=${this._getStageTitle(stage)}
+        .stageTitle=${this._stopping
+          ? localize("views.sbc.progress_view.stopping")
+          : this._getStageTitle(stage)}
         .description=${this._getStageDescription(stage)}
         .progress=${this._progress}
         .bytesProcessed=${this._bytesProcessed}

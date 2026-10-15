@@ -1313,9 +1313,18 @@ async fn upload_image_to_proxmox<P: ProgressCallback>(
         .send();
     tokio::pin!(request);
     let mut progress_open = true;
+    // A stop must land even while the server reads nothing
+    let mut cancel_check = tokio::time::interval(std::time::Duration::from_millis(250));
     let response = loop {
         tokio::select! {
             biased;
+            _ = cancel_check.tick() => {
+                if progress_callback.is_cancelled() {
+                    // Dropping the request closes the connection, and Proxmox
+                    // throws the partial upload away
+                    return Err(Error::Cancelled);
+                }
+            }
             changed = progress_rx.changed(), if progress_open => {
                 if changed.is_err() {
                     progress_open = false;
@@ -1769,7 +1778,37 @@ fn find_vm_ip(json: &serde_json::Value) -> Option<String> {
     None
 }
 
-/// Create and start a Home Assistant VM on Proxmox
+/// Stop with the uploaded image deleted again when the user stopped.
+async fn discard_upload_if_stopped<P: ProgressCallback>(
+    session: &ProxmoxSession,
+    node: &str,
+    storage_name: &str,
+    image_filename: &str,
+    progress_callback: &P,
+) -> Result<()> {
+    if !progress_callback.is_cancelled() {
+        return Ok(());
+    }
+
+    // Best effort: the stop is what the user asked for, a failed cleanup
+    // must not turn it into an error
+    if let Err(error) = delete_import_image(session, node, storage_name, image_filename).await {
+        eprintln!("Temporary import cleanup after a stop failed: {error}");
+    }
+    Err(Error::Cancelled)
+}
+
+fn stop_if_cancelled<P: ProgressCallback>(progress_callback: &P) -> Result<()> {
+    if progress_callback.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    Ok(())
+}
+
+/// Create and start a Home Assistant VM on Proxmox.
+///
+/// A stop is honored until the VM is about to be created, and never leaves
+/// anything behind on Proxmox. Once creation starts, it runs to the end.
 async fn create_vm<B: ReleaseSource, P: ProgressCallback>(
     backend: &B,
     session: &ProxmoxSession,
@@ -1797,6 +1836,7 @@ async fn create_vm<B: ReleaseSource, P: ProgressCallback>(
 
     // Catch anything that would fail later before spending time on the download
     pre_install_checks(session, config, image.size).await?;
+    stop_if_cancelled(progress_callback)?;
 
     // Step 2: Download the compressed image locally
     progress_callback.on_progress(FlashProgress {
@@ -1833,6 +1873,7 @@ async fn create_vm<B: ReleaseSource, P: ProgressCallback>(
         .await?;
 
     let storage_name = recheck_before_upload(session, config, &extracted_path).await?;
+    stop_if_cancelled(progress_callback)?;
 
     // Step 4: Upload the extracted image to Proxmox storage, fetched dynamically with import flag
     let image_filename = upload_image_to_proxmox(
@@ -1844,6 +1885,16 @@ async fn create_vm<B: ReleaseSource, P: ProgressCallback>(
     )
     .await?;
     drop(temporary_image);
+
+    // The last moment a stop leaves nothing behind: past this, the VM exists
+    discard_upload_if_stopped(
+        session,
+        &config.node,
+        &storage_name,
+        &image_filename,
+        progress_callback,
+    )
+    .await?;
 
     // Step 5: Create the VM with disk import and apply the selected size
     progress_callback.on_progress(FlashProgress {
@@ -5018,6 +5069,100 @@ mod tests {
                 delete.assert_async().await;
                 task.assert_async().await;
             }
+        }
+
+        /// Stops once the user asked for it, like the desktop callback does.
+        #[derive(Default)]
+        struct StoppableProgress {
+            stopped: std::sync::atomic::AtomicBool,
+        }
+
+        impl ProgressCallback for StoppableProgress {
+            fn on_progress(&self, _: FlashProgress) {}
+
+            fn is_cancelled(&self) -> bool {
+                self.stopped.load(std::sync::atomic::Ordering::Relaxed)
+            }
+        }
+
+        #[tokio::test]
+        async fn stop_after_upload_deletes_the_image() {
+            let mut server = Server::new_async().await;
+            let session = test_session(&server);
+
+            // Without a stop, nothing is deleted
+            let untouched = server
+                .mock("DELETE", Matcher::Any)
+                .expect(0)
+                .create_async()
+                .await;
+            let progress = StoppableProgress::default();
+            discard_upload_if_stopped(&session, "pve", "local-import", "hai.qcow2", &progress)
+                .await
+                .unwrap();
+            untouched.assert_async().await;
+            untouched.remove_async().await;
+
+            // A failed cleanup still ends as the stop the user asked for
+            let delete = server
+                .mock(
+                    "DELETE",
+                    "/api2/json/nodes/pve/storage/local-import/content/local-import%3Aimport%2Fhai.qcow2",
+                )
+                .with_status(500)
+                .create_async()
+                .await;
+            progress
+                .stopped
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let error =
+                discard_upload_if_stopped(&session, "pve", "local-import", "hai.qcow2", &progress)
+                    .await
+                    .unwrap_err();
+            assert!(matches!(error, Error::Cancelled), "{error:?}");
+            delete.assert_async().await;
+        }
+
+        #[tokio::test]
+        async fn stop_during_upload_drops_the_request() {
+            use tokio::io::AsyncReadExt;
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let session = ProxmoxSession {
+                certificate_sha256: None,
+                server_url: format!("http://{}", listener.local_addr().unwrap()),
+                ticket: "test-ticket".into(),
+                csrf_token: "test-csrf".into(),
+            };
+            let temp_dir = tempfile::tempdir().unwrap();
+            let path = temp_dir.path().join("large.qcow2");
+            std::fs::File::create(&path)
+                .unwrap()
+                .set_len(128 * 1024 * 1024)
+                .unwrap();
+            let progress = StoppableProgress::default();
+
+            let server = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = [0; 64 * 1024];
+                let mut received = 0;
+                while received < 1024 * 1024 {
+                    received += socket.read(&mut buffer).await.unwrap();
+                }
+
+                // Stall without ever answering; only the stop can end this
+                progress
+                    .stopped
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                while socket.read(&mut buffer).await.unwrap_or(0) > 0 {}
+            };
+            let upload = upload_image_to_proxmox(&session, "pve", &path, &progress, "local");
+            let (_, result) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(server, upload)
+            })
+            .await
+            .expect("a stop must end the upload, and close the connection");
+            assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
         }
 
         #[tokio::test]

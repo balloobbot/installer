@@ -472,6 +472,138 @@ describe("proxmox-progress-view", () => {
     }
   });
 
+  describe("stop", () => {
+    const CANCELLED = {
+      code: "cancelled",
+      message: "Installation was cancelled.",
+      retryable: true,
+      details: {},
+    };
+
+    /**
+     * Hold `proxmox_create_vm` open, report its stages on demand, and record
+     * every stop request with the attempt it names.
+     */
+    function mockStoppableInstall({ stopFails = false } = {}) {
+      const createVm = deferred<ProxmoxVmResult>();
+      const created = deferred<void>();
+      const stops: string[] = [];
+      let attempt = "";
+      let report!: (stage: FlashProgress["stage"]) => void;
+      mockTauriIpc((cmd, args) => {
+        switch (cmd) {
+          case "proxmox_create_vm": {
+            const call = args as {
+              attempt: string;
+              progressChannel: { onmessage: (progress: FlashProgress) => void };
+            };
+            attempt = call.attempt;
+            report = (stage) =>
+              call.progressChannel.onmessage({
+                stage,
+                progress: 0,
+                bytes_processed: 0,
+                total_bytes: 0,
+                message: "",
+              });
+            created.resolve();
+            return createVm.promise;
+          }
+          case "cancel_vm_install":
+            stops.push((args as { attempt: string }).attempt);
+            if (stopFails) throw new Error("IPC unavailable");
+            return undefined;
+          case "proxmox_get_vm_status":
+            return { status: "running", ip_address: "192.168.1.50" };
+          case "check_ha_ready":
+          case "check_ha_updated":
+            return true;
+        }
+        throw new Error(`Unexpected IPC command: ${cmd}`);
+      });
+      return {
+        createVm,
+        created: created.promise,
+        stops,
+        attempt: () => attempt,
+        report: (stage: FlashProgress["stage"]) => report(stage),
+      };
+    }
+
+    function stageTitle(el: ProxmoxProgressView): string {
+      return el.shadowRoot!.querySelector("install-progress")!.stageTitle;
+    }
+
+    it("stops an install before the VM exists, and says nothing was created", async () => {
+      const install = mockStoppableInstall();
+      const el = mount();
+      const reported: boolean[] = [];
+      el.addEventListener("install-stoppable", (event) => {
+        reported.push((event as CustomEvent).detail.stoppable);
+      });
+      await install.created;
+      install.report("uploading");
+      await el.updateComplete;
+      expect(el.stoppable).to.be.true;
+
+      el.stop();
+      await settle();
+
+      expect(install.stops).to.deep.equal([install.attempt()]);
+      expect(el.stoppable, "a second stop has nothing to add").to.be.false;
+      expect(stageTitle(el)).to.equal("Stopping...");
+
+      const failed = oneEvent(el, "install-error");
+      install.createVm.reject(CANCELLED);
+      expect((await failed).detail.retryable).to.be.true;
+      await el.updateComplete;
+      expect(errorText(el)).to.equal(
+        "Installation stopped. Nothing was created on Proxmox."
+      );
+      expect(reported).to.deep.equal([true, false]);
+    });
+
+    it("cannot stop once the VM is being created", async () => {
+      const install = mockStoppableInstall();
+      const el = mount();
+      await install.created;
+
+      install.report("creating_vm");
+      await el.updateComplete;
+      el.stop();
+
+      expect(el.stoppable).to.be.false;
+      expect(install.stops).to.deep.equal([]);
+    });
+
+    it("goes on when the VM got created before the stop landed", async () => {
+      const install = mockStoppableInstall();
+      const el = mount();
+      await install.created;
+      el.stop();
+
+      const completed = oneEvent(el, "install-complete");
+      install.createVm.resolve({ vm_id: 100, node: "pve" });
+      await completed;
+
+      expect(el.hasError).to.be.false;
+      expect(stageTitle(el)).to.not.equal("Stopping...");
+    });
+
+    it("offers the stop again when the request fails", async () => {
+      const install = mockStoppableInstall({ stopFails: true });
+      const el = mount();
+      await install.created;
+
+      el.stop();
+      await settle();
+
+      expect(install.stops).to.have.length(1);
+      expect(el.stoppable).to.be.true;
+      expect(stageTitle(el)).to.not.equal("Stopping...");
+    });
+  });
+
   it("reports an error without starting when there is no session", async () => {
     wizardState.startFlow("proxmox");
 

@@ -794,4 +794,102 @@ describe("utm-progress-view", () => {
         .shadowRoot!.querySelector(".error-message")!.textContent
     ).to.contain("import failed");
   });
+
+  describe("stop", () => {
+    const CANCELLED = {
+      code: "cancelled",
+      message: "Installation was cancelled.",
+      retryable: true,
+      details: {},
+    };
+
+    /**
+     * Hold `download_utm_image` open, and record every stop, every VM
+     * creation and every image the view hands back.
+     */
+    function mockStoppableDownload() {
+      const download = deferred<string>();
+      const started = deferred<void>();
+      const stops: string[] = [];
+      const creates: unknown[] = [];
+      const released: string[] = [];
+      let attempt = "";
+      mockTauriIpc((cmd, args) => {
+        switch (cmd) {
+          case "download_utm_image":
+            attempt = (args as { attempt: string }).attempt;
+            started.resolve();
+            return download.promise;
+          case "cancel_vm_install":
+            stops.push((args as { attempt: string }).attempt);
+            return undefined;
+          case "create_utm_vm":
+            creates.push(args);
+            return "new-vm";
+          case "discard_utm_image":
+            released.push((args as { imagePath: string }).imagePath);
+            return undefined;
+        }
+        throw new Error(`Unexpected IPC command: ${cmd}`);
+      });
+      return {
+        download,
+        started: started.promise,
+        stops,
+        creates,
+        released,
+        attempt: () => attempt,
+      };
+    }
+
+    it("stops the download, and says no VM was created", async () => {
+      const install = mockStoppableDownload();
+      const el = mount();
+      await install.started;
+      await el.updateComplete;
+      expect(el.stoppable).to.be.true;
+
+      el.stop();
+      await settle();
+      expect(install.stops).to.deep.equal([install.attempt()]);
+      expect(
+        el.shadowRoot!.querySelector("install-progress")!.stageTitle
+      ).to.equal("Stopping...");
+
+      const failed = oneEvent(el, "install-error");
+      install.download.reject(CANCELLED);
+      expect((await failed).detail.retryable).to.be.true;
+      await el.updateComplete;
+      expect(errorText(el)).to.equal(
+        "Installation stopped. No virtual machine was created in UTM."
+      );
+      expect(install.creates).to.deep.equal([]);
+    });
+
+    it("creates nothing when the download finished as the stop landed", async () => {
+      const install = mockStoppableDownload();
+      const el = mount();
+      await install.started;
+
+      el.stop();
+      const failed = oneEvent(el, "install-error");
+      install.download.resolve("/tmp/stopped.qcow2");
+      await failed;
+      await settle();
+
+      expect(install.creates).to.deep.equal([]);
+      expect(install.released).to.deep.equal(["/tmp/stopped.qcow2"]);
+      expect(errorText(el)).to.equal(
+        "Installation stopped. No virtual machine was created in UTM."
+      );
+    });
+
+    it("cannot stop a resumed install that skips the download", async () => {
+      wizardState.setSelection("vmId", "existing-vm");
+      const el = mount();
+      await el.updateComplete;
+
+      expect(el.stoppable).to.be.false;
+    });
+  });
 });

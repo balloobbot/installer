@@ -7,6 +7,7 @@ use crate::backend::Backend;
 use crate::command_error::CommandError;
 use crate::diagnostics::Operation;
 use crate::flash_state::FlashState;
+use crate::install_jobs::InstallJobs;
 use hai_core::download::TemporaryImage;
 use hai_core::{
     BlockDevice, DeviceBackend, DeviceManifest, ExpectedDevice, FlashProgress, FlashRequest,
@@ -405,10 +406,14 @@ pub async fn get_utm_haos_release() -> Result<HaosRelease, CommandError> {
 /// Download the HAOS qcow2 image for UTM
 #[tauri::command]
 pub async fn download_utm_image(
+    attempt: String,
     progress_channel: Channel<FlashProgress>,
     pending: tauri::State<'_, PendingUtmImages>,
+    jobs: tauri::State<'_, InstallJobs>,
 ) -> Result<String, CommandError> {
-    let callback = TauriProgressCallback::new(&progress_channel, "utm_download");
+    let job = jobs.begin(attempt);
+    let callback =
+        TauriProgressCallback::new(&progress_channel, "utm_download").cancellable(job.cancelled());
 
     // Verify UTM is available before doing any work.
     if let Err(error) = Backend.check_utm_status().await {
@@ -678,9 +683,13 @@ pub async fn proxmox_get_next_vm_id(session: ProxmoxSession) -> Result<u32, Comm
 pub async fn proxmox_create_vm(
     session: ProxmoxSession,
     config: ProxmoxVmConfig,
+    attempt: String,
     progress_channel: Channel<FlashProgress>,
+    jobs: tauri::State<'_, InstallJobs>,
 ) -> Result<ProxmoxVmResult, CommandError> {
-    let callback = TauriProgressCallback::new(&progress_channel, "proxmox_install");
+    let job = jobs.begin(attempt);
+    let callback = TauriProgressCallback::new(&progress_channel, "proxmox_install")
+        .cancellable(job.cancelled());
     // Fully qualified: `create_vm` is defined on both ProxmoxBackend and UtmBackend.
     callback.operation.finish(
         ProxmoxBackend::create_vm(&Backend, &session, &config, &callback)
@@ -689,10 +698,21 @@ pub async fn proxmox_create_vm(
                 let mut error = CommandError::from(error);
                 // A lost response may leave a VM behind. This command cannot yet
                 // resume it safely, even when the underlying network error is transient.
-                error.retryable = false;
+                // A stop never gets that far, so trying again is fine.
+                if error.code != "cancelled" {
+                    error.retryable = false;
+                }
                 error
             }),
     )
+}
+
+/// Stop the Proxmox install or UTM download that `attempt` names. It ends
+/// with a `cancelled` error. Once the virtual machine is being created, it
+/// runs to the end instead.
+#[tauri::command]
+pub fn cancel_vm_install(attempt: String, jobs: tauri::State<'_, InstallJobs>) {
+    jobs.cancel(&attempt);
 }
 
 /// Get the run status and IP address of a Proxmox VM

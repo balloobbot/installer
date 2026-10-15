@@ -110,6 +110,10 @@ export class AppShell extends LitElement {
   @state()
   private _stoppingFlash = false;
 
+  /** Whether the running VM install can still stop without leaving anything */
+  @state()
+  private _vmStoppable = false;
+
   private _unsubscribe?: () => void;
   private _pendingFlow?: WizardFlow;
 
@@ -148,7 +152,9 @@ export class AppShell extends LitElement {
       <info-dialog
         ?open=${this._showStopDialog}
         .title=${localize("components.app_shell.stop_installation_title")}
-        .message=${localize("components.app_shell.stop_installation_message")}
+        .message=${wizardState.currentStep?.id === "flash"
+          ? localize("components.app_shell.stop_installation_message")
+          : localize("components.app_shell.stop_vm_installation_message")}
         .primaryLabel=${localize("components.app_shell.stop_installation")}
         .secondaryLabel=${localize("components.app_shell.keep_installing")}
         @dialog-primary=${this._onStopInstallation}
@@ -195,15 +201,13 @@ export class AppShell extends LitElement {
     // A running flash keeps only Cancel, until it is stopping
     const flashRunning = currentStep?.id === "flash" && !this._flashError;
 
+    // A running VM install keeps only Cancel, while it can still stop
+    const vmRunning = this._isVmInstallRunning();
+
     // Determine when to hide footer (during active processes)
     const hideFooter =
       (flashRunning && this._stoppingFlash) ||
-      (flow === "vm" &&
-        currentStep?.id === "install" &&
-        !this._utmInstallError) ||
-      (flow === "proxmox" &&
-        currentStep?.id === "install" &&
-        !this._proxmoxInstallError);
+      (vmRunning && !this._vmStoppable);
 
     // Determine when to hide back button
     const hideBack =
@@ -215,6 +219,7 @@ export class AppShell extends LitElement {
     // Determine when to hide next button
     const hideNext =
       flashRunning ||
+      vmRunning ||
       currentStep?.id === "method" ||
       (currentStep?.id === "install" &&
         (this._flashError ||
@@ -240,6 +245,7 @@ export class AppShell extends LitElement {
         @flash-complete=${this._onFlashComplete}
         @flash-error=${this._onFlashError}
         @flash-stop-failed=${this._onFlashStopFailed}
+        @install-stoppable=${this._onInstallStoppable}
       >
         ${this._renderWizardStep(flow, currentStep?.id)}
       </wizard-shell>
@@ -464,6 +470,11 @@ export class AppShell extends LitElement {
       this._showStopDialog = true;
       return;
     }
+    if (this._isVmInstallRunning()) {
+      // Cancel only shows while the install can stop, but it may have moved on
+      if (this._vmStoppable) this._showStopDialog = true;
+      return;
+    }
 
     this._resetErrorState();
     wizardState.reset();
@@ -473,6 +484,7 @@ export class AppShell extends LitElement {
   /** A stale error flag would show Cancel/"Try again" over the next live write. */
   private _resetErrorState() {
     this._stoppingFlash = false;
+    this._vmStoppable = false;
     this._flashError = false;
     this._utmInstallError = false;
     this._proxmoxInstallError = false;
@@ -706,6 +718,11 @@ export class AppShell extends LitElement {
 
   private _onStopInstallation() {
     this._showStopDialog = false;
+    if (this._isVmInstallRunning()) {
+      this._stopVmInstall();
+      return;
+    }
+
     // The flash may have ended while the dialog was open
     if (wizardState.currentStep?.id !== "flash" || this._flashError) return;
 
@@ -716,6 +733,34 @@ export class AppShell extends LitElement {
 
     this._stoppingFlash = true;
     progressView.stop();
+  }
+
+  /** Whether a UTM or Proxmox install runs, and has not failed. */
+  private _isVmInstallRunning(): boolean {
+    if (wizardState.currentStep?.id !== "install") return false;
+
+    const flow = this._wizardState.currentFlow;
+    return (
+      (flow === "vm" && !this._utmInstallError) ||
+      (flow === "proxmox" && !this._proxmoxInstallError)
+    );
+  }
+
+  private _stopVmInstall() {
+    const wizardShell = this.shadowRoot?.querySelector("wizard-shell");
+    const progressView =
+      wizardShell?.querySelector("utm-progress-view") ??
+      wizardShell?.querySelector("proxmox-progress-view");
+    // Does nothing once the install moved past where it can stop
+    progressView?.stop();
+  }
+
+  private _onInstallStoppable(event: CustomEvent<{ stoppable: boolean }>) {
+    this._vmStoppable = event.detail.stoppable;
+    // The install moved past where it can stop: there is nothing to ask
+    if (!this._vmStoppable && this._isVmInstallRunning()) {
+      this._showStopDialog = false;
+    }
   }
 
   private _onUtmInstallComplete() {

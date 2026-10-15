@@ -137,6 +137,11 @@ impl ProxmoxBackend for BackendMock {
             (FlashStage::CreatingVm, "Creating virtual machine..."),
             (FlashStage::StartingVm, "Starting virtual machine..."),
         ] {
+            // Like the real one, a stop counts until the VM is being created
+            if !matches!(stage, FlashStage::StartingVm) && progress_callback.is_cancelled() {
+                return Err(crate::Error::Cancelled);
+            }
+
             progress_callback.on_progress(FlashProgress {
                 stage,
                 progress: 0,

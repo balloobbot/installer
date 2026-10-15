@@ -3,11 +3,15 @@ import {
   type InstallerError,
 } from "../../utils/installer-error.js";
 import { localize } from "../../localization/localize.js";
-import { LitElement, html, css } from "lit";
-import { InstallDiagnostics } from "../../utils/diagnostics.js";
+import { LitElement, html, css, type PropertyValues } from "lit";
+import {
+  InstallDiagnostics,
+  logFrontendError,
+} from "../../utils/diagnostics.js";
 import { customElement, state } from "lit/decorators.js";
 import { wizardState, type WizardState } from "../../state/wizard-state.js";
 import {
+  cancelVmInstall,
   checkHaReady,
   checkHaUpdated,
   proxmoxCreateVm,
@@ -47,6 +51,13 @@ const BACKEND_STAGES = [
 ] as const satisfies readonly FlashStage[];
 
 type BackendStage = (typeof BACKEND_STAGES)[number];
+
+/** Past these, the VM exists, and the install runs to the end */
+const STOPPABLE_STAGES: InstallStage[] = [
+  "downloading",
+  "extracting",
+  "uploading",
+];
 
 /** The backend's stages, then the waits for the VM and Home Assistant run from here */
 type InstallStage =
@@ -137,6 +148,19 @@ export class ProxmoxProgressView extends LitElement {
   @state()
   private _isInstalling = false;
 
+  /** Whether the backend install (download up to starting the VM) runs */
+  @state()
+  private _creatingVm = false;
+
+  @state()
+  private _stopping = false;
+
+  /** Names the running backend install, so a late stop can never hit a retry. */
+  private _attempt = "";
+
+  /** What the shell last heard about `stoppable`. */
+  private _reportedStoppable?: boolean;
+
   private _stageStartTime: number | null = null;
   private _diagnostics?: InstallDiagnostics;
   private _stageStartBytes: number = 0;
@@ -146,6 +170,31 @@ export class ProxmoxProgressView extends LitElement {
   /** Whether the install operation has failed */
   get hasError(): boolean {
     return this._error !== null;
+  }
+
+  /** Whether `stop` can still end the install without leaving anything behind */
+  get stoppable(): boolean {
+    return (
+      this._creatingVm &&
+      !this._stopping &&
+      STOPPABLE_STAGES.includes(this._stage)
+    );
+  }
+
+  /** Stop the install. It ends as a retryable `cancelled` error. */
+  stop(): void {
+    if (!this.stoppable) return;
+
+    this._stopping = true;
+    const attempt = this._attempt;
+    cancelVmInstall(attempt).catch((error: unknown) => {
+      logFrontendError(error);
+      // A late failure must not touch a retry that is stopping by now
+      if (attempt !== this._attempt || !this._creatingVm) return;
+
+      // The install keeps going; show it as such again
+      this._stopping = false;
+    });
   }
 
   /**
@@ -171,6 +220,21 @@ export class ProxmoxProgressView extends LitElement {
     });
 
     void this._startInstall();
+  }
+
+  protected updated(changed: PropertyValues): void {
+    super.updated(changed);
+
+    // The shell offers the stop only while it can still work
+    if (this.stoppable === this._reportedStoppable) return;
+    this._reportedStoppable = this.stoppable;
+    this.dispatchEvent(
+      new CustomEvent("install-stoppable", {
+        detail: { stoppable: this.stoppable },
+        bubbles: true,
+        composed: true,
+      })
+    );
   }
 
   disconnectedCallback() {
@@ -272,6 +336,9 @@ export class ProxmoxProgressView extends LitElement {
         return;
       }
 
+      // Say what a stop left behind, rather than a generic "cancelled"
+      const stopped =
+        this._stopping && installerError(error).code === "cancelled";
       this._setError(
         error instanceof PollTimeoutError
           ? {
@@ -280,13 +347,19 @@ export class ProxmoxProgressView extends LitElement {
               retryable: true,
               details: {},
             }
-          : error
+          : error,
+        stopped
+          ? localize(
+              "views.proxmox.proxmox_progress_view.stopped_nothing_created"
+            )
+          : undefined
       );
     } finally {
       // A newer attempt may own the component by now (cancel, then retry)
       if (this._abortController === controller) {
         this._isInstalling = false;
         this._abortController = undefined;
+        this._stopping = false;
       }
     }
   }
@@ -301,32 +374,54 @@ export class ProxmoxProgressView extends LitElement {
     this._diagnostics?.advance("downloading");
     this._stageStartTime = Date.now();
     this._stageStartBytes = 0;
+    this._attempt = crypto.randomUUID();
+    this._creatingVm = true;
 
-    return proxmoxCreateVm(session, config, (progress: FlashProgress) => {
-      // Progress keeps arriving from the backend after a cancel; a
-      // detached view must stop reporting on it
-      if (signal.aborted) return;
+    try {
+      const result = await this._reportCreation(session, config, signal);
+      // A stop that came too late: the VM exists, so the install goes on
+      this._stopping = false;
+      return result;
+    } finally {
+      this._creatingVm = false;
+    }
+  }
 
-      if (!isBackendStage(progress.stage)) {
-        // A stage the backend gained without this view learning it
-        console.warn(
-          `Ignoring unknown Proxmox install stage: ${progress.stage}`
-        );
-        return;
-      }
+  private _reportCreation(
+    session: ProxmoxSession,
+    config: ProxmoxVmConfig,
+    signal: AbortSignal
+  ): Promise<ProxmoxVmResult> {
+    return proxmoxCreateVm(
+      session,
+      config,
+      (progress: FlashProgress) => {
+        // Progress keeps arriving from the backend after a cancel; a
+        // detached view must stop reporting on it
+        if (signal.aborted) return;
 
-      // Use raw per-stage progress
-      this._diagnostics?.advance(progress.stage);
-      if (progress.stage !== this._stage) {
-        this._stage = progress.stage;
-        this._stageStartTime = Date.now();
-        this._stageStartBytes = progress.bytes_processed;
-      }
+        if (!isBackendStage(progress.stage)) {
+          // A stage the backend gained without this view learning it
+          console.warn(
+            `Ignoring unknown Proxmox install stage: ${progress.stage}`
+          );
+          return;
+        }
 
-      this._progress = progress.progress;
-      this._bytesProcessed = progress.bytes_processed;
-      this._totalBytes = progress.total_bytes;
-    });
+        // Use raw per-stage progress
+        this._diagnostics?.advance(progress.stage);
+        if (progress.stage !== this._stage) {
+          this._stage = progress.stage;
+          this._stageStartTime = Date.now();
+          this._stageStartBytes = progress.bytes_processed;
+        }
+
+        this._progress = progress.progress;
+        this._bytesProcessed = progress.bytes_processed;
+        this._totalBytes = progress.total_bytes;
+      },
+      this._attempt
+    );
   }
 
   /** Move to an indeterminate stage, clearing the previous stage's progress */
@@ -405,15 +500,16 @@ export class ProxmoxProgressView extends LitElement {
   }
 
   /** Show an error and tell the shell whether a retry is safe. */
-  private _setError(error: unknown) {
+  private _setError(error: unknown, message?: string) {
     this._diagnostics?.fail(error);
     this._stage = "error";
-    this._error = installerError(
+    const installer = installerError(
       error,
       localize(
         "views.proxmox.proxmox_progress_view.failed_to_create_virtual_machine"
       )
     );
+    this._error = message ? { ...installer, message } : installer;
     this.dispatchEvent(
       new CustomEvent("install-error", {
         detail: { retryable: this._error.retryable },
@@ -446,7 +542,9 @@ export class ProxmoxProgressView extends LitElement {
               : this._getStageDescription(id),
         }))}
         .stage=${stage}
-        .stageTitle=${this._getStageTitle(stage)}
+        .stageTitle=${this._stopping
+          ? localize("views.sbc.progress_view.stopping")
+          : this._getStageTitle(stage)}
         .description=${this._getStageDescription(stage)}
         .progress=${this._progress}
         .bytesProcessed=${this._bytesProcessed}

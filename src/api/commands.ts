@@ -333,14 +333,16 @@ export async function discardUtmImage(imagePath: string): Promise<void> {
 /**
  * Download the HAOS qcow2 image for UTM.
  * @param onProgress Callback for progress updates
+ * @param attempt Names this download, so `cancelVmInstall` can never stop another
  * @returns Path to the downloaded qcow2 file
  */
 export async function downloadUtmImage(
-  onProgress: (progress: FlashProgress) => void
+  onProgress: (progress: FlashProgress) => void,
+  attempt: string
 ): Promise<string> {
   if (MOCK_ALLOWED && isBrowserOnly()) {
     // Simulate download progress in browser-only mode
-    return simulateUtmDownload(onProgress);
+    return simulateUtmDownload(onProgress, attempt);
   }
 
   const channel = new Channel<FlashProgress>();
@@ -350,15 +352,46 @@ export async function downloadUtmImage(
   };
 
   return invoke<string>("download_utm_image", {
+    attempt,
     progressChannel: channel,
   });
+}
+
+/** The simulated VM install in browser-only mode, and whether it was stopped. */
+let mockVmAttempt: string | undefined;
+let mockVmCancelled = false;
+
+/** Reject like the native command does after a stop. */
+function throwIfMockVmCancelled(): void {
+  if (!mockVmCancelled) return;
+
+  throw {
+    code: "cancelled",
+    message: "Installation was cancelled.",
+    retryable: true,
+    details: {},
+  };
+}
+
+/**
+ * Ask the Proxmox install or UTM download started as `attempt` to stop. It
+ * then rejects with `cancelled`. Once the virtual machine is being created,
+ * it runs to the end instead.
+ */
+export async function cancelVmInstall(attempt: string): Promise<void> {
+  if (MOCK_ALLOWED && isBrowserOnly()) {
+    if (attempt === mockVmAttempt) mockVmCancelled = true;
+    return;
+  }
+  return invoke<void>("cancel_vm_install", { attempt });
 }
 
 /**
  * Simulate UTM download for browser-only mode
  */
 async function simulateUtmDownload(
-  onProgress: (progress: FlashProgress) => void
+  onProgress: (progress: FlashProgress) => void,
+  attempt: string
 ): Promise<string> {
   const stages: Array<{
     stage: FlashProgress["stage"];
@@ -382,9 +415,12 @@ async function simulateUtmDownload(
 
   let overallProgress = 0;
   const stageWeight = 100 / stages.length;
+  mockVmAttempt = attempt;
+  mockVmCancelled = false;
 
   for (const { stage, message, steps, delay } of stages) {
     for (let step = 0; step <= steps; step++) {
+      throwIfMockVmCancelled();
       const stageProgress = (step * 100) / steps;
       const progress = overallProgress + (stageProgress * stageWeight) / 100;
 
@@ -696,15 +732,17 @@ export async function proxmoxGetVmStatus(
  * @param session The authentication session
  * @param config VM configuration
  * @param onProgress Callback for progress updates
+ * @param attempt Names this install, so `cancelVmInstall` can never stop another
  * @returns Result with VM ID and node
  */
 export async function proxmoxCreateVm(
   session: ProxmoxSession,
   config: ProxmoxVmConfig,
-  onProgress: (progress: FlashProgress) => void
+  onProgress: (progress: FlashProgress) => void,
+  attempt: string
 ): Promise<ProxmoxVmResult> {
   if (MOCK_ALLOWED && isBrowserOnly()) {
-    return simulateProxmoxInstall(config, onProgress);
+    return simulateProxmoxInstall(config, onProgress, attempt);
   }
 
   const channel = new Channel<FlashProgress>();
@@ -715,6 +753,7 @@ export async function proxmoxCreateVm(
   return invoke<ProxmoxVmResult>("proxmox_create_vm", {
     session,
     config,
+    attempt,
     progressChannel: channel,
   });
 }
@@ -724,7 +763,8 @@ export async function proxmoxCreateVm(
  */
 async function simulateProxmoxInstall(
   config: ProxmoxVmConfig,
-  onProgress: (progress: FlashProgress) => void
+  onProgress: (progress: FlashProgress) => void,
+  attempt: string
 ): Promise<ProxmoxVmResult> {
   const stages: Array<{
     stage: FlashProgress["stage"];
@@ -771,9 +811,15 @@ async function simulateProxmoxInstall(
   ];
 
   let overallProgress = 0;
+  mockVmAttempt = attempt;
+  mockVmCancelled = false;
 
   for (const { stage, message, weight, steps, delay } of stages) {
     for (let step = 0; step <= steps; step++) {
+      // Like the native install, a stop counts until the VM is being created
+      if (stage !== "starting_vm" && (stage !== "creating_vm" || step === 0)) {
+        throwIfMockVmCancelled();
+      }
       const stageProgress = (step * 100) / steps;
       const progress = overallProgress + (stageProgress * weight) / 100;
 

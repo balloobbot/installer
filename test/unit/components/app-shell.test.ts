@@ -469,6 +469,82 @@ describe("app-shell", () => {
     expect(wizardState.currentStep?.id).to.equal("flash");
   });
 
+  describe("cancelling a running VM install", () => {
+    const stopDialogOf = (el: AppShell) =>
+      el.shadowRoot!.querySelector("info-dialog") as InfoDialog;
+
+    /** `mockBackend` runs once the flow is entered, before the install starts */
+    async function enterProxmoxInstall(mockBackend?: () => void) {
+      fire(el.shadowRoot!.querySelector("welcome-view")!, "navigate", {
+        view: "path-selection",
+      });
+      await el.updateComplete;
+      fire(
+        el.shadowRoot!.querySelector("path-selection-view")!,
+        "select-path",
+        { path: "proxmox" }
+      );
+      await el.updateComplete;
+      wizardState.setSelection("proxmoxSession", {
+        server_url: "https://pve:8006",
+        ticket: "test",
+        csrf_token: "test",
+      });
+      mockBackend?.();
+      await goToStep(el, "install");
+    }
+
+    // Browser-only mode runs the simulated install, which honors a stop too
+    it("asks first, then stops before anything is created", async () => {
+      await enterProxmoxInstall();
+      await waitUntil(() => !shellOf(el).hideFooter, "Cancel never showed");
+      expect(shellOf(el).hideNext).to.be.true;
+
+      fire(shellOf(el), "wizard-cancel");
+      await el.updateComplete;
+      expect(stopDialogOf(el).open).to.be.true;
+      expect(stopDialogOf(el).message).to.contain("nothing is left behind");
+
+      fire(stopDialogOf(el), "dialog-primary");
+      await waitUntil(() => shellOf(el).nextLabel === "Try again");
+      expect(shellOf(el).hideFooter).to.be.false;
+      expect(wizardState.currentStep?.id).to.equal("install");
+      expect(el.shadowRoot!.querySelector("proxmox-progress-view")!.hasError).to
+        .be.true;
+    });
+
+    it("hides Cancel once the VM is being created", async () => {
+      let report!: (stage: string) => void;
+      await enterProxmoxInstall(() =>
+        mockTauriIpc((cmd, args) => {
+          if (cmd === "proxmox_create_vm") {
+            const { progressChannel } = args as {
+              progressChannel: { onmessage: (progress: unknown) => void };
+            };
+            report = (stage) =>
+              progressChannel.onmessage({
+                stage,
+                progress: 0,
+                bytes_processed: 0,
+                total_bytes: 0,
+                message: "",
+              });
+            return new Promise(() => {});
+          }
+          throw new Error(`Unexpected IPC command: ${cmd}`);
+        })
+      );
+      await waitUntil(() => !shellOf(el).hideFooter, "Cancel never showed");
+
+      // The dialog was open when the install moved on: nothing left to ask
+      fire(shellOf(el), "wizard-cancel");
+      await el.updateComplete;
+      report("creating_vm");
+      await waitUntil(() => shellOf(el).hideFooter, "Cancel stayed");
+      expect(stopDialogOf(el).open).to.be.false;
+    });
+  });
+
   // These flags reveal Cancel and "Try again" on the progress steps. Left
   // set, they would show over the next run's live write.
   describe("error state between runs", () => {

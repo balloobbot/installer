@@ -380,12 +380,40 @@ test.describe("Proxmox Installation Flow", () => {
     await expect(stageDots.first()).toBeVisible();
   });
 
-  test("step 4: footer is hidden during installation", async ({ page }) => {
+  test("step 4: offers only Cancel until the VM is being created", async ({
+    page,
+  }) => {
     await navigateToProxmoxStep4(page);
 
     const wizardShell = page.locator("wizard-shell");
-    // Footer should not be visible during install
-    await expect(wizardShell.locator(".footer")).not.toBeVisible();
+    await expect(wizardShell.locator(".footer-left wa-button")).toHaveText(
+      "Cancel"
+    );
+    await expect(wizardShell.locator(".footer-right wa-button")).toHaveCount(0);
+
+    // Past this, the VM exists, and the install runs to the end
+    await expect(wizardShell.locator(".footer")).not.toBeVisible({
+      timeout: 15000,
+    });
+  });
+
+  test("step 4: Cancel asks first, then stops before anything is created", async ({
+    page,
+  }) => {
+    await navigateToProxmoxStep4(page);
+
+    const wizardShell = page.locator("wizard-shell");
+    const stopDialog = page.locator("app-shell > info-dialog");
+    await wizardShell.locator(".footer-left wa-button").click();
+    await expect(stopDialog.getByText("nothing is left behind")).toBeVisible();
+    await stopDialog.getByRole("button", { name: "Stop installation" }).click();
+
+    await expect(
+      page.locator("proxmox-progress-view .error-message")
+    ).toHaveText("Installation stopped. Nothing was created on Proxmox.");
+    await expect(wizardShell.locator(".footer-right wa-button")).toHaveText(
+      "Try again"
+    );
   });
 
   test("step 4: back button is hidden during installation", async ({
